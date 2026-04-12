@@ -1,0 +1,39 @@
+# TAILOR — Python dependencies
+# Core
+chromadb>=1.0
+mcp>=1.0
+uvicorn>=0.30
+starlette>=0.40
+sse-starlette>=3.0
+anyio>=4.0
+httpx>=0.28
+
+# Embedding & search
+numpy>=2.0
+onnxruntime>=1.18
+tokenizers>=0.20
+
+# Document processing
+openpyxl>=3.1           # Excel
+python-docx>=1.0        # Word
+python-pptx>=1.0        # PowerPoint
+pillow>=10.0            # Images / OCR fallback
+pyyaml>=6.0             # Config
+
+# API & networking
+requests>=2.30
+aiohttp>=3.9
+
+# Services
+filelock>=3.12          # Telegram bot session locking
+
+# Gmail sync (optional — only if using Gmail connector)
+google-api-python-client>=2.100
+google-auth>=2.20
+google-auth-oauthlib>=1.0
+google-auth-httplib2>=0.2
+
+# macOS only (optional — Apple Vision OCR)
+# pyobjc-framework-Vision>=12.0
+# pyobjc-framework-CoreML>=12.0
+# pyobjc-framework-Quartz>=12.0

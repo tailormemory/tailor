@@ -1,0 +1,42 @@
+# TAILOR — MCP Server systemd service (Linux)
+#
+# Installation:
+#   1. Copy this file to /etc/systemd/system/tailor-mcp.service
+#   2. Edit the paths and user below to match your setup
+#   3. Reload:  sudo systemctl daemon-reload
+#   4. Enable:  sudo systemctl enable tailor-mcp
+#   5. Start:   sudo systemctl start tailor-mcp
+#   6. Check:   sudo systemctl status tailor-mcp
+#               curl http://localhost:8787/api/search?q=test
+
+[Unit]
+Description=TAILOR MCP Server
+After=network.target
+
+[Service]
+Type=simple
+
+# UPDATE THIS: your username
+User=youruser
+Group=youruser
+
+# UPDATE THIS: path to your tailor directory
+WorkingDirectory=/path/to/tailor
+
+# UPDATE THIS: path to your Python venv
+ExecStart=/path/to/tailor/.venv/bin/python3 /path/to/tailor/mcp_server.py
+
+# API keys — add your own
+Environment="ANTHROPIC_API_KEY=sk-ant-..."
+Environment="OPENAI_API_KEY=sk-..."
+Environment="GOOGLE_API_KEY=AI..."
+Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+
+Restart=always
+RestartSec=10
+
+StandardOutput=append:/path/to/tailor/logs/mcp_stdout.log
+StandardError=append:/path/to/tailor/logs/mcp_stderr.log
+
+[Install]
+WantedBy=multi-user.target

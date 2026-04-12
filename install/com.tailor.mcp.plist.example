@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TAILOR — MCP Server LaunchDaemon (macOS)
+
+  Installation:
+    1. Copy this file to /Library/LaunchDaemons/com.tailor.mcp.plist
+    2. Edit the paths below to match your setup
+    3. Load:  sudo launchctl load /Library/LaunchDaemons/com.tailor.mcp.plist
+    4. Check: curl http://localhost:8787/api/search?q=test
+
+  To stop:  sudo launchctl unload /Library/LaunchDaemons/com.tailor.mcp.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tailor.mcp</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <!-- UPDATE THIS: path to your Python venv -->
+        <string>/path/to/tailor/.venv/bin/python3</string>
+        <!-- UPDATE THIS: path to mcp_server.py -->
+        <string>/path/to/tailor/mcp_server.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <!-- UPDATE THIS: path to your tailor directory -->
+    <string>/path/to/tailor</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Add your API keys here -->
+        <key>ANTHROPIC_API_KEY</key>
+        <string>sk-ant-...</string>
+        <key>OPENAI_API_KEY</key>
+        <string>sk-...</string>
+        <key>GOOGLE_API_KEY</key>
+        <string>AI...</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <key>HOME</key>
+        <!-- UPDATE THIS: your home directory -->
+        <string>/Users/youruser</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <!-- UPDATE THIS -->
+    <string>/path/to/tailor/logs/mcp_stdout.log</string>
+    <key>StandardErrorPath</key>
+    <!-- UPDATE THIS -->
+    <string>/path/to/tailor/logs/mcp_stderr.log</string>
+</dict>
+</plist>

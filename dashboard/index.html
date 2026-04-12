@@ -1,0 +1,1780 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TAILOR Dashboard</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text x='50%25' y='55%25' dominant-baseline='middle' text-anchor='middle' fill='%230d9488' font-size='11' font-weight='700' font-family='sans-serif'>[AI]</text></svg>" />
+  <script src="/dashboard/vendor/react.min.js"></script>
+  <script src="/dashboard/vendor/react-dom.min.js"></script>
+  <script src="/dashboard/vendor/tailwind.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Outfit', sans-serif; }
+    .animate-pulse { animation: pulse 2s cubic-bezier(0.4,0,0.6,1) infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #1a3a3a; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #0d9488; }
+    /* Polish: smooth transitions globally */
+    *, *::before, *::after { transition-property: color, background-color, border-color, box-shadow, opacity; transition-duration: 200ms; transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1); }
+    /* Glow keyframe for status dots */
+    @keyframes glow-pulse { 0%, 100% { box-shadow: 0 0 8px rgba(52,211,153,0.5); } 50% { box-shadow: 0 0 14px rgba(52,211,153,0.7); } }
+    .glow-pulse { animation: glow-pulse 2.5s ease-in-out infinite; }
+    /* Landing-style polish */
+    .tile-glow:hover { box-shadow: 0 0 25px rgba(20,184,166,0.06), 0 4px 20px rgba(0,0,0,0.3) !important; }
+    .frosted-nav { backdrop-filter: blur(24px) saturate(180%); -webkit-backdrop-filter: blur(24px) saturate(180%); border-bottom: 1px solid rgba(20,184,166,0.08) !important; }
+    .nav-pill-active { background: linear-gradient(135deg, rgba(20,184,166,0.12), rgba(20,184,166,0.06)) !important; box-shadow: 0 0 16px rgba(20,184,166,0.1); }
+    @keyframes fade-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+    .fade-in { animation: fade-in 0.4s ease-out; }
+    /* Teal focus ring for inputs */
+    input:focus, select:focus, textarea:focus { box-shadow: 0 0 0 3px rgba(20,184,166,0.15) !important; }
+    /* Subtle teal border on footer */
+    .footer-teal { border-color: rgba(20,184,166,0.08) !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script>
+    const { useState, useEffect, createContext, useContext, useCallback } = React;
+
+    // ── API ──
+    const API_BASE = window.location.origin;
+    const API_TOKEN = new URLSearchParams(window.location.search).get("token") || "";
+
+    async function apiFetch(endpoint) {
+      const sep = endpoint.includes("?") ? "&" : "?";
+      const url = `${API_BASE}/api/dashboard/${endpoint}${API_TOKEN ? `${sep}token=${API_TOKEN}` : ""}`;
+      try {
+        const r = await fetch(url, { credentials: "include" });
+        if (!r.ok) {
+          if (r.status === 401) window.__tailorUnauth = true;
+          return null;
+        }
+        return await r.json();
+      } catch { return null; }
+    }
+
+    // ── Theme ──
+    const ThemeContext = createContext();
+    const useTheme = () => useContext(ThemeContext);
+
+    const themes = {
+      dark: {
+        bg: "linear-gradient(135deg, #050608 0%, #070a0f 50%, #050608 100%)",
+        headerBg: "rgba(5,6,8,0.65)",
+        tile: "bg-gradient-to-b from-zinc-900/50 to-zinc-950/60 border-zinc-800/40 hover:border-teal-500/30 tile-glow",
+        text: "text-zinc-100", textMuted: "text-zinc-500", textFaint: "text-zinc-600", textLabel: "text-zinc-400",
+        border: "border-zinc-800/40", borderLight: "border-zinc-800/50", rowAlt: "bg-zinc-900/40",
+        tag: "bg-zinc-800 text-zinc-300 border-zinc-700",
+        tagAccent: "bg-teal-900/30 text-teal-300 border-teal-600/40",
+        tagMuted: "bg-zinc-900 text-zinc-500 border-zinc-800",
+        barBg: "bg-zinc-800", footerText: "text-zinc-600",
+        navActive: "text-teal-400 nav-pill-active",
+        navInactive: "text-zinc-500 hover:text-zinc-300 hover:bg-white/[0.04]",
+        accent: "text-teal-400", statusOnline: "text-emerald-400", mono: "text-zinc-200",
+        skeleton: "bg-zinc-800 animate-pulse",
+        input: "bg-zinc-900 border-zinc-700 text-zinc-100 placeholder-zinc-600",
+        infoBox: "bg-zinc-800/50 text-zinc-400",
+        tipBox: "bg-teal-900/20 text-teal-300 border border-teal-800/30",
+        warnBox: "bg-amber-900/15 text-amber-300 border border-amber-800/30",
+      },
+      light: {
+        bg: "linear-gradient(180deg, #f9fafb 0%, #f0f2f5 100%)",
+        headerBg: "rgba(249,250,251,0.8)",
+        tile: "bg-white/80 border-zinc-200/80 hover:border-teal-400/25 hover:shadow-[0_0_15px_rgba(20,184,166,0.04)] shadow-sm",
+        text: "text-zinc-900", textMuted: "text-zinc-500", textFaint: "text-zinc-400", textLabel: "text-zinc-600",
+        border: "border-zinc-200", borderLight: "border-zinc-100", rowAlt: "bg-zinc-50",
+        tag: "bg-zinc-100 text-zinc-700 border-zinc-200",
+        tagAccent: "bg-teal-50 text-teal-700 border-teal-200",
+        tagMuted: "bg-zinc-50 text-zinc-400 border-zinc-200",
+        barBg: "bg-zinc-200", footerText: "text-zinc-400",
+        navActive: "bg-teal-50 text-teal-600",
+        navInactive: "text-zinc-400 hover:text-zinc-600 hover:bg-zinc-100",
+        accent: "text-teal-600", statusOnline: "text-emerald-600", mono: "text-zinc-700",
+        skeleton: "bg-zinc-200 animate-pulse",
+        input: "bg-zinc-50 border-zinc-200 text-zinc-900 placeholder-zinc-400",
+        infoBox: "bg-zinc-100 text-zinc-600",
+        tipBox: "bg-teal-50 text-teal-700 border border-teal-200",
+        warnBox: "bg-amber-50 text-amber-700 border border-amber-200",
+      },
+    };
+
+    // ── Shared ──
+    const cl = (...c) => c.filter(Boolean).join(" ");
+
+    const statusStyle = {
+      running: { bg: "bg-emerald-500/15", text: "text-emerald-400", dot: "bg-emerald-400", glow: "shadow-[0_0_12px_rgba(52,211,153,0.5)]" },
+      ok: { bg: "bg-emerald-500/15", text: "text-emerald-400" },
+      warning: { bg: "bg-amber-500/15", text: "text-amber-400", dot: "bg-amber-400", glow: "shadow-[0_0_10px_rgba(251,191,36,0.4)]" },
+      error: { bg: "bg-red-500/15", text: "text-red-400", dot: "bg-red-400" },
+      stopped: { bg: "bg-red-500/15", text: "text-red-400", dot: "bg-red-400", glow: "shadow-[0_0_10px_rgba(248,113,113,0.4)]" },
+    };
+
+    const ICONS = { mcp: "\u{1F9E0}", telegram: "\u{1F4AC}", ollama: "\u{1F52E}", tunnel: "\u{1F310}", "vscode-tunnel": "\u2328\uFE0F" };
+    const svcIcon = (id) => ICONS[id.split(".").pop()] || "\u2699";
+
+    const Tile = ({ children, className = "" }) => {
+      const t = useTheme();
+      return React.createElement("div", { className: cl("rounded-2xl border p-5 transition-all duration-300 fade-in", t.tile, className) }, children);
+    };
+
+    const Tag = ({ children, variant = "default" }) => {
+      const t = useTheme();
+      const v = { default: t.tag, accent: t.tagAccent, muted: t.tagMuted };
+      return React.createElement("span", { className: cl("inline-block px-2.5 py-1 text-sm rounded-lg border", v[variant]) }, children);
+    };
+
+    const BigNum = ({ value, label, unit = "", accent = false }) => {
+      const t = useTheme();
+      const display = value === null || value === undefined ? "\u2014" : typeof value === "number" ? value.toLocaleString() : value;
+      return React.createElement("div", null,
+        React.createElement("div", { className: cl("text-4xl font-extrabold tracking-tight drop-shadow-sm", accent ? t.accent : t.text) },
+          display,
+          unit && React.createElement("span", { className: cl("text-lg font-normal ml-1", t.textMuted) }, unit)
+        ),
+        React.createElement("div", { className: cl("text-sm mt-1 uppercase tracking-widest", t.textMuted) }, label)
+      );
+    };
+
+    const ProgressBar = ({ value, max, color = "bg-teal-500", height = "h-2.5" }) => {
+      const t = useTheme();
+      const pct = max > 0 ? Math.min((value / max) * 100, 100) : 0;
+      return React.createElement("div", { className: cl("w-full rounded-full overflow-hidden", t.barBg, height) },
+        React.createElement("div", { className: cl("rounded-full transition-all duration-700", height, color), style: { width: `${pct}%`, boxShadow: color.includes("teal") ? "0 0 14px rgba(20,184,166,0.35), 0 0 4px rgba(20,184,166,0.2)" : "none" } })
+      );
+    };
+
+    const Skeleton = ({ className = "h-8 w-24" }) => {
+      const t = useTheme();
+      return React.createElement("div", { className: cl("rounded-lg", t.skeleton, className) });
+    };
+
+    const TABS = [
+      { id: "home", label: "Home", icon: "\u2B21" },
+      { id: "kb", label: "Knowledge Base", icon: "\u25C6" },
+      { id: "pipeline", label: "Pipeline", icon: "\u25B8" },
+      { id: "config", label: "Configuration", icon: "\u2699" },
+      { id: "profile", label: "Profile", icon: "\u25CE" },
+    ];
+
+    // ── Form Components (shared by Wizard and Config Editor) ──
+    const WInput = ({ label, value, onChange, type = "text", placeholder = "", mono = false, helpText = "", mode = "dark" }) => {
+      const t = themes[mode];
+      return React.createElement("div", { className: "mb-4" },
+        React.createElement("label", { className: cl("text-sm font-medium block mb-1.5", t.textLabel) }, label),
+        React.createElement("input", {
+          type, value: value || "", placeholder,
+          onChange: (e) => onChange(e.target.value),
+          className: cl("w-full px-4 py-3 rounded-xl border text-sm outline-none transition-all",
+            "focus:ring-2 focus:ring-teal-500/30 focus:border-teal-500",
+            mono ? "font-mono" : "", t.input),
+        }),
+        helpText && React.createElement("p", { className: cl("text-xs mt-1", t.textFaint) }, helpText)
+      );
+    };
+
+    const WTextArea = ({ label, value, onChange, placeholder = "", rows = 3, helpText = "", mode = "dark" }) => {
+      const t = themes[mode];
+      return React.createElement("div", { className: "mb-4" },
+        React.createElement("label", { className: cl("text-sm font-medium block mb-1.5", t.textLabel) }, label),
+        React.createElement("textarea", {
+          value: value || "", placeholder, rows,
+          onChange: (e) => onChange(e.target.value),
+          className: cl("w-full px-4 py-3 rounded-xl border text-sm outline-none transition-all resize-none",
+            "focus:ring-2 focus:ring-teal-500/30 focus:border-teal-500", t.input),
+        }),
+        helpText && React.createElement("p", { className: cl("text-xs mt-1", t.textFaint) }, helpText)
+      );
+    };
+
+    const WSelect = ({ label, value, onChange, options, helpText = "", mode = "dark" }) => {
+      const t = themes[mode];
+      return React.createElement("div", { className: "mb-4" },
+        React.createElement("label", { className: cl("text-sm font-medium block mb-1.5", t.textLabel) }, label),
+        React.createElement("select", {
+          value: value || "",
+          onChange: (e) => onChange(e.target.value),
+          className: cl("w-full px-4 py-3 rounded-xl border text-sm outline-none transition-all",
+            "focus:ring-2 focus:ring-teal-500/30 focus:border-teal-500", t.input),
+        }, options.map(o => React.createElement("option", { key: o.value, value: o.value }, o.label))),
+        helpText && React.createElement("p", { className: cl("text-xs mt-1", t.textFaint) }, helpText)
+      );
+    };
+
+    // ── Model Catalogs ──
+    const LLM_MODELS = {
+      anthropic: [
+        { value: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5 (fast, cheap)" },
+        { value: "claude-sonnet-4-20250514", label: "Claude Sonnet 4 (balanced)" },
+      ],
+      openai: [
+        { value: "gpt-4o-mini", label: "GPT-4o Mini (fast, cheap)" },
+        { value: "gpt-4o", label: "GPT-4o (balanced)" },
+      ],
+      google: [
+        { value: "gemini-2.0-flash", label: "Gemini 2.0 Flash (fast)" },
+        { value: "gemini-2.5-pro-preview-05-06", label: "Gemini 2.5 Pro (balanced)" },
+      ],
+      ollama: [
+        { value: "qwen2.5:7b", label: "Qwen 2.5 7B (local)" },
+        { value: "llama3.1:8b", label: "Llama 3.1 8B (local)" },
+        { value: "mistral:7b", label: "Mistral 7B (local)" },
+      ],
+    };
+
+    const EMBED_MODELS = {
+      ollama: [
+        { value: "nomic-embed-text", label: "Nomic Embed Text (768d, local)" },
+        { value: "mxbai-embed-large", label: "mxbai Embed Large (1024d, local)" },
+      ],
+      openai: [
+        { value: "text-embedding-3-small", label: "text-embedding-3-small (1536d)" },
+        { value: "text-embedding-3-large", label: "text-embedding-3-large (3072d)" },
+      ],
+      google: [
+        { value: "gemini-embedding-2-preview", label: "Gemini Embedding 2 (768d)" },
+      ],
+    };
+
+    const EMBED_DIMS = {
+      "nomic-embed-text": 768, "mxbai-embed-large": 1024,
+      "text-embedding-3-small": 1536, "text-embedding-3-large": 3072,
+      "gemini-embedding-2-preview": 768,
+    };
+
+    // ── Setup Wizard ──
+    const WIZARD_STEPS = [
+      { id: "welcome", label: "Welcome", icon: "\u{1F44B}", desc: "Tell us about yourself" },
+      { id: "llm", label: "LLM", icon: "\u{1F9E0}", desc: "AI model configuration" },
+      { id: "embedding", label: "Embedding", icon: "\u{1F52E}", desc: "Vector embedding model" },
+      { id: "enrichment", label: "Enrichment", icon: "\u{1F52C}", desc: "Nightly pipeline backends", optional: true },
+      { id: "telegram", label: "Telegram", icon: "\u{1F4AC}", desc: "Bot integration", optional: true },
+      { id: "email", label: "Email", icon: "\u{1F4E7}", desc: "Email sync", optional: true },
+      { id: "storage", label: "Storage", icon: "\u2601\uFE0F", desc: "Cloud storage sync", optional: true },
+      { id: "remote", label: "Remote", icon: "\u{1F310}", desc: "Remote access setup", optional: true },
+      { id: "import", label: "Import", icon: "\u{1F4E5}", desc: "Import conversations", optional: true },
+      { id: "review", label: "Review", icon: "\u2705", desc: "Review & save" },
+    ];
+
+    function SetupWizard({ onComplete, mode }) {
+      const [step, setStep] = useState(0);
+      const [saving, setSaving] = useState(false);
+      const [error, setError] = useState("");
+      const [cfg, setCfg] = useState({
+        user: { name: "", bio: "", language: "en" },
+        branding: { app_name: "TAILOR" },
+        llm: { provider: "anthropic", model: "claude-haiku-4-5-20251001", api_key: "", tool_use: true, max_tokens: 1000, temperature: 0.3 },
+        embedding: { provider: "ollama", model: "nomic-embed-text", dimensions: 768 },
+        telegram: { bot_token: "", chat_id: "", poll_timeout: 30 },
+        email: { provider: "", address: "", credentials: {} },
+        cloud_sync: [],
+        remote_access: { provider: "none" },
+        ingest: { conversations: [] },
+        classifier: { provider: "ollama", model: "qwen2.5:7b", temperature: 0.3, max_tokens: 400 },
+        kb: { collection: "tailor_conversations" },
+        persona: { name: "Tailor", system_prompt: "You are Tailor, a personal AI assistant." },
+        sessions: { timeout_minutes: 10, max_history: 20, auto_capture: true },
+        enrichment: {
+          fact_extraction: { backends: [{ provider: "google", model: "gemini-2.5-flash" }] },
+          fact_supersession: { backends: [{ provider: "anthropic", model: "claude-haiku-4-5-20251001" }] },
+          fact_derivation: { backends: [{ provider: "anthropic", model: "claude-haiku-4-5-20251001" }] },
+          entity_extraction: { backends: [{ provider: "anthropic", model: "claude-haiku-4-5-20251001" }] },
+          doc_enrichment: { backends: [{ provider: "anthropic", model: "claude-haiku-4-5-20251001" }] },
+          summaries: { backends: [{ provider: "anthropic", model: "claude-haiku-4-5-20251001" }] },
+        },
+      });
+
+      const t = themes[mode];
+      const current = WIZARD_STEPS[step];
+      const isFirst = step === 0;
+      const isLast = step === WIZARD_STEPS.length - 1;
+
+      const updateCfg = (section, updates) => {
+        setCfg(prev => ({ ...prev, [section]: { ...(prev[section] || {}), ...updates } }));
+      };
+
+      const canProceed = () => {
+        switch (current.id) {
+          case "welcome": return cfg.user.name.trim().length > 0;
+          case "llm": return cfg.llm.provider && cfg.llm.model && (cfg.llm.provider === "ollama" || cfg.llm.api_key);
+          case "embedding": return cfg.embedding.provider && cfg.embedding.model;
+          default: return true;
+        }
+      };
+
+      const handleSave = async () => {
+        setSaving(true);
+        setError("");
+        try {
+          const payload = JSON.parse(JSON.stringify(cfg));
+          if (!payload.telegram.bot_token) delete payload.telegram;
+          if (!payload.email.provider) delete payload.email;
+          // Convert cloud_sync folders_text to folders array
+          if (payload.cloud_sync && payload.cloud_sync.length > 0) {
+            const cs = payload.cloud_sync[0];
+            if (!cs.provider || !cs.remote_name) { delete payload.cloud_sync; }
+            else {
+              const folders = (cs.folders_text || "").split("\n").map(f => f.trim()).filter(Boolean);
+              payload.cloud_sync = [{ name: cs.provider, remote_name: cs.remote_name,
+                remote_root: cs.remote_root || "", local_root: cs.local_root || "", folders }];
+              delete payload.cloud_sync[0].folders_text;
+              delete payload.cloud_sync[0].provider;
+            }
+          } else { delete payload.cloud_sync; }
+          if (payload.remote_access?.provider === "none") delete payload.remote_access;
+          if (!payload.ingest.conversations || payload.ingest.conversations.length === 0) {
+            delete payload.ingest.conversations;
+          }
+          // Clean enrichment: remove empty backends, remove roles with no backends
+          if (payload.enrichment) {
+            for (const [role, rcfg] of Object.entries(payload.enrichment)) {
+              if (rcfg.backends) {
+                rcfg.backends = rcfg.backends.filter(b => b.provider);
+                if (rcfg.backends.length === 0) delete payload.enrichment[role];
+              }
+            }
+            if (Object.keys(payload.enrichment).length === 0) delete payload.enrichment;
+          }
+          const r = await fetch(`${API_BASE}/api/dashboard/config/save`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            credentials: "include",
+            body: JSON.stringify(payload),
+          });
+          const data = await r.json();
+          if (data.ok) { onComplete(); } else { setError(data.error || "Save failed"); }
+        } catch (e) { setError("Connection failed"); }
+        setSaving(false);
+      };
+
+      const renderStepContent = () => {
+        switch (current.id) {
+          case "welcome":
+            return React.createElement("div", null,
+              React.createElement(WInput, { label: "Your Name", value: cfg.user.name, onChange: v => updateCfg("user", { name: v }), placeholder: "e.g. John Doe", mode }),
+              React.createElement(WTextArea, { label: "Short Bio", value: cfg.user.bio, onChange: v => updateCfg("user", { bio: v }), placeholder: "A short description of yourself...", helpText: "Used by the profile generator and persona system.", mode }),
+              React.createElement(WSelect, { label: "Language", value: cfg.user.language || "en", onChange: v => updateCfg("user", { language: v }), options: [{v:"en",l:"English"},{v:"it",l:"Italiano"},{v:"es",l:"Español"},{v:"fr",l:"Français"},{v:"de",l:"Deutsch"},{v:"pt",l:"Português"},{v:"nl",l:"Nederlands"},{v:"ja",l:"日本語"},{v:"zh",l:"中文"},{v:"ko",l:"한국어"}], helpText: "Language for AI-generated content (summaries, facts, profiles).", mode }),
+              React.createElement(WInput, { label: "App Name", value: cfg.branding.app_name, onChange: v => updateCfg("branding", { app_name: v }), placeholder: "TAILOR", helpText: "Display name in the dashboard header.", mode })
+            );
+          case "llm":
+            return React.createElement("div", null,
+              React.createElement(WSelect, {
+                label: "Provider", value: cfg.llm.provider, mode,
+                onChange: v => {
+                  const models = LLM_MODELS[v] || [];
+                  updateCfg("llm", { provider: v, model: models[0]?.value || "", api_key: v === "ollama" ? "" : cfg.llm.api_key });
+                },
+                options: [
+                  { value: "anthropic", label: "Anthropic (Claude)" },
+                  { value: "openai", label: "OpenAI (GPT)" },
+                  { value: "google", label: "Google (Gemini)" },
+                  { value: "ollama", label: "Ollama (Local)" },
+                ],
+                helpText: "Cloud providers need an API key. Ollama runs locally for free."
+              }),
+              React.createElement(WSelect, {
+                label: "Model", value: cfg.llm.model, mode,
+                onChange: v => updateCfg("llm", { model: v }),
+                options: LLM_MODELS[cfg.llm.provider] || [],
+              }),
+              cfg.llm.provider !== "ollama" && React.createElement(WInput, {
+                label: "API Key", value: cfg.llm.api_key, mode,
+                onChange: v => updateCfg("llm", { api_key: v }),
+                type: "password", placeholder: "sk-...", mono: true,
+                helpText: "Stored locally in config/tailor.yaml. Never sent anywhere."
+              })
+            );
+          case "embedding":
+            return React.createElement("div", null,
+              React.createElement(WSelect, {
+                label: "Provider", value: cfg.embedding.provider, mode,
+                onChange: v => {
+                  const models = EMBED_MODELS[v] || [];
+                  const model = models[0]?.value || "";
+                  updateCfg("embedding", { provider: v, model, dimensions: EMBED_DIMS[model] || 768 });
+                },
+                options: [
+                  { value: "ollama", label: "Ollama (Local, free)" },
+                  { value: "openai", label: "OpenAI" },
+                  { value: "google", label: "Google" },
+                ],
+                helpText: "Ollama is recommended for privacy and zero cost."
+              }),
+              React.createElement(WSelect, {
+                label: "Model", value: cfg.embedding.model, mode,
+                onChange: v => updateCfg("embedding", { model: v, dimensions: EMBED_DIMS[v] || 768 }),
+                options: EMBED_MODELS[cfg.embedding.provider] || [],
+              }),
+              React.createElement("div", { className: "mb-4" },
+                React.createElement("label", { className: cl("text-sm font-medium block mb-1.5", t.textLabel) }, "Dimensions"),
+                React.createElement("div", { className: cl("px-4 py-3 rounded-xl border text-sm font-mono", mode === "dark" ? "bg-zinc-900/50 border-zinc-700 text-zinc-400" : "bg-zinc-100 border-zinc-200 text-zinc-500") }, String(cfg.embedding.dimensions))
+              )
+            );
+          case "enrichment":
+            const WIZ_ROLES = [
+              { key: "fact_extraction", label: "Fact Extraction", desc: "Extracts atomic facts from each chunk" },
+              { key: "fact_supersession", label: "Fact Supersession", desc: "Detects and marks outdated facts" },
+              { key: "fact_derivation", label: "Fact Derivation", desc: "Infers second-order facts from entities" },
+              { key: "entity_extraction", label: "Entity Extraction", desc: "Identifies entities in chunks" },
+              { key: "doc_enrichment", label: "Doc Enrichment", desc: "Generates document summaries" },
+              { key: "summaries", label: "Summaries", desc: "Creates conversation summaries" },
+            ];
+            const WIZ_PROVIDERS = [
+              { value: "anthropic", label: "Anthropic (Claude)" },
+              { value: "openai", label: "OpenAI (GPT)" },
+              { value: "google", label: "Google (Gemini)" },
+              { value: "ollama", label: "Ollama (Local)" },
+            ];
+            const wizEnrich = cfg.enrichment || {};
+            const wizUpdateBackend = (role, idx, field, value) => {
+              setCfg(prev => {
+                const e = { ...prev.enrichment };
+                const rd = { ...e[role], backends: [...(e[role]?.backends || [])] };
+                rd.backends[idx] = { ...rd.backends[idx], [field]: value };
+                e[role] = rd;
+                return { ...prev, enrichment: e };
+              });
+            };
+            const wizAddBackend = (role) => {
+              setCfg(prev => {
+                const e = { ...prev.enrichment };
+                const rd = { ...e[role], backends: [...(e[role]?.backends || [])] };
+                rd.backends.push({ provider: "", model: "" });
+                e[role] = rd;
+                return { ...prev, enrichment: e };
+              });
+            };
+            const wizRemoveBackend = (role, idx) => {
+              setCfg(prev => {
+                const e = { ...prev.enrichment };
+                const rd = { ...e[role], backends: [...(e[role]?.backends || [])] };
+                rd.backends.splice(idx, 1);
+                e[role] = rd;
+                return { ...prev, enrichment: e };
+              });
+            };
+            return React.createElement("div", null,
+              React.createElement("div", { className: cl("text-sm mb-4 p-3 rounded-xl", t.infoBox) },
+                "Configure which AI models run your nightly enrichment pipeline. Each role can have multiple backends — if one hits a rate limit, it falls back to the next."
+              ),
+              React.createElement("div", { className: "space-y-4" },
+                WIZ_ROLES.map(role => {
+                  const rd = wizEnrich[role.key] || { backends: [{ provider: "", model: "" }] };
+                  const backends = rd.backends || [];
+                  return React.createElement("div", { key: role.key, className: cl("p-3 rounded-xl border", t.borderLight) },
+                    React.createElement("div", { className: cl("text-sm font-semibold mb-1", t.text) }, role.label),
+                    React.createElement("div", { className: cl("text-xs mb-2", t.textFaint) }, role.desc),
+                    React.createElement("div", { className: "space-y-1.5" },
+                      backends.map((b, idx) =>
+                        React.createElement("div", { key: idx, className: "flex items-center gap-2" },
+                          React.createElement("select", {
+                            value: b.provider || "", onChange: e => wizUpdateBackend(role.key, idx, "provider", e.target.value),
+                            className: cl("w-36 px-2 py-1.5 rounded-lg border text-sm", t.input)
+                          }, React.createElement("option", { value: "" }, "Provider..."),
+                            WIZ_PROVIDERS.map(p => React.createElement("option", { key: p.value, value: p.value }, p.label))),
+                          React.createElement("input", { type: "text", value: b.model || "", placeholder: "model name",
+                            onChange: e => wizUpdateBackend(role.key, idx, "model", e.target.value),
+                            className: cl("flex-1 px-2 py-1.5 rounded-lg border text-sm font-mono", t.input) }),
+                          React.createElement("input", { type: "number", value: b.workers || "", placeholder: "w",
+                            onChange: e => wizUpdateBackend(role.key, idx, "workers", parseInt(e.target.value) || ""),
+                            title: "Parallel workers",
+                            className: cl("w-14 px-1.5 py-1.5 rounded-lg border text-sm font-mono text-center", t.input) }),
+                          backends.length > 1 && React.createElement("button", {
+                            onClick: () => wizRemoveBackend(role.key, idx),
+                            className: "text-xs text-red-400 hover:bg-red-500/10 px-1 rounded"
+                          }, "\u2715")
+                        )
+                      )
+                    ),
+                    React.createElement("button", { onClick: () => wizAddBackend(role.key),
+                      className: cl("mt-1.5 text-xs px-2 py-1 rounded-md border border-dashed", t.borderLight, "hover:border-teal-500 hover:text-teal-400", t.textFaint)
+                    }, "+ Add fallback")
+                  );
+                })
+              )
+            );
+                    case "telegram":
+            return React.createElement("div", null,
+              React.createElement("div", { className: cl("text-sm mb-4 p-3 rounded-xl", t.infoBox) },
+                "Optional. Create a bot via @BotFather on Telegram to get a token."
+              ),
+              React.createElement(WInput, { label: "Bot Token", value: cfg.telegram.bot_token, onChange: v => updateCfg("telegram", { bot_token: v }), type: "password", mono: true, placeholder: "123456:ABC-DEF...", mode }),
+              React.createElement(WInput, { label: "Chat ID", value: cfg.telegram.chat_id, onChange: v => updateCfg("telegram", { chat_id: v }), mono: true, placeholder: "Your Telegram chat ID", helpText: "Send /start to your bot, then use @userinfobot to find your chat ID.", mode })
+            );
+          case "email":
+            return React.createElement("div", null,
+              React.createElement("div", { className: cl("text-sm mb-4 p-3 rounded-xl", t.infoBox) },
+                "Optional. Sync your emails into the Knowledge Base."
+              ),
+              React.createElement(WSelect, {
+                label: "Provider", value: cfg.email.provider, mode,
+                onChange: v => updateCfg("email", { provider: v, credentials: {} }),
+                options: [
+                  { value: "", label: "Skip email sync" },
+                  { value: "imap", label: "IMAP (recommended — works with any provider)" },
+                  { value: "gmail", label: "Gmail API (advanced — requires Google Cloud project)" },
+                ],
+              }),
+              cfg.email.provider === "imap" && React.createElement("div", null,
+                React.createElement(WInput, { label: "Email Address", value: cfg.email.address, onChange: v => updateCfg("email", { address: v }), placeholder: "you@gmail.com", helpText: "Your email address — used to detect sent vs received emails.", mode }),
+                React.createElement(WInput, { label: "IMAP Host", value: cfg.email.credentials?.host || "", onChange: v => updateCfg("email", { credentials: { ...cfg.email.credentials, host: v } }), mono: true, placeholder: "imap.gmail.com", helpText: "Gmail: imap.gmail.com | Outlook: outlook.office365.com | iCloud: imap.mail.me.com", mode }),
+                React.createElement(WInput, { label: "IMAP Port", value: cfg.email.credentials?.port || "993", onChange: v => updateCfg("email", { credentials: { ...cfg.email.credentials, port: v } }), mono: true, mode }),
+                React.createElement(WInput, { label: "Username", value: cfg.email.credentials?.username || "", onChange: v => updateCfg("email", { credentials: { ...cfg.email.credentials, username: v } }), mono: true, placeholder: "you@gmail.com", mode }),
+                React.createElement(WInput, { label: "Password / App Password", value: cfg.email.credentials?.password || "", onChange: v => updateCfg("email", { credentials: { ...cfg.email.credentials, password: v } }), type: "password", mono: true, helpText: "Gmail and Outlook require an App Password (not your regular password). Enable 2FA first, then generate one in your account security settings.", mode })
+              ),
+              cfg.email.provider === "gmail" && React.createElement("div", null,
+                React.createElement(WInput, { label: "Email Address", value: cfg.email.address, onChange: v => updateCfg("email", { address: v }), placeholder: "you@gmail.com", mode }),
+                React.createElement("div", { className: cl("text-sm p-3 rounded-xl", t.tipBox) },
+                  "Gmail API requires a Google Cloud project with OAuth2 credentials. See docs/EMAIL_SETUP.md for a detailed step-by-step guide. After setup, run: .venv/bin/python3 scripts/gmail/export_gmail.py --stats"
+                )
+              )
+            );
+          case "storage":
+            const PROVIDERS = [
+              { id: "onedrive", label: "OneDrive", icon: "\u{1F4E6}" },
+              { id: "gdrive", label: "Google Drive", icon: "\u{1F4BE}" },
+              { id: "dropbox", label: "Dropbox", icon: "\u{1F4E5}" },
+              { id: "s3", label: "S3 / MinIO", icon: "\u{1F5C4}" },
+              { id: "custom", label: "Other rclone", icon: "\u2699\uFE0F" },
+            ];
+            const cs = cfg.cloud_sync[0] || { provider: "", remote_name: "", remote_root: "", local_root: "", folders_text: "" };
+            const csUpdate = (k, v) => {
+              const updated = { ...cs, [k]: v };
+              setCfg({ ...cfg, cloud_sync: [updated] });
+            };
+            return React.createElement("div", null,
+              React.createElement("div", { className: cl("text-sm mb-4 p-3 rounded-xl", t.infoBox) },
+                "Optional. Sync documents from cloud storage into the KB. Requires rclone to be installed and configured on this machine."
+              ),
+              React.createElement("div", { className: cl("text-sm mb-4 p-3 rounded-xl", t.tipBox) },
+                "If you haven\u2019t set up rclone yet: install it (rclone.org), then run \u201Crclone config\u201D to add your cloud remote. Come back here to tell TAILOR which remote and folders to sync."
+              ),
+              // Provider select
+              React.createElement("label", { className: cl("text-sm font-medium block mb-2", t.textLabel) }, "Cloud Provider"),
+              React.createElement("div", { className: "flex flex-wrap gap-2 mb-4" },
+                PROVIDERS.map(p => React.createElement("button", {
+                  key: p.id, onClick: () => csUpdate("provider", p.id),
+                  className: cl("px-3 py-2 rounded-xl border text-sm transition-all",
+                    cs.provider === p.id ? "border-teal-500 bg-teal-500/10" : cl(t.borderLight, "hover:border-zinc-500"))
+                }, React.createElement("span", { className: "mr-1.5" }, p.icon), p.label))
+              ),
+              cs.provider && React.createElement("div", { className: "space-y-3" },
+                React.createElement(WInput, { label: "Rclone Remote Name", placeholder: "e.g. onedrive, gdrive, mydropbox",
+                  value: cs.remote_name || "", onChange: v => csUpdate("remote_name", v) }),
+                React.createElement(WInput, { label: "Remote Root Path", placeholder: "e.g. Documents, Personale, /",
+                  value: cs.remote_root || "", onChange: v => csUpdate("remote_root", v) }),
+                React.createElement(WInput, { label: "Local Sync Path", placeholder: "e.g. /home/user/OneDrive/Docs",
+                  value: cs.local_root || "", onChange: v => csUpdate("local_root", v) }),
+                React.createElement(WTextArea, { label: "Folders to sync (one per line)", placeholder: "Documents\nFinance\nProjects",
+                  value: cs.folders_text || "", onChange: v => csUpdate("folders_text", v) }),
+                React.createElement("div", { className: cl("text-sm p-3 rounded-xl mt-2", t.tipBox) },
+                  "These folders will be synced nightly via rclone, then ingested into the KB. You can add more folders later in the config editor."
+                )
+              )
+            );
+          case "remote":
+            return React.createElement("div", null,
+              React.createElement("div", { className: cl("text-sm mb-4 p-3 rounded-xl", t.infoBox) },
+                "Optional. Set up remote access to reach TAILOR from outside your local network."
+              ),
+              React.createElement("div", { className: "space-y-3" },
+                [
+                  { id: "none", name: "None (LAN only)", desc: "Access only from your local network. No setup needed.", icon: "\u{1F3E0}" },
+                  { id: "cloudflare", name: "Cloudflare Tunnel", desc: "Free. Requires Cloudflare account + domain. Exposes on public URL.", icon: "\u{1F310}" },
+                  { id: "tailscale", name: "Tailscale", desc: "Free for personal use. Private VPN mesh. No domain needed. Simplest option.", icon: "\u{1F511}" },
+                  { id: "ngrok", name: "ngrok", desc: "Free tier with random URL. Paid for fixed domain.", icon: "\u{1F680}" },
+                ].map(opt => React.createElement("div", {
+                  key: opt.id,
+                  onClick: () => updateCfg("remote_access", { provider: opt.id }),
+                  className: cl("flex items-center gap-3 p-4 rounded-xl border cursor-pointer transition-all",
+                    cfg.remote_access?.provider === opt.id
+                      ? (mode === "dark" ? "border-teal-500 bg-teal-900/20" : "border-teal-500 bg-teal-50")
+                      : (mode === "dark" ? "border-zinc-700 hover:border-zinc-600" : "border-zinc-200 hover:border-zinc-300")
+                  )
+                },
+                  React.createElement("span", { className: "text-2xl" }, opt.icon),
+                  React.createElement("div", { className: "flex-1" },
+                    React.createElement("div", { className: cl("text-sm font-semibold", t.text) }, opt.name),
+                    React.createElement("div", { className: cl("text-xs", t.textMuted) }, opt.desc)
+                  ),
+                  cfg.remote_access?.provider === opt.id && React.createElement("span", { className: "text-teal-500 text-lg" }, "\u2713")
+                ))
+              ),
+              cfg.remote_access?.provider && cfg.remote_access.provider !== "none" && React.createElement("div", { className: cl("text-sm mt-4 p-3 rounded-xl", t.tipBox) },
+                cfg.remote_access.provider === "cloudflare"
+                  ? "After setup, install cloudflared and run: cloudflared tunnel create tailor. Then configure the tunnel to route to localhost:8787."
+                  : cfg.remote_access.provider === "tailscale"
+                  ? "Install Tailscale on this machine and your devices. Access TAILOR via the Tailscale IP on port 8787."
+                  : "Install ngrok and run: ngrok http 8787. Use the generated URL to access TAILOR remotely."
+              )
+            );
+          case "import":
+            return React.createElement("div", null,
+              React.createElement("div", { className: cl("text-sm mb-4 p-3 rounded-xl", t.infoBox) },
+                "Optional. Bootstrap your Knowledge Base by importing conversation exports from other AI assistants."
+              ),
+              React.createElement("div", { className: "space-y-3" },
+                ["ChatGPT", "Claude", "Gemini"].map(name =>
+                  React.createElement("div", { key: name, className: cl("flex items-center justify-between p-3 rounded-xl border", t.borderLight, mode === "dark" ? "bg-zinc-900/40" : "bg-zinc-50") },
+                    React.createElement("div", { className: "flex items-center gap-3" },
+                      (name === "ChatGPT" ? React.createElement("img", { src: "/dashboard/icons/chatgpt.ico", alt: "ChatGPT", style: { width: "20px", height: "20px", borderRadius: "4px", display: "inline-block", verticalAlign: "middle" } }) : name === "Claude" ? React.createElement("img", { src: "/dashboard/icons/claude.ico", alt: "Claude", style: { width: "20px", height: "20px", borderRadius: "4px", display: "inline-block", verticalAlign: "middle" } }) : React.createElement("img", { src: "/dashboard/icons/gemini.png", alt: "Gemini", style: { width: "20px", height: "20px", borderRadius: "4px", display: "inline-block", verticalAlign: "middle" } })),
+                      React.createElement("div", null,
+                        React.createElement("span", { className: cl("text-sm font-semibold", t.text) }, name),
+                        React.createElement("span", { className: cl("text-xs block", t.textFaint) },
+                          name === "ChatGPT" ? "conversations.json export" :
+                          name === "Claude" ? "Claude export folder" : "Google Takeout export"
+                        )
+                      )
+                    ),
+                    React.createElement("span", { className: cl("text-xs px-2 py-1 rounded-md", mode === "dark" ? "bg-zinc-800 text-zinc-500" : "bg-zinc-200 text-zinc-400") }, "via CLI after setup")
+                  )
+                )
+              ),
+              React.createElement("div", { className: cl("text-sm mt-4 p-3 rounded-xl", t.tipBox) },
+                "After completing setup, use the ingest scripts to import your conversation exports: python scripts/ingest/ingest_conversations.py --source chatgpt"
+              )
+            );
+          case "review":
+            const RR = ({ label, value, masked }) =>
+              React.createElement("div", { className: cl("flex items-center justify-between py-2 border-b last:border-0", t.borderLight) },
+                React.createElement("span", { className: cl("text-sm", t.textMuted) }, label),
+                React.createElement("span", { className: cl("text-sm font-mono", masked ? t.textFaint : t.mono) }, masked ? "\u2022".repeat(16) : (value || "\u2014"))
+              );
+            return React.createElement("div", { className: "space-y-4" },
+              React.createElement(Tile, null,
+                React.createElement("h4", { className: cl("text-sm font-semibold mb-3", t.text) }, "\u{1F464} Identity"),
+                React.createElement(RR, { label: "Name", value: cfg.user.name }),
+                React.createElement(RR, { label: "App Name", value: cfg.branding.app_name })
+              ),
+              React.createElement(Tile, null,
+                React.createElement("h4", { className: cl("text-sm font-semibold mb-3", t.text) }, "\u{1F9E0} LLM"),
+                React.createElement(RR, { label: "Provider", value: cfg.llm.provider }),
+                React.createElement(RR, { label: "Model", value: cfg.llm.model }),
+                cfg.llm.provider !== "ollama" && React.createElement(RR, { label: "API Key", masked: true })
+              ),
+              React.createElement(Tile, null,
+                React.createElement("h4", { className: cl("text-sm font-semibold mb-3", t.text) }, "\u{1F52E} Embedding"),
+                React.createElement(RR, { label: "Provider", value: cfg.embedding.provider }),
+                React.createElement(RR, { label: "Model", value: cfg.embedding.model }),
+                React.createElement(RR, { label: "Dimensions", value: String(cfg.embedding.dimensions) })
+              ),
+              cfg.telegram.bot_token && React.createElement(Tile, null,
+                React.createElement("h4", { className: cl("text-sm font-semibold mb-3", t.text) }, "\u{1F4AC} Telegram"),
+                React.createElement(RR, { label: "Bot Token", masked: true }),
+                React.createElement(RR, { label: "Chat ID", value: cfg.telegram.chat_id })
+              ),
+              cfg.email.provider && React.createElement(Tile, null,
+                React.createElement("h4", { className: cl("text-sm font-semibold mb-3", t.text) }, "\u{1F4E7} Email"),
+                React.createElement(RR, { label: "Provider", value: cfg.email.provider }),
+                React.createElement(RR, { label: "Address", value: cfg.email.address })
+              ),
+              cfg.remote_access?.provider && cfg.remote_access.provider !== "none" && React.createElement(Tile, null,
+                React.createElement("h4", { className: cl("text-sm font-semibold mb-3", t.text) }, "\u{1F310} Remote Access"),
+                React.createElement(RR, { label: "Provider", value: cfg.remote_access.provider })
+              ),
+              cfg.enrichment && Object.keys(cfg.enrichment).length > 0 && React.createElement(Tile, null,
+                React.createElement("h4", { className: cl("text-sm font-semibold mb-3", t.text) }, "\u{1F52C} Enrichment"),
+                Object.entries(cfg.enrichment).map(([role, rcfg]) =>
+                  rcfg.backends && rcfg.backends.filter(b => b.provider).length > 0 && React.createElement(RR, {
+                    key: role,
+                    label: role.replace(/_/g, " "),
+                    value: rcfg.backends.filter(b => b.provider).map(b => b.provider + "/" + b.model).join(" \u2192 ")
+                  })
+                )
+              ),
+              error && React.createElement("div", { className: "text-sm text-red-400 p-3 rounded-xl bg-red-500/10" }, error)
+            );
+          default: return null;
+        }
+      };
+
+      return React.createElement(ThemeContext.Provider, { value: t },
+        React.createElement("div", {
+          className: "min-h-screen", style: { background: t.bg, fontFamily: "'Outfit', sans-serif" }
+        },
+          React.createElement("div", { className: "text-center pt-12 pb-6 px-4" },
+          React.createElement("div", {
+            className: "w-16 h-16 rounded-2xl flex items-center justify-center mx-auto mb-4",
+            style: { background: "linear-gradient(135deg, #14b8a6, #0d9488)" }
+          }, React.createElement("span", { className: "text-3xl font-extrabold text-white" }, "T")),
+          React.createElement("h1", { className: cl("text-2xl font-bold", t.text) }, "Setup TAILOR"),
+          React.createElement("p", { className: cl("text-sm mt-1", t.textMuted) }, "Configure your personal AI memory system")
+        ),
+        React.createElement("div", { className: "max-w-2xl mx-auto px-6 mb-8" },
+          React.createElement("div", { className: "flex items-center gap-1" },
+            WIZARD_STEPS.map((s, i) => React.createElement("div", { key: s.id, className: "flex-1 flex flex-col items-center" },
+              React.createElement("div", {
+                className: cl("w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold mb-1 transition-all",
+                  i < step ? "bg-teal-600 text-white cursor-pointer" :
+                  i === step ? "bg-teal-500 text-white ring-4 ring-teal-500/20" :
+                  mode === "dark" ? "bg-zinc-800 text-zinc-500" : "bg-zinc-200 text-zinc-400"
+                ),
+                onClick: () => { if (i < step) setStep(i); },
+              }, i < step ? "\u2713" : String(i + 1)),
+              React.createElement("span", { className: cl("text-xs hidden sm:block", i === step ? t.accent : t.textFaint) }, s.label)
+            ))
+          )
+        ),
+        React.createElement("div", { className: "max-w-2xl mx-auto px-6" },
+          React.createElement(Tile, null,
+            React.createElement("div", { className: "flex items-center gap-3 mb-5" },
+              React.createElement("span", { className: "text-2xl" }, current.icon),
+              React.createElement("div", null,
+                React.createElement("h2", { className: cl("text-lg font-bold", t.text) }, current.label),
+                React.createElement("p", { className: cl("text-sm", t.textMuted) }, current.desc),
+                current.optional && React.createElement("span", { className: cl("text-xs px-2 py-0.5 rounded-md mt-1 inline-block", mode === "dark" ? "bg-zinc-800 text-zinc-500" : "bg-zinc-100 text-zinc-400") }, "optional")
+              )
+            ),
+            renderStepContent()
+          )
+        ),
+        React.createElement("div", { className: "max-w-2xl mx-auto px-6 py-6 flex items-center justify-between" },
+          React.createElement("button", {
+            onClick: () => setStep(s => s - 1),
+            disabled: isFirst,
+            className: cl("px-5 py-2.5 rounded-xl text-sm font-semibold transition-all",
+              isFirst ? "opacity-0 cursor-default" :
+              mode === "dark" ? "bg-zinc-800 text-zinc-300 hover:bg-zinc-700" : "bg-zinc-100 text-zinc-600 hover:bg-zinc-200"
+            ),
+          }, "\u2190 Back"),
+          React.createElement("span", { className: cl("text-sm", t.textFaint) }, `${step + 1} / ${WIZARD_STEPS.length}`),
+          isLast
+            ? React.createElement("button", {
+                onClick: handleSave, disabled: saving,
+                className: cl("px-6 py-2.5 rounded-xl text-sm font-semibold transition-all",
+                  "bg-teal-600 hover:bg-teal-500 text-white", saving && "opacity-50 cursor-not-allowed"),
+              }, saving ? "Saving..." : "Save & Launch \u{1F680}")
+            : React.createElement("button", {
+                onClick: () => setStep(s => s + 1), disabled: !canProceed(),
+                className: cl("px-5 py-2.5 rounded-xl text-sm font-semibold transition-all",
+                  canProceed() ? "bg-teal-600 hover:bg-teal-500 text-white" : "opacity-50 cursor-not-allowed bg-teal-600 text-white"),
+              }, current.optional ? "Skip \u2192" : "Next \u2192")
+        )
+      ));
+    }
+
+    // ── Pages ──
+
+
+    function ModelAdvisorCard({ data }) {
+      const t = useTheme();
+      if (!data || (!data.advisories?.length && !data.last_check)) return null;
+      const [jobs, setJobs] = useState({});
+      const advisories = data.advisories || [];
+      const updates = advisories.filter(function(a) { return a.type === "update"; });
+      const newModels = advisories.filter(function(a) { return a.type === "new"; });
+      const deprecated = advisories.filter(function(a) { return a.type === "deprecated"; });
+      const hasChanges = advisories.length > 0;
+      var lastCheckStr = "Never";
+      if (data.last_check) { try { var d2 = new Date(data.last_check); var diffH = Math.round((new Date() - d2) / 3600000); if (diffH < 1) lastCheckStr = "Just now"; else if (diffH < 24) lastCheckStr = diffH + "h ago"; else lastCheckStr = Math.round(diffH / 24) + "d ago"; } catch(e) { lastCheckStr = data.last_check.slice(0, 10); } }
+      function isOllamaModel(a) { return a.provider === "ollama" || (a.detail || "").indexOf("[on Ollama]") !== -1; }
+      function installModel(mid) {
+        setJobs(function(p) { var n = Object.assign({}, p); n[mid] = { status: "starting", progress: "Sending..." }; return n; });
+        fetch(API_BASE + "/api/dashboard/model-advisor/install" + (API_TOKEN ? "?token=" + API_TOKEN : ""), { method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include", body: JSON.stringify({ model: mid }) }).then(function(r) { return r.json(); }).then(function(d) {
+          if (d.ok) { setJobs(function(p) { var n = Object.assign({}, p); n[mid] = { status: "pulling", progress: "Downloading...", job_id: d.job_id }; return n; }); pollInstall(mid, d.job_id); }
+          else { setJobs(function(p) { var n = Object.assign({}, p); n[mid] = { status: "error", progress: d.error || "Failed" }; return n; }); }
+        }).catch(function(e) { setJobs(function(p) { var n = Object.assign({}, p); n[mid] = { status: "error", progress: e.message }; return n; }); });
+      }
+      function pollInstall(key, jid) {
+        var iv = setInterval(function() {
+          fetch(API_BASE + "/api/dashboard/model-advisor/status/" + jid + (API_TOKEN ? "?token=" + API_TOKEN : ""), { credentials: "include" }).then(function(r) { return r.json(); }).then(function(d) {
+            setJobs(function(p) { var n = Object.assign({}, p); n[key] = { status: d.status, progress: d.progress || d.error || "", job_id: jid }; return n; });
+            if (d.status === "done" || d.status === "error") clearInterval(iv);
+          }).catch(function() { clearInterval(iv); });
+        }, 2000);
+      }
+      function renderAction(a) {
+        var job = jobs[a.model_id];
+        if (job) {
+          if (job.status === "pulling" || job.status === "starting") return React.createElement("span", { className: "text-xs text-teal-400 animate-pulse" }, job.progress);
+          if (job.status === "done") return React.createElement("span", { className: "text-xs text-green-400" }, "\u2714 Installed");
+          if (job.status === "error") return React.createElement("span", { className: "text-xs text-red-400" }, "\u2717 " + job.progress);
+        }
+        if (isOllamaModel(a)) return React.createElement("button", { className: "text-xs px-2 py-0.5 rounded border border-teal-500/30 text-teal-400 hover:bg-teal-500/10 transition-colors cursor-pointer", onClick: function() { installModel(a.model_id); } }, a.type === "update" ? "Update" : "Install");
+        return null;
+      }
+      function renderRow(a, i, pfx) {
+        var icon = a.type === "update" ? "\u21BB" : a.type === "new" ? "\u2726" : "\u2715";
+        var ic = a.type === "new" ? "text-teal-400" : a.type === "deprecated" ? "text-red-400" : "";
+        return React.createElement("div", { key: pfx + i, className: cl("text-sm flex items-center gap-2 py-1", t.textMuted) },
+          React.createElement("span", { className: ic }, icon),
+          React.createElement("span", { className: "font-mono text-xs flex-1 min-w-0 truncate" }, a.model_id),
+          a.size_gb ? React.createElement("span", { className: cl("text-xs whitespace-nowrap", t.textFaint) }, a.size_gb + "GB") : null,
+          renderAction(a));
+      }
+      return React.createElement(Tile, null,
+        React.createElement("div", { className: "flex items-center justify-between mb-3" },
+          React.createElement("h3", { className: cl("text-sm font-semibold", t.text) }, "\uD83D\uDD0D Model Advisor"),
+          React.createElement("span", { className: cl("text-xs", t.textFaint) }, "Last check: " + lastCheckStr)),
+        hasChanges ? React.createElement("div", { className: "space-y-3" },
+          updates.length > 0 && React.createElement("div", null,
+            React.createElement("div", { className: cl("text-xs font-semibold mb-1", t.textMuted) }, "Updates Available"),
+            updates.slice(0, 5).map(function(a, i) { return renderRow(a, i, "u"); })),
+          newModels.length > 0 && React.createElement("div", null,
+            React.createElement("div", { className: cl("text-xs font-semibold mb-1", t.textMuted) }, "New Models"),
+            newModels.slice(0, 8).map(function(a, i) { return renderRow(a, i, "n"); }),
+            newModels.length > 8 && React.createElement("div", { className: cl("text-xs mt-1", t.textFaint) }, "+" + (newModels.length - 8) + " more")),
+          deprecated.length > 0 && React.createElement("div", null,
+            React.createElement("div", { className: cl("text-xs font-semibold mb-1", t.textMuted) }, "Removed"),
+            deprecated.slice(0, 3).map(function(a, i) { return renderRow(a, i, "d"); }))
+        ) : (data.recommendations && data.recommendations.length > 0 ? React.createElement("div", { className: "space-y-2" }, React.createElement("div", { className: cl("text-xs font-semibold mb-1", t.textMuted) }, "Recommended for your hardware"), data.recommendations.slice(0, 6).map(function(r, i) { return React.createElement("div", { key: "r" + i, className: cl("text-sm flex items-center gap-2 py-1", t.textMuted) }, React.createElement("span", { className: "text-teal-400" }, "\u2726"), React.createElement("span", { className: "font-mono text-xs flex-1 min-w-0 truncate" }, r.model_id), React.createElement("span", { className: cl("text-xs whitespace-nowrap", t.textFaint) }, r.params_b + "B \u2022 " + r.ram_q4_gb + "GB"), React.createElement("button", { className: "text-xs px-2 py-0.5 rounded border border-teal-500/30 text-teal-400 hover:bg-teal-500/10 transition-colors cursor-pointer", onClick: function() { installModel(r.model_id); } }, "Install")); }), data.recommendations.length > 6 ? React.createElement("div", { className: cl("text-xs mt-1", t.textFaint) }, "+" + (data.recommendations.length - 6) + " more") : null) : React.createElement("div", { className: cl("text-sm py-2", t.textMuted) }, "\u2714 No changes detected.")));
+    }
+
+    function HomePage({ stats, services, setTab, modelAdvisor }) {
+      const t = useTheme();
+      return React.createElement("div", { className: "space-y-5" },
+        React.createElement("div", { className: "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4" },
+          services ? services.map((svc) => {
+            const sc = statusStyle[svc.status] || statusStyle.stopped;
+            return React.createElement(Tile, { key: svc.id },
+              React.createElement("div", { className: "flex items-start gap-4" },
+                React.createElement("div", { className: "text-3xl mt-0.5" }, svcIcon(svc.id)),
+                React.createElement("div", { className: "flex-1 min-w-0" },
+                  React.createElement("div", { className: "flex items-center justify-between" },
+                    React.createElement("h3", { className: cl("text-sm font-semibold", t.text) }, svc.name),
+                    React.createElement("span", { className: cl("w-2.5 h-2.5 rounded-full", sc.dot, sc.glow) })
+                  ),
+                  React.createElement("p", { className: cl("text-sm mt-0.5", t.textMuted) }, svc.desc),
+                  React.createElement("div", { className: "flex items-center gap-3 mt-2.5" },
+                    React.createElement("span", { className: cl("text-sm font-medium px-2 py-0.5 rounded-md", sc.bg, sc.text) }, svc.status),
+                    svc.port && React.createElement("span", { className: cl("text-sm font-mono", t.textFaint) }, `:${svc.port}`)
+                  )
+                )
+              )
+            );
+          }) : [1,2,3].map(i => React.createElement(Tile, { key: i }, React.createElement(Skeleton, { className: "h-16 w-full" })))
+        ),
+        stats && stats.chunks && stats.chunks.total === 0 && React.createElement(Tile, null,
+          React.createElement("div", { className: "text-center py-6" },
+            React.createElement("div", { className: "text-4xl mb-4" }, "🚀"),
+            React.createElement("h3", { className: cl("text-lg font-semibold mb-2", t.text) }, "Your Knowledge Base is empty"),
+            React.createElement("p", { className: cl("text-sm mb-6 max-w-md mx-auto", t.textMuted) },
+              "TAILOR is running, but there\u2019s no data yet. Here\u2019s how to get started:"
+            ),
+            React.createElement("div", { className: "grid grid-cols-1 sm:grid-cols-3 gap-4 max-w-2xl mx-auto text-left" },
+              React.createElement("div", { className: cl("rounded-xl border p-4 cursor-pointer hover:border-teal-500/50 transition-colors", t.borderLight), onClick: () => setTab("kb") },
+                React.createElement("div", { className: "text-2xl mb-2" }, "💬"),
+                React.createElement("h4", { className: cl("text-sm font-semibold mb-1", t.text) }, "Import conversations"),
+                React.createElement("p", { className: cl("text-xs", t.textMuted) },
+                  "Export from ChatGPT, Claude, or Gemini and upload via the Knowledge Base tab."
+                )
+              ),
+              React.createElement("div", { className: cl("rounded-xl border p-4 cursor-pointer hover:border-teal-500/50 transition-colors", t.borderLight), onClick: () => setTab("config") },
+                React.createElement("div", { className: "text-2xl mb-2" }, "📄"),
+                React.createElement("h4", { className: cl("text-sm font-semibold mb-1", t.text) }, "Add documents"),
+                React.createElement("p", { className: cl("text-xs", t.textMuted) },
+                  "Configure document folders in the Configuration tab, then run the nightly pipeline or sync manually."
+                )
+              ),
+              React.createElement("div", { className: cl("rounded-xl border p-4 cursor-pointer hover:border-teal-500/50 transition-colors", t.borderLight), onClick: () => setTab("config") },
+                React.createElement("div", { className: "text-2xl mb-2" }, "📧"),
+                React.createElement("h4", { className: cl("text-sm font-semibold mb-1", t.text) }, "Connect email"),
+                React.createElement("p", { className: cl("text-xs", t.textMuted) },
+                  "Set up IMAP or Gmail API in the config. See docs/EMAIL_SETUP.md for a step-by-step guide."
+                )
+              )
+            )
+          )
+        ),
+        React.createElement("div", { className: "grid grid-cols-2 sm:grid-cols-4 gap-4" },
+          React.createElement(Tile, null, React.createElement(BigNum, { value: stats?.chunks?.total, label: "Chunks", accent: true })),
+          React.createElement(Tile, null, React.createElement(BigNum, { value: stats?.facts?.total, label: "Atomic Facts" })),
+          React.createElement(Tile, null, React.createElement(BigNum, { value: stats?.entities, label: "Entities" })),
+          React.createElement(Tile, null, React.createElement(BigNum, { value: stats?.db_size_mb ? `${(stats.db_size_mb / 1000).toFixed(1)}` : null, label: "Database", unit: "GB" }))
+        ),
+        stats && (() => {
+          const coverage = stats.chunks.total > 0 ? Math.round((stats.facts.covered / stats.chunks.total) * 100) : 0;
+          const isHealthMode = coverage >= 95;
+          const factsPerChunk = stats.facts.covered > 0 ? (stats.facts.total / stats.facts.covered).toFixed(1) : "—";
+          const supersededPct = stats.facts.total > 0 ? ((stats.facts.superseded / stats.facts.total) * 100).toFixed(2) : "0";
+          const derivedPct = stats.facts.total > 0 ? ((stats.facts.derived / stats.facts.total) * 100).toFixed(1) : "0";
+
+          if (isHealthMode) {
+            // KB Health mode
+            return React.createElement(Tile, null,
+              React.createElement("div", { className: "flex items-center justify-between mb-3" },
+                React.createElement("h3", { className: cl("text-sm font-semibold", t.text) }, "\u{1f49a} Knowledge Base Health"),
+                React.createElement("span", { className: "text-sm font-semibold text-teal-400" }, `${coverage}% indexed`)
+              ),
+              React.createElement(ProgressBar, { value: coverage, max: 100, color: "bg-teal-500" }),
+              React.createElement("div", { className: "grid grid-cols-3 gap-4 mt-4" },
+                React.createElement("div", { className: "text-center" },
+                  React.createElement("div", { className: cl("text-lg font-bold", t.text) }, factsPerChunk),
+                  React.createElement("div", { className: cl("text-xs", t.textFaint) }, "facts/chunk")
+                ),
+                React.createElement("div", { className: "text-center" },
+                  React.createElement("div", { className: cl("text-lg font-bold", t.text) }, `${stats.facts.derived.toLocaleString()}`),
+                  React.createElement("div", { className: cl("text-xs", t.textFaint) }, `derived (${derivedPct}%)`)
+                ),
+                React.createElement("div", { className: "text-center" },
+                  React.createElement("div", { className: cl("text-lg font-bold", t.text) }, `${stats.facts.superseded.toLocaleString()}`),
+                  React.createElement("div", { className: cl("text-xs", t.textFaint) }, `superseded (${supersededPct}%)`)
+                )
+              )
+            );
+          }
+
+          // Extraction progress mode (< 95%)
+          const remaining = stats.chunks.total - stats.facts.covered;
+          const nightsLeft = remaining > 0 ? Math.max(1, Math.round(remaining / 9000)) : 0;
+          return React.createElement(Tile, null,
+            React.createElement("div", { className: "flex items-center justify-between mb-3" },
+              React.createElement("h3", { className: cl("text-sm font-semibold", t.text) }, "\u{1F9E0} Fact Extraction Progress"),
+              React.createElement("span", { className: cl("text-sm", t.textMuted) }, `${coverage}% coverage`)
+            ),
+            React.createElement(ProgressBar, { value: stats.facts.covered, max: stats.chunks.total }),
+            React.createElement("div", { className: "flex justify-between mt-2 text-sm" },
+              React.createElement("span", { className: t.textFaint }, `${stats.facts.covered.toLocaleString()} chunks processed`),
+              React.createElement("span", { className: t.textFaint }, nightsLeft > 0 ? `~${nightsLeft} nights remaining` : "Complete")
+            )
+          );
+        })(),
+        React.createElement(ModelAdvisorCard, { data: modelAdvisor })
+      );
+    }
+
+    function UploadSection() {
+      const t = useTheme();
+      const [file, setFile] = useState(null);
+      const [source, setSource] = useState("chatgpt");
+      const [uploading, setUploading] = useState(false);
+      const [job, setJob] = useState(null);
+      const [dragOver, setDragOver] = useState(false);
+
+      const handleFile = (f) => { if (f) setFile(f); };
+      const handleDrop = (e) => { e.preventDefault(); setDragOver(false); handleFile(e.dataTransfer.files[0]); };
+      const handleDragOver = (e) => { e.preventDefault(); setDragOver(true); };
+      const handleDragLeave = () => setDragOver(false);
+
+      const upload = async () => {
+        if (!file) return;
+        setUploading(true); setJob(null);
+        const fd = new FormData();
+        fd.append("file", file);
+        fd.append("source", source);
+        try {
+          const sep = "/api/dashboard/upload";
+          const url = `${API_BASE}${sep}${API_TOKEN ? `?token=${API_TOKEN}` : ""}`;
+          const r = await fetch(url, { method: "POST", body: fd, credentials: "include" });
+          const d = await r.json();
+          if (d.ok) { setJob({ ...d, status: "running", progress_pct: 0, message: "Starting..." }); pollJob(d.job_id); }
+          else { setJob({ status: "error", message: d.error || "Upload failed" }); setUploading(false); }
+        } catch (e) { setJob({ status: "error", message: e.message }); setUploading(false); }
+      };
+
+      const pollJob = async (jid) => {
+        const poll = async () => {
+          try {
+            const url = `${API_BASE}/api/dashboard/upload/status?job=${jid}${API_TOKEN ? `&token=${API_TOKEN}` : ""}`;
+            const r = await fetch(url, { credentials: "include" });
+            const d = await r.json();
+            setJob(d);
+            if (d.status === "running") { setTimeout(poll, 2000); }
+            else { setUploading(false); }
+          } catch { setTimeout(poll, 3000); }
+        };
+        setTimeout(poll, 1500);
+      };
+
+      const reset = () => { setFile(null); setJob(null); setUploading(false); };
+
+      const sources = [
+        { id: "chatgpt", label: "ChatGPT", desc: "conversations.json or .zip", icon: "chatgpt" },
+        { id: "claude", label: "Claude", desc: "Export .zip", icon: "claude" },
+        { id: "gemini", label: "Gemini", desc: "Google Takeout .zip", icon: "gemini" },
+      ];
+
+      return React.createElement(Tile, null,
+        React.createElement("h3", { className: cl("text-sm font-semibold mb-4", t.text) }, "\u{1F4E4} Upload Conversations"),
+        // Source selector
+        React.createElement("div", { className: "flex gap-2 mb-4" },
+          sources.map(s => React.createElement("button", {
+            key: s.id,
+            onClick: () => { if (!uploading) setSource(s.id); },
+            className: cl("flex-1 p-2.5 rounded-xl border text-left transition-all",
+              source === s.id ? "border-teal-500 bg-teal-500/10" : cl(t.borderLight, "hover:border-zinc-500"),
+              uploading && "opacity-50 cursor-not-allowed")
+          },
+            (s.icon === "chatgpt" ? React.createElement("img", { src: "/dashboard/icons/chatgpt.ico", alt: "ChatGPT", style: { width: "20px", height: "20px", borderRadius: "4px", display: "inline-block", verticalAlign: "middle" } }) : s.icon === "claude" ? React.createElement("img", { src: "/dashboard/icons/claude.ico", alt: "Claude", style: { width: "20px", height: "20px", borderRadius: "4px", display: "inline-block", verticalAlign: "middle" } }) : s.icon === "gemini" ? React.createElement("img", { src: "/dashboard/icons/gemini.png", alt: "Gemini", style: { width: "20px", height: "20px", borderRadius: "4px", display: "inline-block", verticalAlign: "middle" } }) : React.createElement("span", { className: "text-lg" }, s.icon)),
+            React.createElement("span", { className: cl("text-sm font-semibold block mt-1", t.text) }, s.label),
+            React.createElement("span", { className: cl("text-xs", t.textFaint) }, s.desc)
+          ))
+        ),
+        // Drop zone
+        !job && React.createElement("div", {
+          onDrop: handleDrop, onDragOver: handleDragOver, onDragLeave: handleDragLeave,
+          onClick: () => { if (!uploading) document.getElementById("upload-file-input").click(); },
+          className: cl("border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-all mb-4",
+            dragOver ? "border-teal-400 bg-teal-500/10" : cl(t.borderLight, "hover:border-zinc-500"))
+        },
+          React.createElement("input", { id: "upload-file-input", type: "file", className: "hidden",
+            accept: ".json,.zip", onChange: (e) => handleFile(e.target.files[0]) }),
+          file
+            ? React.createElement("div", null,
+                React.createElement("span", { className: cl("text-sm font-semibold", t.text) }, file.name),
+                React.createElement("span", { className: cl("text-sm block mt-1", t.textFaint) },
+                  `${(file.size / 1048576).toFixed(1)} MB`))
+            : React.createElement("div", null,
+                React.createElement("span", { className: cl("text-3xl block mb-2", t.textFaint) }, "\u{1F4C1}"),
+                React.createElement("span", { className: cl("text-sm", t.textMuted) }, "Drop file here or click to browse"),
+                React.createElement("span", { className: cl("text-xs block mt-1", t.textFaint) }, ".json or .zip"))
+        ),
+        // Upload button
+        !job && file && React.createElement("button", {
+          onClick: upload, disabled: uploading,
+          className: cl("w-full py-3 rounded-xl font-semibold text-sm transition-all",
+            uploading ? "bg-zinc-700 text-zinc-400 cursor-not-allowed" : "bg-teal-600 hover:bg-teal-500 text-white")
+        }, uploading ? "Uploading..." : `Upload & Ingest (${source})`),
+        // Job status
+        job && React.createElement("div", { className: cl("p-4 rounded-xl mt-2", job.status === "error" ? "bg-red-500/10" : job.status === "done" ? "bg-emerald-500/10" : cl(t.rowAlt)) },
+          React.createElement("div", { className: "flex items-center justify-between mb-2" },
+            React.createElement("span", { className: cl("text-sm font-semibold",
+              job.status === "error" ? "text-red-400" : job.status === "done" ? "text-emerald-400" : t.text) },
+              job.status === "running" ? "\u23F3 Processing..." : job.status === "done" ? "\u2705 Complete" : "\u274C Error"),
+            job.progress_pct > 0 && job.status === "running" && React.createElement("span", { className: cl("text-sm font-mono", t.textMuted) }, `${job.progress_pct}%`)
+          ),
+          job.status === "running" && job.progress_pct > 0 && React.createElement(ProgressBar, { value: job.progress_pct, max: 100, color: "bg-teal-500" }),
+          React.createElement("span", { className: cl("text-sm block mt-2", t.textMuted) }, job.message),
+          job.status !== "running" && React.createElement("button", {
+            onClick: reset,
+            className: cl("mt-3 px-4 py-2 rounded-lg text-sm font-medium", t.borderLight, "border hover:border-zinc-500", t.text)
+          }, "Upload another")
+        )
+      );
+    }
+
+    function KBPage({ stats, config }) {
+      const t = useTheme();
+      if (!stats) return React.createElement(Tile, null, React.createElement(Skeleton, { className: "h-40 w-full" }));
+      const sources = [
+        { label: "Documents", value: stats.chunks.document || 0, color: "bg-teal-500", icon: "\u{1F4C4}" },
+        { label: "Email", value: stats.chunks.email || 0, color: "bg-violet-500", icon: "\u{1F4E7}" },
+        { label: "Claude", value: stats.chunks.claude || 0, color: "bg-amber-500", icon: "claude" },
+        { label: "ChatGPT", value: stats.chunks.chatgpt || 0, color: "bg-emerald-500", icon: "chatgpt" },
+      ];
+      const convs = config?.conversations || [];
+      const clouds = config?.cloud_sync || [];
+      return React.createElement("div", { className: "space-y-5" },
+        React.createElement("div", { className: "grid grid-cols-2 sm:grid-cols-4 gap-4" },
+          React.createElement(Tile, null, React.createElement(BigNum, { value: stats.chunks.total, label: "Total Chunks", accent: true })),
+          React.createElement(Tile, null, React.createElement(BigNum, { value: stats.facts.total, label: "Atomic Facts" })),
+          React.createElement(Tile, null, React.createElement(BigNum, { value: stats.entities, label: "Unique Entities" })),
+          React.createElement(Tile, null, React.createElement(BigNum, { value: stats.documents, label: "Documents" }))
+        ),
+        React.createElement(Tile, null,
+          React.createElement("h3", { className: cl("text-sm font-semibold mb-4", t.text) }, "Chunks by Source"),
+          React.createElement("div", { className: "space-y-4" },
+            sources.map(s => React.createElement("div", { key: s.label },
+              React.createElement("div", { className: "flex items-center justify-between mb-1.5" },
+                React.createElement("div", { className: "flex items-center gap-2" },
+                  (s.icon === "chatgpt" ? React.createElement("img", { src: "/dashboard/icons/chatgpt.ico", alt: "ChatGPT", style: { width: "20px", height: "20px", borderRadius: "4px", display: "inline-block", verticalAlign: "middle" } }) : s.icon === "claude" ? React.createElement("img", { src: "/dashboard/icons/claude.ico", alt: "Claude", style: { width: "20px", height: "20px", borderRadius: "4px", display: "inline-block", verticalAlign: "middle" } }) : s.icon === "gemini" ? React.createElement("img", { src: "/dashboard/icons/gemini.png", alt: "Gemini", style: { width: "20px", height: "20px", borderRadius: "4px", display: "inline-block", verticalAlign: "middle" } }) : React.createElement("span", null, s.icon)),
+                  React.createElement("span", { className: cl("text-sm", t.textLabel) }, s.label)
+                ),
+                React.createElement("span", { className: cl("text-sm font-mono", t.textMuted) }, s.value.toLocaleString())
+              ),
+              React.createElement(ProgressBar, { value: s.value, max: stats.chunks.total, color: s.color, height: "h-1.5" })
+            ))
+          )
+        ),
+        React.createElement(Tile, null,
+          React.createElement("h3", { className: cl("text-sm font-semibold mb-4", t.text) }, "Facts Engine"),
+          React.createElement("div", { className: "grid grid-cols-2 sm:grid-cols-4 gap-4" },
+            React.createElement(BigNum, { value: stats.facts.total, label: "Extracted" }),
+            React.createElement(BigNum, { value: stats.facts.derived, label: "Derived" }),
+            React.createElement(BigNum, { value: stats.facts.superseded, label: "Superseded" }),
+            React.createElement(BigNum, { value: stats.facts.covered, label: "Chunks Covered" })
+          )
+        ),
+        React.createElement(UploadSection),
+                convs.length > 0 && React.createElement(React.Fragment, null,
+          React.createElement("h3", { className: cl("text-sm font-semibold uppercase tracking-widest", t.textLabel) }, "Conversation Sources"),
+          React.createElement("div", { className: "grid grid-cols-1 sm:grid-cols-3 gap-4" },
+            convs.map(c => React.createElement(Tile, { key: c.name },
+              React.createElement("div", { className: "flex items-center justify-between mb-2" },
+                React.createElement("span", { className: cl("text-sm font-semibold capitalize", t.text) }, c.name),
+                React.createElement("span", { className: cl("text-sm font-medium px-2 py-0.5 rounded-md", c.enabled ? "bg-emerald-500/15 text-emerald-400" : "bg-zinc-800 text-zinc-500") }, c.enabled ? "enabled" : "disabled")
+              ),
+              React.createElement("div", { className: cl("text-sm font-mono", t.textFaint) }, `parser: ${c.parser}`)
+            ))
+          )
+        ),
+        clouds.length > 0 && React.createElement(React.Fragment, null,
+          React.createElement("h3", { className: cl("text-sm font-semibold uppercase tracking-widest", t.textLabel) }, "Cloud Sync"),
+          clouds.map((c, i) => React.createElement(Tile, { key: i },
+            React.createElement("div", { className: "flex items-center justify-between" },
+              React.createElement("div", { className: "flex items-center gap-3" },
+                React.createElement("span", { className: "text-2xl" }, "\u2601\uFE0F"),
+                React.createElement("div", null,
+                  React.createElement("h4", { className: cl("text-sm font-semibold", t.text) }, c.name),
+                  React.createElement("span", { className: cl("text-sm font-mono", t.textMuted) }, `${c.remote_name}:${c.remote_root}`)
+                )
+              ),
+              React.createElement(Tag, { variant: "accent" }, `${(c.folders || []).length} folders`)
+            )
+          ))
+        )
+      );
+    }
+
+    function PipelinePage({ pipeline }) {
+      const t = useTheme();
+      const CRON = [
+        { time: "02:30", name: "DB Backup", script: "backup_db.sh" },
+        { time: "03:00", name: "Nightly Pipeline", script: "sync_and_ingest.sh" },
+        { time: "04:00", name: "Gmail Sync", script: "sync_gmail.sh" },
+        { time: "*/5m", name: "Heartbeat", script: "heartbeat.py" },
+        { time: "*/1m", name: "Reminders", script: "reminder_checker.py" },
+      ];
+      return React.createElement("div", { className: "space-y-5" },
+        React.createElement(Tile, null,
+          React.createElement("h3", { className: cl("text-sm font-semibold mb-4", t.text) }, "Pipeline Log (last 50 lines)"),
+          pipeline?.log_tail
+            ? React.createElement("pre", { className: cl("text-sm font-mono leading-relaxed overflow-x-auto max-h-96 overflow-y-auto p-3 rounded-xl whitespace-pre-wrap", t.rowAlt, t.textMuted) }, pipeline.log_tail)
+            : React.createElement(Skeleton, { className: "h-40 w-full" })
+        ),
+        React.createElement(Tile, null,
+          React.createElement("h3", { className: cl("text-sm font-semibold mb-4", t.text) }, "Schedule (cron)"),
+          React.createElement("div", { className: "space-y-1" },
+            CRON.map((job, i) => React.createElement("div", { key: i, className: cl("flex items-center justify-between py-2.5 px-3 rounded-xl", i % 2 === 0 ? t.rowAlt : "") },
+              React.createElement("div", { className: "flex items-center gap-4" },
+                React.createElement("span", { className: cl("text-sm font-mono w-12", t.accent) }, job.time),
+                React.createElement("span", { className: cl("text-sm", t.text) }, job.name)
+              ),
+              React.createElement("span", { className: cl("text-sm font-mono", t.textFaint) }, job.script)
+            ))
+          )
+        )
+      );
+    }
+
+    function ConfigPage({ config, onConfigSaved }) {
+      const t = useTheme();
+      const mode = t === themes.dark ? "dark" : "light";
+      const [editing, setEditing] = useState(null); // which section is being edited
+      const [draft, setDraft] = useState({});
+      const [saving, setSaving] = useState(false);
+      const [saveMsg, setSaveMsg] = useState("");
+
+      if (!config) return React.createElement(Tile, null, React.createElement(Skeleton, { className: "h-60 w-full" }));
+
+      const startEdit = (section, data) => {
+        setEditing(section);
+        setDraft(JSON.parse(JSON.stringify(data)));
+        setSaveMsg("");
+      };
+      const cancelEdit = () => { setEditing(null); setDraft({}); setSaveMsg(""); };
+
+      const handleSave = async (sectionKey, payload) => {
+        setSaving(true);
+        setSaveMsg("");
+        try {
+          const r = await fetch(`${API_BASE}/api/dashboard/config/save`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            credentials: "include",
+            body: JSON.stringify(payload),
+          });
+          const data = await r.json();
+          if (data.ok) {
+            setSaveMsg("Saved");
+            setEditing(null);
+            if (onConfigSaved) onConfigSaved();
+            setTimeout(() => setSaveMsg(""), 2000);
+          } else {
+            setSaveMsg("Error: " + (data.error || "unknown"));
+          }
+        } catch { setSaveMsg("Connection failed"); }
+        setSaving(false);
+      };
+
+      const Row = ({ label, value, mono, masked }) => React.createElement("div", { className: cl("flex items-center justify-between py-2.5 border-b last:border-0", t.borderLight) },
+        React.createElement("span", { className: cl("text-sm", t.textMuted) }, label),
+        React.createElement("span", { className: cl("text-sm", mono ? "font-mono" : "", masked ? t.textFaint : t.mono) }, masked ? "\u2022".repeat(20) : String(value || ""))
+      );
+
+      const EditBtn = ({ onClick }) => React.createElement("button", {
+        onClick,
+        className: cl("text-xs px-3 py-1.5 rounded-lg transition-all font-semibold",
+          mode === "dark" ? "bg-zinc-800 text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200" : "bg-zinc-100 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-700")
+      }, "\u270E Edit");
+
+      const SaveBar = ({ onSave, onCancel }) => React.createElement("div", { className: "flex items-center gap-3 mt-4" },
+        React.createElement("button", {
+          onClick: onSave, disabled: saving,
+          className: cl("px-4 py-2 rounded-xl text-sm font-semibold bg-teal-600 hover:bg-teal-500 text-white transition-all", saving && "opacity-50")
+        }, saving ? "Saving..." : "Save"),
+        React.createElement("button", {
+          onClick: onCancel,
+          className: cl("px-4 py-2 rounded-xl text-sm font-semibold transition-all",
+            mode === "dark" ? "bg-zinc-800 text-zinc-300 hover:bg-zinc-700" : "bg-zinc-100 text-zinc-600 hover:bg-zinc-200")
+        }, "Cancel"),
+        saveMsg && React.createElement("span", { className: cl("text-sm", saveMsg.startsWith("Error") ? "text-red-400" : t.accent) }, saveMsg)
+      );
+
+      const Section = ({ icon, title, sectionId, editData, children, editContent }) => React.createElement(Tile, null,
+        React.createElement("div", { className: "flex items-center justify-between mb-3" },
+          React.createElement("div", { className: "flex items-center gap-2" },
+            React.createElement("span", { className: "text-lg" }, icon),
+            React.createElement("h3", { className: cl("text-sm font-semibold", t.text) }, title)
+          ),
+          editing !== sectionId && React.createElement(EditBtn, { onClick: () => startEdit(sectionId, editData) })
+        ),
+        editing === sectionId ? editContent : children
+      );
+
+      // ── LLM Edit ──
+      const llmEditContent = React.createElement("div", null,
+        React.createElement(WSelect, { label: "Provider", value: draft.provider, mode, onChange: v => {
+          const models = LLM_MODELS[v] || [];
+          setDraft(d => ({ ...d, provider: v, model: models[0]?.value || "" }));
+        }, options: [
+          { value: "anthropic", label: "Anthropic (Claude)" },
+          { value: "openai", label: "OpenAI (GPT)" },
+          { value: "google", label: "Google (Gemini)" },
+          { value: "ollama", label: "Ollama (Local)" },
+        ]}),
+        React.createElement(WSelect, { label: "Model", value: draft.model, mode, onChange: v => setDraft(d => ({ ...d, model: v })),
+          options: LLM_MODELS[draft.provider] || [] }),
+        draft.provider !== "ollama" && React.createElement(WInput, { label: "API Key", value: draft.api_key, mode, onChange: v => setDraft(d => ({ ...d, api_key: v })), type: "password", mono: true }),
+        React.createElement(SaveBar, { onSave: () => handleSave("llm", { llm: draft }), onCancel: cancelEdit })
+      );
+
+      // ── Embedding Edit ──
+      const embEditContent = React.createElement("div", null,
+        React.createElement(WSelect, { label: "Provider", value: draft.provider, mode, onChange: v => {
+          const models = EMBED_MODELS[v] || [];
+          const model = models[0]?.value || "";
+          setDraft(d => ({ ...d, provider: v, model, dimensions: EMBED_DIMS[model] || 768 }));
+        }, options: [
+          { value: "ollama", label: "Ollama (Local)" },
+          { value: "openai", label: "OpenAI" },
+          { value: "google", label: "Google" },
+        ]}),
+        React.createElement(WSelect, { label: "Model", value: draft.model, mode, onChange: v => setDraft(d => ({ ...d, model: v, dimensions: EMBED_DIMS[v] || 768 })),
+          options: EMBED_MODELS[draft.provider] || [] }),
+        React.createElement("div", { className: cl("text-sm mb-4 p-3 rounded-xl", t.warnBox || (mode === "dark" ? "bg-amber-900/15 text-amber-300 border border-amber-800/30" : "bg-amber-50 text-amber-700 border border-amber-200")) },
+          "Changing embedding model requires re-embedding all chunks. Don\u2019t mix providers in the same collection."
+        ),
+        React.createElement(SaveBar, { onSave: () => handleSave("embedding", { embedding: draft }), onCancel: cancelEdit })
+      );
+
+      // ── Classifier Edit ──
+      const clsEditContent = React.createElement("div", null,
+        React.createElement(WSelect, { label: "Provider", value: draft.provider, mode, onChange: v => setDraft(d => ({ ...d, provider: v })),
+          options: [
+            { value: "ollama", label: "Ollama (Local)" },
+            { value: "anthropic", label: "Anthropic" },
+            { value: "openai", label: "OpenAI" },
+            { value: "google", label: "Google" },
+          ]}),
+        React.createElement(WInput, { label: "Model", value: draft.model, mode, onChange: v => setDraft(d => ({ ...d, model: v })), mono: true }),
+        React.createElement(SaveBar, { onSave: () => handleSave("classifier", { classifier: draft }), onCancel: cancelEdit })
+      );
+
+      // ── Telegram Edit ──
+      const tgEditContent = React.createElement("div", null,
+        React.createElement(WInput, { label: "Bot Token", value: draft.bot_token, mode, onChange: v => setDraft(d => ({ ...d, bot_token: v })), type: "password", mono: true }),
+        React.createElement(WInput, { label: "Chat ID", value: draft.chat_id, mode, onChange: v => setDraft(d => ({ ...d, chat_id: v })), mono: true }),
+        React.createElement(SaveBar, { onSave: () => handleSave("telegram", { telegram: draft }), onCancel: cancelEdit })
+      );
+
+      // ── Identity Edit ──
+      const idEditContent = React.createElement("div", null,
+        React.createElement(WInput, { label: "User Name", value: draft.userName, mode, onChange: v => setDraft(d => ({ ...d, userName: v })) }),
+        React.createElement(WInput, { label: "App Name", value: draft.appName, mode, onChange: v => setDraft(d => ({ ...d, appName: v })) }),
+        React.createElement(SaveBar, { onSave: () => handleSave("identity", { user: { name: draft.userName }, branding: { app_name: draft.appName } }), onCancel: cancelEdit })
+      );
+
+      const ENRICH_ROLES = [
+        { key: "fact_extraction", label: "Fact Extraction" },
+        { key: "fact_supersession", label: "Fact Supersession" },
+        { key: "fact_derivation", label: "Fact Derivation" },
+        { key: "entity_extraction", label: "Entity Extraction" },
+        { key: "doc_enrichment", label: "Doc Enrichment" },
+        { key: "summaries", label: "Summaries" },
+      ];
+
+      const ENRICH_PROVIDERS = [
+        { value: "anthropic", label: "Anthropic" },
+        { value: "openai", label: "OpenAI" },
+        { value: "google", label: "Google" },
+        { value: "ollama", label: "Ollama" },
+      ];
+
+      // Helper: normalize enrichment data to backends format for editing
+      const normalizeEnrichDraft = (raw) => {
+        const result = {};
+        for (const [role, cfg] of Object.entries(raw)) {
+          if (cfg.backends && Array.isArray(cfg.backends)) {
+            result[role] = { backends: cfg.backends.map(b => ({...b})), daily_limit_per_backend: cfg.daily_limit_per_backend || "" };
+          } else if (cfg.provider) {
+            const backends = [{ provider: cfg.provider, model: cfg.model || "" }];
+            if (cfg.fallback && cfg.fallback.provider) backends.push({ provider: cfg.fallback.provider, model: cfg.fallback.model || "" });
+            result[role] = { backends };
+          } else {
+            result[role] = { backends: [{ provider: "", model: "" }] };
+          }
+        }
+        ENRICH_ROLES.forEach(r => { if (!result[r.key]) result[r.key] = { backends: [{ provider: "", model: "" }] }; });
+        return result;
+      };
+
+      // Normalize once when entering edit mode
+      if (!draft._normalized) {
+        const n = normalizeEnrichDraft(draft);
+        n._normalized = true;
+        setTimeout(() => setDraft(n), 0);
+      }
+      const enrichDraft = draft._normalized ? draft : normalizeEnrichDraft(draft);
+
+      const updateBackend = (role, idx, field, value) => {
+        setDraft(d => {
+          const updated = { ...d };
+          const roleData = { ...updated[role], backends: [...(updated[role]?.backends || [])] };
+          roleData.backends[idx] = { ...roleData.backends[idx], [field]: value };
+          updated[role] = roleData;
+          return updated;
+        });
+      };
+      const addBackend = (role) => {
+        setDraft(d => {
+          const updated = { ...d };
+          const roleData = { ...updated[role], backends: [...(updated[role]?.backends || [])] };
+          roleData.backends.push({ provider: "", model: "" });
+          updated[role] = roleData;
+          return updated;
+        });
+      };
+      const removeBackend = (role, idx) => {
+        setDraft(d => {
+          const updated = { ...d };
+          const roleData = { ...updated[role], backends: [...(updated[role]?.backends || [])] };
+          roleData.backends.splice(idx, 1);
+          updated[role] = roleData;
+          return updated;
+        });
+      };
+      const moveBackend = (role, idx, dir) => {
+        setDraft(d => {
+          const updated = { ...d };
+          const roleData = { ...updated[role], backends: [...(updated[role]?.backends || [])] };
+          const ni = idx + dir;
+          if (ni < 0 || ni >= roleData.backends.length) return d;
+          [roleData.backends[idx], roleData.backends[ni]] = [roleData.backends[ni], roleData.backends[idx]];
+          updated[role] = roleData;
+          return updated;
+        });
+      };
+      const saveEnrichment = () => {
+        const payload = {};
+        for (const [role, cfg] of Object.entries(enrichDraft)) {
+          if (role === "_normalized") continue;
+          const backends = (cfg.backends || []).filter(b => b.provider);
+          if (backends.length > 0) {
+            const rp = { backends };
+            if (cfg.daily_limit_per_backend && parseInt(cfg.daily_limit_per_backend) > 0) rp.daily_limit_per_backend = parseInt(cfg.daily_limit_per_backend);
+            payload[role] = rp;
+          }
+        }
+        handleSave("enrichment", { enrichment: payload });
+      };
+
+      const enrichEditContent = React.createElement("div", { className: "space-y-5" },
+        ENRICH_ROLES.map(role => {
+          const rd = enrichDraft[role.key] || { backends: [] };
+          const backends = rd.backends || [];
+          return React.createElement("div", { key: role.key, className: cl("border-b pb-4 last:border-0", t.borderLight) },
+            React.createElement("div", { className: "flex items-center justify-between mb-3" },
+              React.createElement("span", { className: cl("text-sm font-semibold", t.text) }, role.label),
+              role.key === "fact_extraction" && React.createElement("div", { className: "w-40" },
+                React.createElement(WInput, { label: "Daily limit", value: rd.daily_limit_per_backend || "", mode, mono: true,
+                  onChange: v => setDraft(d => ({ ...d, [role.key]: { ...d[role.key], daily_limit_per_backend: v } })),
+                  placeholder: "4500" })
+              )
+            ),
+            React.createElement("div", { className: "space-y-2" },
+              backends.map((b, idx) =>
+                React.createElement("div", { key: idx, className: cl("flex items-center gap-2 p-2 rounded-xl border", t.borderLight, mode === "dark" ? "bg-zinc-900/40" : "bg-zinc-50") },
+                  React.createElement("span", { className: cl("text-xs font-mono w-5 text-center shrink-0", t.textFaint) }, String(idx + 1)),
+                  React.createElement("select", {
+                    value: b.provider || "", onChange: e => updateBackend(role.key, idx, "provider", e.target.value),
+                    className: cl("w-32 px-2 py-1.5 rounded-lg border text-sm outline-none focus:ring-2 focus:ring-teal-500/30", t.input)
+                  }, React.createElement("option", { value: "" }, "Provider..."),
+                    ENRICH_PROVIDERS.map(p => React.createElement("option", { key: p.value, value: p.value }, p.label))),
+                  React.createElement("input", { type: "text", value: b.model || "", placeholder: "model name",
+                    onChange: e => updateBackend(role.key, idx, "model", e.target.value),
+                    className: cl("flex-1 px-2 py-1.5 rounded-lg border text-sm font-mono outline-none focus:ring-2 focus:ring-teal-500/30", t.input) }),
+                  React.createElement("input", { type: "number", value: b.workers || "", placeholder: "w",
+                    onChange: e => updateBackend(role.key, idx, "workers", parseInt(e.target.value) || ""),
+                    title: "Parallel workers",
+                    className: cl("w-14 px-1.5 py-1.5 rounded-lg border text-sm font-mono text-center outline-none focus:ring-2 focus:ring-teal-500/30", t.input) }),
+                  React.createElement("button", { onClick: () => moveBackend(role.key, idx, -1), disabled: idx === 0,
+                    className: cl("text-xs px-1 py-0.5 rounded", idx === 0 ? "opacity-20" : "hover:bg-white/10", t.textFaint) }, "\u25B2"),
+                  React.createElement("button", { onClick: () => moveBackend(role.key, idx, 1), disabled: idx === backends.length - 1,
+                    className: cl("text-xs px-1 py-0.5 rounded", idx === backends.length - 1 ? "opacity-20" : "hover:bg-white/10", t.textFaint) }, "\u25BC"),
+                  backends.length > 1
+                    ? React.createElement("button", { onClick: () => removeBackend(role.key, idx),
+                        className: "text-xs px-1 py-0.5 rounded text-red-400 hover:bg-red-500/10" }, "\u2715")
+                    : React.createElement("span", { className: "w-5" })
+                )
+              )
+            ),
+            React.createElement("button", { onClick: () => addBackend(role.key),
+              className: cl("mt-2 text-xs px-3 py-1.5 rounded-lg border border-dashed", t.borderLight, "hover:border-teal-500 hover:text-teal-400", t.textFaint)
+            }, "+ Add backend")
+          );
+        }),
+        Object.keys(enrichDraft).filter(k => k !== "_normalized" && !ENRICH_ROLES.some(r => r.key === k) && enrichDraft[k]?.backends).map(k =>
+          React.createElement("div", { key: k, className: cl("border-b pb-4", t.borderLight) },
+            React.createElement("div", { className: "flex items-center justify-between mb-3" },
+              React.createElement("span", { className: cl("text-sm font-semibold", t.text) }, k.replace(/_/g, " ")),
+              React.createElement("button", { className: "text-xs px-2 py-0.5 rounded-md text-red-400 hover:bg-red-500/10",
+                onClick: () => setDraft(d => { const u = { ...d }; delete u[k]; return u; }) }, "\u2715 Remove")),
+            (enrichDraft[k].backends || []).map((b, idx) =>
+              React.createElement("div", { key: idx, className: "flex items-center gap-2 mb-1" },
+                React.createElement("select", { value: b.provider || "", onChange: e => updateBackend(k, idx, "provider", e.target.value),
+                  className: cl("w-32 px-2 py-1.5 rounded-lg border text-sm", t.input) },
+                  React.createElement("option", { value: "" }, "Provider..."),
+                  ENRICH_PROVIDERS.map(p => React.createElement("option", { key: p.value, value: p.value }, p.label))),
+                React.createElement("input", { type: "text", value: b.model || "", onChange: e => updateBackend(k, idx, "model", e.target.value),
+                  className: cl("flex-1 px-2 py-1.5 rounded-lg border text-sm font-mono", t.input) })))
+          )
+        ),
+        React.createElement("button", {
+          className: cl("w-full py-2.5 rounded-xl border-2 border-dashed text-sm font-medium transition-all", t.borderLight, "hover:border-teal-500 hover:text-teal-400", t.textFaint),
+          onClick: () => { const name = prompt("Role name (e.g. classification, translation):"); if (name && name.trim()) setDraft(d => ({ ...d, [name.trim().toLowerCase().replace(/\s+/g, "_")]: { backends: [{ provider: "", model: "" }] } })); }
+        }, "+ Add Custom Role"),
+        React.createElement(SaveBar, { onSave: saveEnrichment, onCancel: cancelEdit })
+      );
+
+      return React.createElement("div", { className: "space-y-5" },
+        React.createElement("div", { className: "flex items-center justify-between" },
+          React.createElement("h3", { className: cl("text-sm font-semibold uppercase tracking-widest", t.textLabel) }, "Configuration"),
+          React.createElement("div", { className: "flex items-center gap-3" },
+            saveMsg && !editing && React.createElement("span", { className: cl("text-sm", t.accent) }, saveMsg),
+            React.createElement(Tag, { variant: "muted" }, "config/tailor.yaml")
+          )
+        ),
+        React.createElement(Section, { icon: "\u{1F9E0}", title: "LLM Backend", sectionId: "llm", editData: config.llm || {}, editContent: llmEditContent },
+          React.createElement(Row, { label: "Provider", value: config.llm?.provider, mono: true }),
+          React.createElement(Row, { label: "Model", value: config.llm?.model, mono: true }),
+          React.createElement(Row, { label: "Tool Use", value: config.llm?.tool_use ? "enabled" : "disabled" }),
+          React.createElement(Row, { label: "API Key", masked: true })
+        ),
+        React.createElement(Section, { icon: "\u{1F52E}", title: "Embedding", sectionId: "embedding", editData: config.embedding || {}, editContent: embEditContent },
+          React.createElement(Row, { label: "Provider", value: config.embedding?.provider, mono: true }),
+          React.createElement(Row, { label: "Model", value: config.embedding?.model, mono: true }),
+          React.createElement(Row, { label: "Dimensions", value: config.embedding?.dimensions, mono: true })
+        ),
+        React.createElement(Section, { icon: "\u{1F500}", title: "Intent Classifier", sectionId: "classifier", editData: config.classifier || {}, editContent: clsEditContent },
+          React.createElement(Row, { label: "Provider", value: config.classifier?.provider, mono: true }),
+          React.createElement(Row, { label: "Model", value: config.classifier?.model, mono: true })
+        ),
+        React.createElement(Section, { icon: "\u{1F4AC}", title: "Telegram", sectionId: "telegram", editData: config.telegram || {}, editContent: tgEditContent },
+          React.createElement(Row, { label: "Bot Token", masked: true }),
+          React.createElement(Row, { label: "Chat ID", value: config.telegram?.chat_id, mono: true })
+        ),
+        React.createElement(Section, { icon: "\u{1F464}", title: "Identity", sectionId: "identity",
+          editData: { userName: config.user?.name || "", appName: config.branding?.app_name || "" }, editContent: idEditContent },
+          React.createElement(Row, { label: "User", value: config.user?.name }),
+          React.createElement(Row, { label: "App Name", value: config.branding?.app_name, mono: true })
+        ),
+        config.enrichment && React.createElement(Section, { icon: "\u{1F52C}", title: "Enrichment Backends", sectionId: "enrichment",
+          editData: config.enrichment || {}, editContent: enrichEditContent },
+          React.createElement("div", { className: "space-y-4" },
+            Object.entries(config.enrichment).map(([role, cfg]) => {
+              const backends = cfg.backends || (cfg.provider ? [{ provider: cfg.provider, model: cfg.model }, ...(cfg.fallback ? [cfg.fallback] : [])] : []);
+              return React.createElement("div", { key: role, className: cl("border-b pb-3 last:border-0", t.borderLight) },
+                React.createElement("div", { className: cl("text-sm font-semibold capitalize mb-2", t.text) }, role.replace(/_/g, " ")),
+                React.createElement("div", { className: "flex items-center gap-2 flex-wrap" },
+                  backends.map((b, i) => React.createElement("span", {
+                    key: i, className: cl("text-sm font-mono px-2.5 py-1 rounded-lg border", i === 0 ? t.tagAccent : t.tag)
+                  }, `${i + 1}. ${b.provider} / ${b.model}${b.workers ? ` (${b.workers}w)` : ""}`))
+                )
+              );
+            })
+          )
+        ),
+        config.pipeline && React.createElement(Section, { icon: "\u23F1", title: "Pipeline Schedule", sectionId: "pipeline",
+          editData: config.pipeline || {}, editContent: (() => {
+            const pd = draft;
+            return React.createElement("div", null,
+              React.createElement(WInput, { label: "Deadline Hour (0-23)", value: pd.deadline_hour ?? 8, mode, mono: true,
+                onChange: v => setDraft(d => ({ ...d, deadline_hour: parseInt(v) || 8 })),
+                helpText: "Pipeline must finish by this hour. All steps stop gracefully before deadline." }),
+              React.createElement(WInput, { label: "Fact Extraction Max (minutes)", value: pd.extraction_max_min ?? 200, mode, mono: true,
+                onChange: v => setDraft(d => ({ ...d, extraction_max_min: parseInt(v) || 200 })) }),
+              React.createElement(WInput, { label: "Fact Supersession Max (minutes)", value: pd.supersession_max_min ?? 90, mode, mono: true,
+                onChange: v => setDraft(d => ({ ...d, supersession_max_min: parseInt(v) || 90 })) }),
+              React.createElement(WInput, { label: "Fact Derivation Max (minutes)", value: pd.derivation_max_min ?? 60, mode, mono: true,
+                onChange: v => setDraft(d => ({ ...d, derivation_max_min: parseInt(v) || 60 })) }),
+              React.createElement(SaveBar, { onSave: () => handleSave("pipeline", { pipeline: {
+                deadline_hour: parseInt(pd.deadline_hour) || 8,
+                extraction_max_min: parseInt(pd.extraction_max_min) || 200,
+                supersession_max_min: parseInt(pd.supersession_max_min) || 90,
+                derivation_max_min: parseInt(pd.derivation_max_min) || 60,
+              } }), onCancel: cancelEdit })
+            );
+          })() },
+          React.createElement(Row, { label: "Deadline", value: (config.pipeline?.deadline_hour ?? 8) + ":00", mono: true }),
+          React.createElement(Row, { label: "Extraction max", value: (config.pipeline?.extraction_max_min ?? 200) + " min", mono: true }),
+          React.createElement(Row, { label: "Supersession max", value: (config.pipeline?.supersession_max_min ?? 90) + " min", mono: true }),
+          React.createElement(Row, { label: "Derivation max", value: (config.pipeline?.derivation_max_min ?? 60) + " min", mono: true })
+        )
+      );
+    }
+
+
+    function ProfilePage({ profile }) {
+      const t = useTheme();
+      if (!profile || Object.keys(profile).length === 0) {
+        return React.createElement(Tile, null, React.createElement("p", { className: cl("text-sm", t.textMuted) }, "No profile generated yet. Run the nightly pipeline."));
+      }
+      const renderSection = (data, title, icon, tagVar) => {
+        if (!data || typeof data !== "object") return null;
+        return React.createElement(Tile, null,
+          React.createElement("h3", { className: cl("text-sm font-semibold mb-4", t.text) }, `${icon} ${title}`),
+          React.createElement("div", { className: "space-y-3" },
+            Object.entries(data).map(([key, val]) => React.createElement("div", { key, className: cl("border-b pb-3 last:border-0", t.borderLight) },
+              React.createElement("span", { className: cl("text-sm uppercase tracking-widest", t.textMuted) }, key.replace(/_/g, " ")),
+              Array.isArray(val)
+                ? React.createElement("div", { className: "flex flex-wrap gap-1.5 mt-1.5" }, val.map((v, j) => React.createElement(Tag, { key: j, variant: tagVar || "default" }, String(v))))
+                : typeof val === "object" && val !== null
+                  ? React.createElement("pre", { className: cl("text-sm mt-1 font-mono whitespace-pre-wrap", t.mono) }, JSON.stringify(val, null, 2))
+                  : React.createElement("div", { className: cl("text-sm mt-1", t.text) }, String(val))
+            ))
+          )
+        );
+      };
+      return React.createElement("div", { className: "space-y-5" },
+        React.createElement("div", { className: "flex items-center justify-between" },
+          React.createElement("h3", { className: cl("text-sm font-semibold uppercase tracking-widest", t.textLabel) }, "User Profile"),
+          React.createElement(Tag, { variant: "accent" }, "auto-generated nightly")
+        ),
+        renderSection(profile.static, "Static Profile", "\u{1F4CC}"),
+        renderSection(profile.dynamic, "Dynamic Context", "\u26A1", "accent")
+      );
+    }
+
+    // ── App ──
+    function LoginScreen({ onLogin, mode }) {
+      const [token, setToken] = useState("");
+      const [error, setError] = useState("");
+      const [loading, setLoading] = useState(false);
+      const t = themes[mode];
+
+      const handleLogin = async () => {
+        setLoading(true);
+        setError("");
+        try {
+          const r = await fetch(`${API_BASE}/api/auth/login`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            credentials: "include",
+            body: JSON.stringify({ token }),
+          });
+          const data = await r.json();
+          if (data.ok) {
+            onLogin();
+          } else {
+            setError("Invalid access token");
+          }
+        } catch (e) {
+          setError("Connection failed");
+        }
+        setLoading(false);
+      };
+
+      return React.createElement("div", {
+        className: "min-h-screen flex items-center justify-center",
+        style: { background: "linear-gradient(135deg, #050608 0%, #070a0f 50%, #050608 100%)", fontFamily: "'Outfit', sans-serif" }
+      },
+        React.createElement("div", { className: "w-full max-w-sm mx-4 fade-in" },
+          React.createElement("div", { className: "text-center mb-8" },
+            React.createElement("h1", { className: cl("text-3xl font-bold mb-1", t.text), style: { letterSpacing: "1px" } },
+              React.createElement("span", null, "T"),
+              React.createElement("span", { style: { color: "#0d9488", fontWeight: 400, fontSize: "36px", position: "relative", top: "-2px" } }, "["),
+              React.createElement("span", { style: { color: "#0d9488" } }, "AI"),
+              React.createElement("span", { style: { color: "#0d9488", fontWeight: 400, fontSize: "36px", position: "relative", top: "-2px", marginRight: "-2px" } }, "]"),
+              React.createElement("span", null, "LOR")
+            ),
+            React.createElement("p", { className: cl("text-sm tracking-widest mt-1", t.textFaint) }, "Self-hosted AI memory that never forgets")
+          ),
+          React.createElement("div", { className: cl("rounded-2xl border p-6", t.tile) },
+            React.createElement("label", { className: cl("text-sm font-medium block mb-2", t.textLabel) }, "Access Token"),
+            React.createElement("input", {
+              type: "password",
+              value: token,
+              onChange: (e) => setToken(e.target.value),
+              onKeyDown: (e) => e.key === "Enter" && handleLogin(),
+              placeholder: "Enter your access token",
+              className: cl("w-full px-4 py-3 rounded-xl border text-sm font-mono outline-none transition-all",
+                "focus:ring-2 focus:ring-teal-500/30 focus:border-teal-500", t.input
+              ),
+              autoFocus: true,
+            }),
+            error && React.createElement("p", { className: "text-sm text-red-400 mt-2" }, error),
+            React.createElement("button", {
+              onClick: handleLogin,
+              disabled: loading || !token,
+              className: cl("w-full mt-4 py-3 rounded-xl text-sm font-semibold transition-all",
+                "bg-teal-600 hover:bg-teal-500 text-white",
+                (loading || !token) && "opacity-50 cursor-not-allowed"
+              ),
+            }, loading ? "Verifying..." : "Sign In")
+          )
+        )
+      );
+    }
+
+    function App() {
+      const [setupDone, setSetupDone] = useState(null);
+      const [authed, setAuthed] = useState(null);
+      const [tab, setTab] = useState("home");
+      const [mode, setMode] = useState(localStorage.getItem("tailor-theme") || "dark");
+      const [time, setTime] = useState(new Date());
+      const [stats, setStats] = useState(null);
+      const [services, setServices] = useState(null);
+      const [config, setConfig] = useState(null);
+      const [profile, setProfile] = useState(null);
+      const [pipeline, setPipeline] = useState(null);
+      const [modelAdvisor, setModelAdvisor] = useState(null);
+
+      const toggleMode = () => {
+        const next = mode === "dark" ? "light" : "dark";
+        setMode(next);
+        localStorage.setItem("tailor-theme", next);
+      };
+
+      // Check setup + auth on load
+      useEffect(() => {
+        async function checkSetupAndAuth() {
+          try {
+            const sr = await fetch(`${API_BASE}/api/dashboard/setup`);
+            const sd = await sr.json();
+            if (!sd.setup_complete) {
+              setSetupDone(false);
+              return;
+            }
+          } catch { /* assume setup done if check fails */ }
+          setSetupDone(true);
+          const r = await apiFetch("bulk");
+          if (r) {
+            setAuthed(true);
+            if (r.stats) setStats(r.stats);
+            if (r.services) setServices(r.services);
+            if (r.config) setConfig(r.config);
+            if (r.profile) setProfile(r.profile);
+            if (r.pipeline) setPipeline(r.pipeline);
+            if (r.model_advisor) setModelAdvisor(r.model_advisor);
+          } else {
+            setAuthed(false);
+          }
+        }
+        checkSetupAndAuth();
+      }, []);
+
+      const refresh = useCallback(async () => {
+        window.__tailorUnauth = false;
+        const bulk = await apiFetch("bulk");
+        if (window.__tailorUnauth) { setAuthed(false); return; }
+        if (bulk) {
+          if (bulk.stats) setStats(bulk.stats);
+          if (bulk.services) setServices(bulk.services);
+          if (bulk.config) setConfig(bulk.config);
+          if (bulk.profile) setProfile(bulk.profile);
+          if (bulk.pipeline) setPipeline(bulk.pipeline);
+          if (bulk.model_advisor) setModelAdvisor(bulk.model_advisor);
+        }
+      }, []);
+
+      useEffect(() => { if (authed) refresh(); }, [authed, refresh]);
+      useEffect(() => { const i = setInterval(() => { if (authed) refresh(); }, 30000); return () => clearInterval(i); }, [authed, refresh]);
+      useEffect(() => { const i = setInterval(() => setTime(new Date()), 30000); return () => clearInterval(i); }, []);
+
+      // Loading
+      if (setupDone === null) return React.createElement("div", { className: "min-h-screen flex items-center justify-center", style: { background: themes[mode].bg } },
+        React.createElement("div", { className: themes[mode].skeleton + " w-8 h-8 rounded-full" })
+      );
+      // Wizard
+      if (setupDone === false) return React.createElement(SetupWizard, { onComplete: () => { setSetupDone(true); window.location.reload(); }, mode });
+      // Auth loading
+      if (authed === null) return React.createElement("div", { className: "min-h-screen flex items-center justify-center", style: { background: themes[mode].bg } },
+        React.createElement("div", { className: themes[mode].skeleton + " w-8 h-8 rounded-full" })
+      );
+      // Login
+      if (authed === false) return React.createElement(LoginScreen, { onLogin: () => { setAuthed(true); }, mode });
+
+      const t = themes[mode];
+      const allRunning = services?.every(s => s.status === "running");
+
+      const pages = {
+        home: React.createElement(HomePage, { stats, services, setTab, modelAdvisor }),
+        kb: React.createElement(KBPage, { stats, config }),
+        pipeline: React.createElement(PipelinePage, { pipeline }),
+        config: React.createElement(ConfigPage, { config, onConfigSaved: refresh }),
+        profile: React.createElement(ProfilePage, { profile }),
+      };
+
+      return React.createElement(ThemeContext.Provider, { value: t },
+        React.createElement("div", { className: "min-h-screen", style: { background: t.bg, fontFamily: "'Outfit', sans-serif" } },
+          // Header
+          React.createElement("header", { className: "sticky top-0 z-50 frosted-nav", style: { background: t.headerBg } },
+            React.createElement("div", { className: cl("max-w-6xl mx-auto px-5 h-16 flex items-center justify-between border-b", t.border) },
+              React.createElement("div", { className: "flex items-center gap-3" },
+                React.createElement("div", { className: "flex items-center", style: { gap: "0px" } },
+                  React.createElement("span", { className: cl(t.text), style: { fontSize: "22px", fontWeight: 700, lineHeight: 1, letterSpacing: "1px" } }, "T"),
+                  React.createElement("span", { style: { color: "#0d9488", fontSize: "25px", fontWeight: 400, lineHeight: 1, position: "relative", top: "-1px" } }, "["),
+                  React.createElement("span", { style: { color: "#0d9488", fontSize: "22px", fontWeight: 700, lineHeight: 1, letterSpacing: "1px" } }, "AI"),
+                  React.createElement("span", { style: { color: "#0d9488", fontSize: "25px", fontWeight: 400, lineHeight: 1, position: "relative", top: "-1px", marginRight: "-1px" } }, "]"),
+                  React.createElement("span", { className: cl(t.text), style: { fontSize: "22px", fontWeight: 700, lineHeight: 1, letterSpacing: "1px" } }, "LOR")
+                ),
+                React.createElement("span", { className: cl("text-xs hidden sm:inline tracking-widest", t.textMuted) }, "Self-hosted AI memory that never forgets")
+              ),
+              React.createElement("div", { className: "flex items-center gap-4" },
+                React.createElement("span", { className: cl("text-sm font-mono hidden sm:inline", t.textFaint) },
+                  `${time.toLocaleDateString("en-GB", { day: "2-digit", month: "short" })} \u00B7 ${time.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })}`
+                ),
+                React.createElement("div", { className: "flex items-center gap-2" },
+                  React.createElement("span", { className: cl("w-2 h-2 rounded-full", allRunning === false ? "bg-amber-400" : "bg-emerald-400", "shadow-[0_0_12px_rgba(52,211,153,0.6)] glow-pulse") }),
+                  React.createElement("span", { className: cl("text-sm font-medium", allRunning === false ? "text-amber-400" : t.statusOnline) },
+                    allRunning === false ? "DEGRADED" : services ? "ONLINE" : "...")
+                ),
+                React.createElement("button", { onClick: toggleMode, className: cl("w-10 h-10 rounded-xl flex items-center justify-center text-base transition-all", mode === "dark" ? "bg-zinc-800 hover:bg-zinc-700" : "bg-zinc-100 hover:bg-zinc-200") },
+                  mode === "dark" ? "\u2600\uFE0F" : "\u{1F319}"
+                ),
+                React.createElement("button", { onClick: refresh, className: cl("w-10 h-10 rounded-xl flex items-center justify-center text-base transition-all", mode === "dark" ? "bg-zinc-800 hover:bg-zinc-700" : "bg-zinc-100 hover:bg-zinc-200"), title: "Refresh" },
+                  "\u{1F504}"
+                )
+              )
+            )
+          ),
+          // Nav
+          React.createElement("nav", { className: cl("border-b", t.border) },
+            React.createElement("div", { className: "max-w-6xl mx-auto px-5 flex gap-1 overflow-x-auto py-1" },
+              TABS.map(tb => React.createElement("button", {
+                key: tb.id, onClick: () => setTab(tb.id),
+                className: cl("px-4 py-2.5 text-sm font-semibold tracking-wider rounded-xl transition-all whitespace-nowrap", tab === tb.id ? t.navActive : t.navInactive)
+              }, React.createElement("span", { className: "mr-1.5 text-sm" }, tb.icon), tb.label))
+            )
+          ),
+          // Content
+          React.createElement("main", { className: "max-w-6xl mx-auto px-5 py-6" }, pages[tab]),
+          // Footer
+          React.createElement("footer", { className: cl("border-t mt-12 footer-teal", t.border) },
+            React.createElement("div", { className: "max-w-6xl mx-auto px-5 py-4 flex items-center justify-between" },
+              React.createElement("span", { className: cl("text-sm", t.footerText) }, "T[AI]LOR \u2014 Self-hosted AI memory that never forgets"),
+              React.createElement("span", { className: cl("text-sm font-mono", t.footerText) }, `${config?.user?.name || ""} \u00B7 ${window.location.host}`)
+            )
+          )
+        )
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
+  </script>
+</body>
+</html>

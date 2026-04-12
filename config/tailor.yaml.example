@@ -1,0 +1,281 @@
+# ═══════════════════════════════════════════════════════════════
+# TAILOR — Configuration Example
+# ═══════════════════════════════════════════════════════════════
+# Copy this file to tailor.yaml and edit to match your setup.
+# All API keys can also be set via environment variables.
+
+# ── Paths ─────────────────────────────────────────────────────
+paths:
+  home: /path/to/your/tailor
+  db: ./db
+  logs: ./logs
+  backups: ./backups
+  models: ./models
+
+# ── User Identity ─────────────────────────────────────────────
+# Used by profile generation, fact supersession, and persona prompt.
+user:
+  name: Your Name
+  name_variants:
+    - your name
+    - name your
+  language: en  # Language for AI-generated content (summaries, facts, profiles). Default: en
+  bio: |
+    A short bio about yourself. This is used by the profile generator
+    and the persona system prompt. Write it in the language you prefer.
+
+# ── Document Ingest ───────────────────────────────────────────
+# Folders to scan recursively for documents (PDF, Excel, CSV, Word, PPTX).
+ingest:
+  document_paths:
+    - /path/to/your/documents/folder1
+    - /path/to/your/documents/folder2
+  ignore_folders:
+    - Temp
+  ignore_patterns:
+    - "~$"
+    - ".tmp"
+    - "Thumbs.db"
+    - ".DS_Store"
+  supported_extensions:
+    - .pdf
+    - .xlsx
+    - .xls
+    - .csv
+    - .tsv
+    - .docx
+    - .pptx
+  # Conversation sources to parse and ingest into the KB.
+  # Each entry needs a matching parser in scripts/ingest/parsers/<name>.py
+  # Supported parsers: chatgpt, claude, gemini
+  conversations:
+    # - name: chatgpt
+    #   parser: chatgpt
+    #   source_files:
+    #     - "conversations-*.json"
+    #   enabled: true
+    # - name: claude
+    #   parser: claude
+    #   source_dir: claude_export
+    #   enabled: true
+    # - name: gemini
+    #   parser: gemini
+    #   source_dir: gemini_export
+    #   enabled: false
+
+# ── LLM Backend ───────────────────────────────────────────────
+# Supported providers: anthropic, openai, google, ollama
+# Tier 1 (tool use): anthropic, openai, google
+# Tier 2 (prompt-based): ollama
+llm:
+  provider: anthropic
+  model: claude-haiku-4-5-20251001
+  api_key: ${ANTHROPIC_API_KEY}
+  tool_use: true
+  max_tokens: 1000
+  temperature: 0.3
+
+# ── Intent Classifier ─────────────────────────────────────────
+classifier:
+  provider: ollama
+  model: qwen3.5
+  temperature: 0.3
+  max_tokens: 400
+
+# ── Embedding ─────────────────────────────────────────────────
+embedding:
+  provider: ollama
+  model: nomic-embed-text
+  dimensions: 768
+
+# ── Knowledge Base ────────────────────────────────────────────
+kb:
+  mcp_url: http://localhost:8787
+  chromadb_path: ./db
+  collection: tailor_kb
+
+# ── Telegram ──────────────────────────────────────────────────
+telegram:
+  bot_token: ${TELEGRAM_BOT_TOKEN}
+  chat_id: ${TELEGRAM_CHAT_ID}
+  poll_timeout: 30
+
+# ── Email Ingest ──────────────────────────────────────────────
+# Email pipeline configuration. Supports Gmail API or generic IMAP.
+# Set provider to "gmail" or "imap".
+email:
+  provider: gmail              # gmail | imap
+  addresses:                   # your email addresses (for sent/received detection)
+    - user@gmail.com
+  gmail:
+    credentials: ./credentials/gmail_credentials.json
+    token: ./credentials/gmail_token.json
+  # imap:
+  #   host: imap.example.com
+  #   port: 993
+  #   username: ""
+  #   password: ""
+  sender_blacklist_extra: []   # additional sender patterns to skip (merged with built-in)
+  domain_blacklist_extra: []   # additional domain patterns to skip (merged with built-in)
+  signature_patterns_extra: [] # custom regex patterns to strip from email bodies
+                               # e.g. ["123 Main Street", "My Company Ltd"]
+
+# ── Session Management ────────────────────────────────────────
+sessions:
+  db_path: ./db/telegram_sessions.sqlite3
+  timeout_minutes: 10
+  max_history: 20
+  auto_capture: true
+
+# ── Persona ───────────────────────────────────────────────────
+persona:
+  name: Tailor
+  system_prompt: |
+    You are Tailor, a personal AI assistant. You respond via Telegram.
+    Style: concise, competent, helpful. Never verbose.
+    
+    RULES:
+    - Use tools to search the Knowledge Base before answering.
+    - If the KB doesn't have the info, say so. Don't make things up.
+    - Keep answers short — Telegram is not the place for essays.
+    - If the user shares important facts, save them to KB with kb_add.
+
+# ── Branding ──────────────────────────────────────────────────
+branding:
+  app_name: TAILOR
+
+# ── Cloud Sync ────────────────────────────────────────────────
+# Cloud storage providers to sync before document ingest.
+# Each entry maps to an rclone remote. Set up rclone first: rclone config
+# Supported: onedrive, gdrive, dropbox, or any rclone remote.
+# Remove or leave empty if you don't use cloud storage.
+cloud_sync:
+  # - name: onedrive
+  #   remote_name: onedrive
+  #   remote_root: Personale
+  #   local_root: /path/to/local/onedrive
+  #   folders:
+  #     - "Documents"
+  #     - "Finance"
+  # - name: gdrive
+  #   remote_name: gdrive
+  #   remote_root: ""
+  #   local_root: /path/to/local/gdrive
+  #   folders:
+  #     - "Documents"
+  #     - "Projects"
+
+# ── Enrichment Backends ───────────────────────────────────────
+# Models used by nightly enrichment scripts.
+# Each role has an ordered list of backends. The script uses the first
+# available backend; if it hits a rate limit, it falls back to the next.
+# Supported providers: anthropic, openai, google, ollama
+enrichment:
+  fact_extraction:
+    backends:
+      - provider: google
+        model: gemini-2.5-flash
+        workers: 5           # optional, parallel requests (default auto-tuned per provider)
+      - provider: openai
+        model: gpt-4o-mini
+        workers: 8
+      - provider: anthropic
+        model: claude-haiku-4-5-20251001
+        workers: 15
+    daily_limit_per_backend: 4500  # optional, default 4500
+
+  fact_derivation:
+    backends:
+      - provider: anthropic
+        model: claude-haiku-4-5-20251001
+
+  entity_extraction:
+    backends:
+      - provider: anthropic
+        model: claude-haiku-4-5-20251001
+
+  doc_enrichment:
+    backends:
+      - provider: anthropic
+        model: claude-haiku-4-5-20251001
+
+  fact_supersession:
+    backends:
+      - provider: anthropic
+        model: claude-haiku-4-5-20251001
+
+  summaries:
+    backends:
+      - provider: anthropic
+        model: claude-haiku-4-5-20251001
+
+# ── Pipeline ──────────────────────────────────────────────────
+# Nightly pipeline schedule and timeouts.
+# The pipeline respects the deadline: each step checks remaining time
+# and stops gracefully if it would exceed the deadline.
+pipeline:
+  deadline_hour: 8          # Hard stop: all processing must finish by this hour (local time)
+  extraction_max_min: 200   # Max minutes for fact extraction
+  supersession_max_min: 90  # Max minutes for fact supersession
+  derivation_max_min: 60    # Max minutes for fact derivation
+
+
+# ── Model Advisor ─────────────────────────────────────────────
+# Periodically checks for new/updated models across all providers.
+# Filters by hardware constraints (RAM → max_model_size_gb).
+# max_model_size_gb is auto-calculated as floor(ram_gb * 0.6) if not set.
+model_advisor:
+  enabled: false
+  schedule_days: [1, 4]        # 0=Mon, 1=Tue, ... 6=Sun → Tue + Fri
+  hardware:
+    ram_gb: 8                  # your machine's total RAM
+    # max_model_size_gb: 4     # optional override; default: floor(ram_gb * 0.6)
+  providers:
+    ollama:
+      enabled: true
+      track_installed: true    # flag updates of currently installed models
+      discover_new: true       # suggest new models in tracked families
+      families: [qwen, llama, gemma, phi, mistral, deepseek]
+    anthropic:
+      enabled: false
+    google:
+      enabled: false
+    openai:
+      enabled: false
+  notify:
+    telegram: true
+    dashboard: true
+
+# ── Services ──────────────────────────────────────────────────
+# Services monitored by heartbeat and shown in the dashboard.
+# check: "port" (TCP connect) or "process" (ps aux match)
+# Remove or comment out services you don't use.
+services:
+  - name: MCP Server
+    id: com.tailor.mcp
+    check: port
+    port: 8787
+    process: mcp_server
+    desc: Knowledge Base API
+    required: true
+  - name: Ollama
+    id: com.tailor.ollama
+    check: port
+    port: 11434
+    process: ollama
+    desc: Local LLM & Embeddings
+  # - name: Telegram Bot
+  #   id: com.tailor.telegram
+  #   check: process
+  #   process: telegram_bot
+  #   desc: Chat interface
+  # - name: Cloudflare Tunnel
+  #   id: com.tailor.tunnel
+  #   check: process
+  #   process: cloudflared
+  #   desc: Remote access
+  # - name: Tailscale
+  #   id: com.tailor.tailscale
+  #   check: process
+  #   process: tailscaled
+  #   desc: VPN mesh access

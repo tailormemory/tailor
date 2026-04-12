@@ -1,0 +1,38 @@
+# ═══════════════════════════════════════════════════════════════
+# TAILOR .gitignore
+# ═══════════════════════════════════════════════════════════════
+
+# ── User data (NEVER commit) ─────────────────────────────────
+db/
+data/
+credentials/
+backups/
+logs/
+
+# ── Config with secrets ──────────────────────────────────────
+config/tailor.yaml
+
+# ── Archive (old scripts, backups, dated READMEs) ────────────
+archive/
+
+# ── Python ───────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# ── OS junk ──────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*~
+
+# ── IDE ──────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Models (downloaded at setup, too large for git) ──────────
+models/
+*.bak*
