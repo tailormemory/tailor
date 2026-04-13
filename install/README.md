@@ -52,9 +52,10 @@ crontab -e
 
 ```bash
 crontab -e
-# Add:
-30 2 * * * /path/to/tailor/scripts/maintenance/backup_db.sh
-0  3 * * * /path/to/tailor/sync_and_ingest.sh
+# Add (replace /path/to/tailor with your actual path):
+TAILOR_HOME=/path/to/tailor
+30 2 * * * cd /path/to/tailor && ./scripts/maintenance/backup_db.sh
+0  3 * * * cd /path/to/tailor && ./sync_and_ingest.sh
 0  4 * * * /path/to/tailor/sync_email.sh
 ```
 
@@ -92,9 +93,10 @@ journalctl -u tailor-mcp -f      # or: tail -f logs/mcp_stderr.log
 
 ```bash
 crontab -e
-# Add:
-30 2 * * * /path/to/tailor/scripts/maintenance/backup_db.sh
-0  3 * * * /path/to/tailor/sync_and_ingest.sh
+# Add (replace /path/to/tailor with your actual path):
+TAILOR_HOME=/path/to/tailor
+30 2 * * * cd /path/to/tailor && ./scripts/maintenance/backup_db.sh
+0  3 * * * cd /path/to/tailor && ./sync_and_ingest.sh
 0  4 * * * /path/to/tailor/sync_email.sh
 */5 * * * * /path/to/tailor/.venv/bin/python3 /path/to/tailor/scripts/services/heartbeat.py
 * * * * *   /path/to/tailor/.venv/bin/python3 /path/to/tailor/scripts/services/reminder_checker.py
