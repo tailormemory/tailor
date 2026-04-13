@@ -104,6 +104,9 @@ Without it, the server runs open (suitable for local-only use).
 | **Fact Derivation** | Infers second-order facts from entity clusters |
 | **Temporal Grounding** | Dual-layer `document_date` + `event_date` for time-aware retrieval |
 | **User Profiles** | Auto-generated static + dynamic profile, refreshed nightly |
+| **Rate Limiting** | IP-based throttling on failed auth attempts. Configurable max attempts, window, and ban duration. |
+| **Multi-Token Auth** | Per-token permissions (read/write/full). Give ChatGPT read-only access, Claude write access, keep admin full. |
+| **Live Capture** | Chrome extension captures conversations from Claude, ChatGPT, and Gemini in real-time. |
 | **Model Advisor** | Scans HuggingFace + cloud APIs for models matching your hardware. One-click install from the dashboard. |
 
 ### 📥 Multi-Source Ingest
@@ -205,6 +208,7 @@ All config lives in `config/tailor.yaml`:
 | `cloud_sync` | rclone remotes for cloud storage |
 | `email` | Email sync provider (IMAP or Gmail API) |
 | `services` | Services monitored by heartbeat |
+| `auth` | Rate limiting and multi-token authentication |
 | `pipeline` | Nightly pipeline schedule and timeouts |
 | `model_advisor` | Model discovery frequency, hardware specs, tracked providers |
 | `language` | Language for AI-generated content |
@@ -447,6 +451,7 @@ Both have: atomic facts, supersession, user profiles, hybrid search, temporal gr
 ## Roadmap
 
 - **Model Advisor v2** — Benchmark comparison, automatic backend suggestions when a faster/cheaper model fits the same enrichment role.
+- **Chrome Web Store** — Publish the browser extension for one-click install.
 - **Auto-forgetting** — Configurable TTL for facts, with automatic expiration and cleanup.
 - **Webhook real-time ingest** — Push-based ingestion for live data sources (vs. nightly batch).
 - **Multimodal support** — Video, audio, and code AST ingestion.
