@@ -24,7 +24,9 @@
 # v8 - 2026-04-07: trap MCP restart on exit + timeout per step (60/30/30 min)
 # v9 - 2026-04-07: rclone sync da YAML (multi-provider), fix path facts.sqlite3
 
-TAILOR_DIR="${TAILOR_HOME:-$(cd "$(dirname "$0")" && pwd)}"
+# Resolve project root
+TAILOR_DIR="${TAILOR_HOME:-$(cd "$(dirname "$0")" 2>/dev/null && pwd)}"
+cd "$TAILOR_DIR" || { echo "FATAL: cannot cd to $TAILOR_DIR" >&2; exit 1; }
 LOG_FILE="$TAILOR_DIR/logs/sync_and_ingest.log"
 RCLONE="${RCLONE_PATH:-$(command -v rclone 2>/dev/null || echo /opt/homebrew/bin/rclone)}"
 PYTHON="$TAILOR_DIR/.venv/bin/python3"

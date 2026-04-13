@@ -297,6 +297,12 @@ Automated enrichment runs every night:
 | Time | Job | Description |
 |---|---|---|
 | 02:30 | **Backup** | SQLite databases |
+> **Important**: Set `TAILOR_HOME` in your crontab so the pipeline resolves paths correctly:
+> ```
+> TAILOR_HOME=/path/to/tailor
+> 0 3 * * * cd /path/to/tailor && ./sync_and_ingest.sh
+> ```
+
 | 03:00 | **Pipeline** | Cloud sync → doc ingest → entities → facts → supersession → derivation → profile |
 | 04:00 | **Email** | Gmail/IMAP export → triage → chunk → ingest |
 
