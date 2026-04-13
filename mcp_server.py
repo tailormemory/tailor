@@ -857,6 +857,9 @@ class BearerAuthMiddleware:
                 try:
                     from scripts.lib.embedding import get_embeddings
                     embedding = get_embeddings(text[:8000])
+                    # Flatten if nested list (some providers return [[...]])
+                    if embedding and isinstance(embedding[0], list):
+                        embedding = embedding[0]
                     metadata = {
                         "source": source,
                         "title": title,
