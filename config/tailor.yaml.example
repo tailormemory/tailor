@@ -252,7 +252,17 @@ auth:
   rate_limit:
     max_attempts: 5        # failed attempts before ban
     window_minutes: 15     # time window for counting attempts
-    ban_minutes: 30        # ban duration after threshold
+    ban_minutes: 30
+  # Multi-token authentication (optional).
+  # Each token has a name and permission level: full, write, or read.
+  # If not configured, TAILOR_API_KEY is used with full access.
+  # tokens:
+  #   - name: claude
+  #     token: ${TAILOR_TOKEN_CLAUDE}
+  #     permission: write
+  #   - name: chatgpt
+  #     token: ${TAILOR_TOKEN_CHATGPT}
+  #     permission: read        # ban duration after threshold
 
 # ── Services ──────────────────────────────────────────────────
 # Services monitored by heartbeat and shown in the dashboard.

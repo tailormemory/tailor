@@ -129,6 +129,17 @@ _rate_limiter = AuthRateLimiter(
     window_seconds=_rl_cfg.get("window_minutes", 15) * 60,
     ban_seconds=_rl_cfg.get("ban_minutes", 30) * 60,
 )
+# ── Multi-token auth ───────────────────────────────────────────
+from scripts.lib.token_auth import TokenAuth
+_tokens_cfg = []
+try:
+    _tokens_cfg = _rl_get("auth", "tokens") or []
+    if not isinstance(_tokens_cfg, list):
+        _tokens_cfg = []
+except Exception:
+    pass
+_token_auth = TokenAuth(tokens_config=_tokens_cfg, legacy_key=TAILOR_API_KEY)
+
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 if not TAILOR_API_KEY:
@@ -228,7 +239,8 @@ class BearerAuthMiddleware:
                 except Exception:
                     data = {}
                 token = data.get("token", "")
-                if token == TAILOR_API_KEY:
+                _auth_info = _token_auth.authenticate(token)
+                if _auth_info:
                     session_id = secrets.token_hex(32)
                     # Store session (simple file-based)
                     sessions_path = os.path.join(BASE_DIR, "db", "dashboard_sessions.json")
@@ -863,13 +875,16 @@ class BearerAuthMiddleware:
                     hdrs = dict(scope.get("headers", []))
                     # Check Bearer token
                     auth_val = hdrs.get(b"authorization", b"").decode("utf-8", errors="ignore")
-                    if auth_val.startswith("Bearer ") and auth_val[7:] == TAILOR_API_KEY:
+                    _resolved_token = ""
+                    if auth_val.startswith("Bearer ") and _token_auth.authenticate(auth_val[7:]):
+                        _resolved_token = auth_val[7:]
                         token_ok = True
                     # Check query string token
                     if not token_ok:
                         qs = scope.get("query_string", b"").decode()
                         for param in qs.split("&"):
-                            if param.startswith("token=") and param[6:] == TAILOR_API_KEY:
+                            if param.startswith("token=") and _token_auth.authenticate(param[6:]):
+                                _resolved_token = param[6:]
                                 token_ok = True
                                 break
                     # Check session cookie
@@ -900,20 +915,31 @@ class BearerAuthMiddleware:
                             response = Response(content='{"error":"Unauthorized"}', status_code=401, media_type="application/json")
                         await response(scope, receive, send)
                         return
+                # Check endpoint permission
+                if _resolved_token and not is_localhost:
+                    _ep_ok, _ep_reason = _token_auth.check_endpoint(_resolved_token, path)
+                    if not _ep_ok:
+                        response = Response(content='{"error":"Forbidden: insufficient permissions"}', status_code=403, media_type="application/json")
+                        await response(scope, receive, send)
+                        return
                 response = await self._handle_rest_api(path, scope, receive)
                 await response(scope, receive, send)
                 return
 
         headers = dict(scope.get("headers", []))
         auth_value = headers.get(b"authorization", b"").decode("utf-8", errors="ignore")
-        if auth_value.startswith("Bearer ") and auth_value[7:] == TAILOR_API_KEY:
+        _mcp_token = ""
+        if auth_value.startswith("Bearer ") and _token_auth.authenticate(auth_value[7:]):
+            _mcp_token = auth_value[7:]
+            scope["_tailor_token"] = _mcp_token
             await self.app(scope, receive, send)
             return
         query_string = scope.get("query_string", b"").decode("utf-8", errors="ignore")
         for param in query_string.split("&"):
             if param.startswith("token="):
-                token_value = param[6:]
-                if token_value == TAILOR_API_KEY:
+                _mcp_token = param[6:]
+                if _token_auth.authenticate(_mcp_token):
+                    scope["_tailor_token"] = _mcp_token
                     await self.app(scope, receive, send)
                     return
                 break
