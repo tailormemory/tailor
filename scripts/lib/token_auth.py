@@ -63,6 +63,7 @@ ENDPOINT_PERMISSIONS = {
     "/api/fetch/": "read",
     # Write
     "/api/dashboard/upload": "write",
+    "/api/ingest-live": "write",
     "/api/dashboard/model-advisor/install": "write",
     # Full
     "/api/dashboard/config": "full",

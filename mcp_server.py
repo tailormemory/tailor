@@ -812,6 +812,58 @@ class BearerAuthMiddleware:
                     return _json_response({"error": "Job not found"}, 404)
                 return _json_response(job)
 
+            elif path == "/api/ingest-live":
+                # Receive live conversation messages from browser extension
+                body = await _receive_body(scope, receive)
+                import json as _jlive, hashlib as _hlive
+                try:
+                    data = _jlive.loads(body)
+                except Exception:
+                    return _json_response({"error": "Invalid JSON"}, 400)
+                source = data.get("source", "web")
+                title = data.get("title", "Untitled")
+                messages = data.get("messages", [])
+                timestamp = data.get("timestamp", "")
+                if not messages:
+                    return _json_response({"error": "No messages"}, 400)
+                # Build conversation text
+                lines = []
+                for m in messages:
+                    role = m.get("role", "unknown").capitalize()
+                    content = m.get("content", "")
+                    lines.append(f"{role}: {content}")
+                text = "\n\n".join(lines)
+                # Generate chunk ID based on content hash
+                content_hash = _hlive.md5(text[:500].encode()).hexdigest()[:10]
+                chunk_id = f"live_{source}_{content_hash}"
+                # Check if already exists
+                collection = get_collection()
+                try:
+                    existing = collection.get(ids=[chunk_id])
+                    if existing and existing["ids"]:
+                        return _json_response({"ok": True, "chunks": 0, "note": "Already ingested"})
+                except Exception:
+                    pass
+                # Embed and store
+                try:
+                    from scripts.lib.embedding import get_embeddings
+                    embedding = get_embeddings(text[:8000])
+                    metadata = {
+                        "source": source,
+                        "title": title,
+                        "type": "conversation",
+                        "document_date": timestamp[:10] if timestamp else "",
+                    }
+                    collection.add(
+                        ids=[chunk_id],
+                        embeddings=[embedding],
+                        documents=[text[:10000]],
+                        metadatas=[metadata],
+                    )
+                    return _json_response({"ok": True, "chunks": 1})
+                except Exception as e:
+                    return _json_response({"error": str(e)}, 500)
+
             elif path == "/api/dashboard/rate-limit":
                 return _json_response(_rate_limiter.get_stats())
 
