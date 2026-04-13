@@ -197,7 +197,7 @@ def classify_intent(text: str) -> tuple[str, str]:
         if has_num or any(w in t.lower().replace("\u00ec","i") for w in cwords):
             return "confirm_delete", t
     
-    p = ask_classifier_json(INTENT_SYSTEM, f"Messaggio: \"{t}\"")
+    p = ask_classifier_json(INTENT_SYSTEM, f"Message: \"{t}\"")
     if p and "intent" in p:
         return p["intent"], p.get("query", t)
     return "general", t
@@ -209,30 +209,30 @@ def classify_intent(text: str) -> tuple[str, str]:
 def handle_create_reminder(text):
     send_typing()
     dt_now = datetime.now()
-    days_it = ['lunedi','martedi','mercoledi','giovedi','venerdi','sabato','domenica']
-    day_names = ["LUN","MAR","MER","GIO","VEN","SAB","DOM"]
-    p = ask_classifier_json(REMINDER_SYSTEM, f"Now: {dt_now.strftime('%Y-%m-%d %H:%M:%S')} ({days_it[dt_now.weekday()]})\nMessage: \"{text}\"")
+    days_en = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday']
+    day_names = ["MON","TUE","WED","THU","FRI","SAT","SUN"]
+    p = ask_classifier_json(REMINDER_SYSTEM, f"Now: {dt_now.strftime('%Y-%m-%d %H:%M:%S')} ({days_en[dt_now.weekday()]})\nMessage: \"{text}\"")
     if not p or "text" not in p:
-        return "Non ho capito cosa/quando. Prova:\n_ricordami di chiamare Marco domani alle 10_"
+        return t("I didn't understand what/when. Try:\nremind me to call Marco tomorrow at 10")
     
     rtype = p.get("type", "once")
     if rtype == "recurring":
         days = p.get("days", [])
         time_str = p.get("time", "09:00")
-        if not days: return "Non ho capito i giorni."
+        if not days: return t("I didn't understand the days.")
         add_recurring_reminder(p["text"], days, time_str)
         day_labels = ", ".join(day_names[d] for d in sorted(days))
-        return f"\u2705 *Reminder ricorrente impostato*\n\n\U0001f4dd {p['text']}\n\U0001f4c5 {day_labels} alle {time_str}"
+        return f"\u2705 *{t("Recurring reminder set")}*\n\n\U0001f4dd {p['text']}\n\U0001f4c5 {day_labels} {time_str}"
     else:
         dt_str = p.get("datetime", "")
-        if not dt_str: return "Non ho capito quando."
+        if not dt_str: return t("I didn't understand when.")
         try:
             dt = datetime.fromisoformat(dt_str)
             if dt < dt_now - timedelta(minutes=5):
                 return t(f"Date ({dt.strftime('%d/%m/%Y %H:%M')}) is in the past.")
-        except: return f"Data non valida: {dt_str}"
+        except: return f"{t('Invalid date')}: {dt_str}"
         add_reminder(p["text"], dt_str)
-        return f"\u2705 *Reminder impostato*\n\n\U0001f4dd {p['text']}\n\U0001f4c5 {dt.strftime('%d/%m/%Y alle %H:%M')}"
+        return f"\u2705 *{t("Reminder set")}*\n\n\U0001f4dd {p['text']}\n\U0001f4c5 {dt.strftime('%d/%m/%Y %H:%M')}"
 
 def handle_delete_reminder(query):
     global pending_reminder_deletions
@@ -254,11 +254,11 @@ def handle_delete_reminder(query):
 
 def handle_list_reminders():
     all_rem = load_reminders()
-    day_names = ["LUN","MAR","MER","GIO","VEN","SAB","DOM"]
+    day_names = ["MON","TUE","WED","THU","FRI","SAT","SUN"]
     once_active = [r for r in all_rem if r.get("type","once")=="once" and not r.get("sent")]
     recurring = [r for r in all_rem if r.get("type")=="recurring"]
     if not once_active and not recurring: return "No active reminders."
-    lines = ["\U0001f4cb *Reminder attivi:*\n"]
+    lines = [f"\U0001f4cb *{t('Active reminders')}:*\n"]
     if once_active:
         lines.append("*One-shot:*")
         for i,r in enumerate(once_active,1):
@@ -275,7 +275,7 @@ def handle_list_reminders():
 
 def handle_create_note(text):
     send_typing()
-    if len(text.strip()) < 5: return "Nota troppo corta."
+    if len(text.strip()) < 5: return t("Note too short.")
     p = ask_classifier_json(NOTE_SYSTEM, f"Nota: \"{text}\"")
     title = p["title"][:80] if p and "title" in p else text[:60]
     cat = p.get("category","general") if p else "general"
@@ -284,7 +284,7 @@ def handle_create_note(text):
     result = execute_tool("kb_add", {"content": text, "title": title, "category": cat})
     if "errore" in result.lower() or "error" in result.lower():
         return t("Save error") + f": {result[:200]}"
-    return f"\U0001f4dd *Nota salvata*\n\n\u2022 {title}\n\u2022 Categoria: {cat}"
+    return f"\U0001f4dd *{t("Note saved")}*\n\n\u2022 {title}\n\u2022 {t("Category")}: {cat}"
 
 def handle_delete_note(query):
     global pending_note_deletions
@@ -310,7 +310,7 @@ def handle_confirm_delete(query):
     if pending_reminder_deletions:
         if num<1 or num>len(pending_reminder_deletions): return f"Scegli tra 1 e {len(pending_reminder_deletions)}."
         if delete_reminder_by_index(pending_reminder_deletions[num-1]+1):
-            pending_reminder_deletions = []; return "\u2705 Reminder cancellato."
+            pending_reminder_deletions = []; return t("\u2705 Reminder deleted.")
         return t("Deletion error.")
     return "No pending deletions."
 
@@ -438,12 +438,12 @@ def route_message(text: str, session_id: str) -> str:
         "confirm_delete": lambda: handle_confirm_delete(query),
         "show_status": lambda: handle_show_status(),
         "general": lambda: handle_general(query, session_id),
-        "start": lambda: (f"\U0001f7e2 *{PERSONA_NAME} v5 attivo.*\n\n"
+        "start": lambda: (f"\U0001f7e2 *{PERSONA_NAME} v5 {t('active')}.*\n\n"
                          f"Brain: {get_brain().provider}/{get_brain().model}\n\n"
-                         "Scrivimi in modo naturale:\n"
-                         "\u2022 _ricordami di..._ — reminder\n"
-                         "\u2022 _nota: ..._ — salva in KB\n"
-                         "\u2022 Qualsiasi domanda — rispondo con contesto KB"),
+                         f"{t('Write naturally')}:\n"
+                         f"\u2022 _remind me..._ — reminder\n"
+                         f"\u2022 _note: ..._ — {t('save to KB')}\n"
+                         f"\u2022 {t('Any question')} — {t('I answer with KB context')}"),
     }
     return handlers.get(intent, lambda: handle_general(text, session_id))()
 
