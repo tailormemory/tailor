@@ -312,7 +312,7 @@ def handle_confirm_delete(query):
         if delete_reminder_by_index(pending_reminder_deletions[num-1]+1):
             pending_reminder_deletions = []; return "\u2705 Reminder cancellato."
         return t("Deletion error.")
-    return "Nessuna cancellazione in sospeso."
+    return "No pending deletions."
 
 def handle_show_status():
     try:
