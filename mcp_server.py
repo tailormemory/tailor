@@ -933,10 +933,11 @@ class BearerAuthMiddleware:
             is_localhost = client_host in ("127.0.0.1", "::1", "localhost")
             is_dashboard = path.startswith("/api/dashboard/")
             is_auth_api = path.startswith("/api/auth/")
+            is_ingest_api = path == "/api/ingest-live"
 
             # Localhost: allow all API calls without auth
-            # Remote: allow dashboard + auth API with cookie/token auth
-            if is_localhost or is_dashboard or is_auth_api:
+            # Remote: allow dashboard + auth API + ingest-live with cookie/token auth
+            if is_localhost or is_dashboard or is_auth_api or is_ingest_api:
                 # Remote calls need auth (except /api/auth/login which verifies itself)
                 if not is_localhost and path not in ("/api/auth/login", "/api/dashboard/setup"):
                     token_ok = False
