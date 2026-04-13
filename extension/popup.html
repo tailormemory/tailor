@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { width: 320px; font-family: 'Segoe UI', system-ui, sans-serif; background: #0a0a0a; color: #d1d5db; padding: 20px; }
+h1 { font-size: 16px; font-weight: 700; color: #e5e5e5; margin-bottom: 4px; }
+h1 .bracket { color: #0d9488; font-weight: 400; font-size: 18px; }
+h1 .ai { color: #0d9488; }
+.subtitle { font-size: 11px; color: #6b7280; margin-bottom: 16px; }
+label { display: block; font-size: 11px; font-weight: 600; color: #9ca3af; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; margin-top: 12px; }
+input[type="text"], input[type="password"] { width: 100%; padding: 8px 10px; background: #111; border: 1px solid #333; border-radius: 4px; color: #e5e5e5; font-size: 13px; font-family: monospace; outline: none; }
+input:focus { border-color: #0d9488; box-shadow: 0 0 0 2px rgba(13,148,136,0.15); }
+.toggle-row { display: flex; align-items: center; justify-content: space-between; margin-top: 14px; padding: 8px 0; border-top: 1px solid #1a1a1a; }
+.toggle-label { font-size: 13px; color: #d1d5db; }
+.toggle { position: relative; width: 40px; height: 22px; cursor: pointer; }
+.toggle input { opacity: 0; width: 0; height: 0; }
+.toggle .slider { position: absolute; inset: 0; background: #333; border-radius: 11px; transition: background 0.2s; }
+.toggle .slider::before { content: ""; position: absolute; width: 16px; height: 16px; left: 3px; bottom: 3px; background: white; border-radius: 50%; transition: transform 0.2s; }
+.toggle input:checked + .slider { background: #0d9488; }
+.toggle input:checked + .slider::before { transform: translateX(18px); }
+button { width: 100%; margin-top: 14px; padding: 9px; background: #0d9488; color: white; border: none; border-radius: 4px; font-size: 13px; font-weight: 600; cursor: pointer; }
+button:hover { filter: brightness(1.1); }
+.status { margin-top: 10px; font-size: 11px; text-align: center; min-height: 16px; }
+.status.ok { color: #0d9488; }
+.status.error { color: #ef4444; }
+.status.info { color: #6b7280; }
+.platforms { margin-top: 14px; padding-top: 10px; border-top: 1px solid #1a1a1a; font-size: 11px; color: #6b7280; }
+.platforms span { display: inline-block; background: #1a1a1a; padding: 2px 8px; border-radius: 3px; margin: 2px; font-size: 10px; }
+</style>
+</head>
+<body>
+  <h1><span>T</span><span class="bracket">[</span><span class="ai">AI</span><span class="bracket">]</span><span>LOR</span></h1>
+  <div class="subtitle">AI Conversation Capture</div>
+  <label>Server URL</label>
+  <input type="text" id="url" placeholder="https://your-tailor.example.com" spellcheck="false">
+  <label>API Token</label>
+  <input type="password" id="token" placeholder="Your TAILOR API key" spellcheck="false">
+  <div class="toggle-row">
+    <span class="toggle-label">Capture enabled</span>
+    <label class="toggle"><input type="checkbox" id="enabled"><span class="slider"></span></label>
+  </div>
+  <button id="save">Save & Test Connection</button>
+  <div class="status" id="status"></div>
+  <div class="platforms">Captures from: <span>Claude</span> <span>ChatGPT</span> <span>Gemini</span></div>
+  <script src="popup.js"></script>
+</body>
+</html>

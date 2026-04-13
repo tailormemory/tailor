@@ -338,9 +338,44 @@ tailor/
 │   └── maintenance/           # Backup, rebuild, pre-launch audit
 ├── db/                        # ChromaDB, facts.sqlite3, entity_index.sqlite3 (git-ignored)
 ├── models/reranker/           # ONNX cross-encoder (git-ignored, downloaded by setup.sh)
+├── extension/                 # Chrome extension for live conversation capture
 ├── docs/                      # EMAIL_SETUP.md and other guides
 └── requirements.txt
 ```
+
+---
+
+## Chrome Extension — Live Conversation Capture
+
+TAILOR includes a Chrome extension that captures conversations from Claude, ChatGPT, and Gemini in real-time and sends them to your KB automatically.
+
+### Install
+
+1. Open `chrome://extensions/` in Chrome
+2. Enable **Developer mode** (toggle top-right)
+3. Click **Load unpacked** and select the `extension/` folder from this repo
+4. Click the extension icon → enter your TAILOR server URL and API token
+5. Enable **Capture enabled**
+
+The extension shows a small teal badge on supported sites when active.
+
+### How it works
+
+- Observes the page DOM for new messages (MutationObserver)
+- Buffers and sends new messages to `/api/ingest-live` every 30 seconds
+- Deduplicates by content hash — same conversation won't be ingested twice
+- Works on: **claude.ai**, **chatgpt.com**, **gemini.google.com**
+- Mobile conversations sync automatically (they appear when you open the web version)
+
+### Permissions
+
+| Permission | Why |
+|---|---|
+| `storage` | Save your server URL and token locally |
+| `activeTab` | Read conversation content on the current tab |
+| Host access to claude.ai, chatgpt.com, gemini.google.com | Inject the capture script on these sites only |
+
+No data is sent to any third party. Everything goes directly to your self-hosted TAILOR instance.
 
 ---
 
