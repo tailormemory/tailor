@@ -246,6 +246,14 @@ model_advisor:
     telegram: true
     dashboard: true
 
+# ── Authentication ────────────────────────────────────────────
+# Rate limiting on failed auth attempts (remote only, localhost bypassed).
+auth:
+  rate_limit:
+    max_attempts: 5        # failed attempts before ban
+    window_minutes: 15     # time window for counting attempts
+    ban_minutes: 30        # ban duration after threshold
+
 # ── Services ──────────────────────────────────────────────────
 # Services monitored by heartbeat and shown in the dashboard.
 # check: "port" (TCP connect) or "process" (ps aux match)

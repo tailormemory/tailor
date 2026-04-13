@@ -113,6 +113,22 @@ TAILOR_API_KEY = os.environ.get("TAILOR_API_KEY", "") or os.environ.get("JARVIS_
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 JINA_API_KEY = os.environ.get("JINA_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+
+# ── Rate limiting ─────────────────────────────────────────────
+from scripts.lib.rate_limiter import AuthRateLimiter
+_rl_cfg = {}
+try:
+    from scripts.lib.config import get as _rl_get
+    _rl_cfg = _rl_get("auth", "rate_limit") or {}
+    if not isinstance(_rl_cfg, dict):
+        _rl_cfg = {}
+except Exception:
+    pass
+_rate_limiter = AuthRateLimiter(
+    max_attempts=_rl_cfg.get("max_attempts", 5),
+    window_seconds=_rl_cfg.get("window_minutes", 15) * 60,
+    ban_seconds=_rl_cfg.get("ban_minutes", 30) * 60,
+)
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 if not TAILOR_API_KEY:
@@ -193,6 +209,11 @@ class BearerAuthMiddleware:
 
             # ── Auth ──
             elif path == "/api/auth/login":
+                # Rate limit check
+                _login_ip = scope.get("client", ("", 0))[0] or ""
+                if _rate_limiter.is_banned(_login_ip):
+                    _rem = _rate_limiter.ban_remaining(_login_ip)
+                    return _json_response({"error": "Too many attempts. Try again in %ds." % _rem}, 429)
                 # POST: verify token, return session cookie
                 body = b""
                 while True:
@@ -226,8 +247,13 @@ class BearerAuthMiddleware:
                         _jauth.dump(sessions, _sf)
                     resp = _json_response({"ok": True})
                     resp.set_cookie("tailor_session", session_id, max_age=30*86400, httponly=True, samesite="lax", path="/")
+                    _rate_limiter.record_success(_login_ip)
                     return resp
                 else:
+                    _banned = _rate_limiter.record_failure(_login_ip)
+                    if _banned:
+                        _rem = _rate_limiter.ban_remaining(_login_ip)
+                        return _json_response({"error": "Too many attempts. Banned for %ds." % _rem}, 429)
                     return _json_response({"error": "Invalid token"}, 401)
 
             elif path == "/api/auth/check":
@@ -774,6 +800,9 @@ class BearerAuthMiddleware:
                     return _json_response({"error": "Job not found"}, 404)
                 return _json_response(job)
 
+            elif path == "/api/dashboard/rate-limit":
+                return _json_response(_rate_limiter.get_stats())
+
             else:
                 return _json_response({"error": f"Unknown API path: {path}"}, 404)
         except Exception as e:
@@ -863,7 +892,12 @@ class BearerAuthMiddleware:
                                         pass
                                 break
                     if not token_ok:
-                        response = Response(content='{"error":"Unauthorized"}', status_code=401, media_type="application/json")
+                        _rate_limiter.record_failure(client_host)
+                        if _rate_limiter.is_banned(client_host):
+                            _rem = _rate_limiter.ban_remaining(client_host)
+                            response = Response(content='{"error":"Too many attempts","retry_after":%d}' % _rem, status_code=429, media_type="application/json")
+                        else:
+                            response = Response(content='{"error":"Unauthorized"}', status_code=401, media_type="application/json")
                         await response(scope, receive, send)
                         return
                 response = await self._handle_rest_api(path, scope, receive)
