@@ -935,6 +935,7 @@ class BearerAuthMiddleware:
 
             # Localhost: allow all API calls without auth
             # Remote: allow dashboard + auth API + ingest-live with cookie/token auth
+            _resolved_token = ""
             if is_localhost or is_dashboard or is_auth_api or is_ingest_api:
                 # Remote calls need auth (except /api/auth/login which verifies itself)
                 if not is_localhost and path not in ("/api/auth/login", "/api/dashboard/setup"):
