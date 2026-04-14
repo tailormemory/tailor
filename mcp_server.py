@@ -841,7 +841,7 @@ class BearerAuthMiddleware:
                     lines.append(f"{role}: {content}")
                 text = "\n\n".join(lines)
                 # Generate chunk ID based on content hash
-                content_hash = _hlive.md5(text[:500].encode()).hexdigest()[:10]
+                content_hash = _hlive.sha256(text[:500].encode()).hexdigest()[:16]
                 chunk_id = f"live_{source}_{content_hash}"
                 # Check if already exists
                 collection = get_collection()
