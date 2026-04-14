@@ -182,10 +182,6 @@ class BearerAuthMiddleware:
         def _json_response(data, status_code=200):
             body = _json.dumps(data, ensure_ascii=False, default=str)
             return Response(content=body, status_code=status_code, media_type="application/json", headers=_CORS_HEADERS)
-        # Handle CORS preflight
-            method = scope.get("method", "GET")
-            if method == "OPTIONS":
-                return Response(content="", status_code=204, headers=_CORS_HEADERS)
         try:
             # /api/fetch/<chunk_id>
             if path.startswith("/api/fetch/"):
