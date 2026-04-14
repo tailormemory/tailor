@@ -456,8 +456,6 @@ Both have: atomic facts, supersession, user profiles, hybrid search, temporal gr
 - **Webhook real-time ingest** — Push-based ingestion for live data sources (vs. nightly batch).
 - **Multimodal support** — Video, audio, and code AST ingestion.
 - **Automated Claude conversation ingest** — Proxy architecture for real-time capture.
-- **Rate limiting** — IP-based throttling on failed auth attempts.
-- **Multi-token auth** — Per-token permissions (read-only vs full access) for team use.
 
 ---
 
