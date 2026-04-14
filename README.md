@@ -35,7 +35,7 @@ Your conversations, documents, emails, and decisions — indexed, searchable, an
 | 🧠 **Persistent Memory** | Facts, decisions, and preferences survive across sessions and across different AI providers. |
 | 🔒 **100% Local** | ChromaDB + Ollama. No cloud dependency for core functions. Your data stays on your machine. |
 | 🔌 **LLM-Agnostic** | Anthropic, OpenAI, Google, Ollama. Switch providers by changing one line in the config. |
-| 🤖 **MCP Native** | 20+ tools. Connects to Claude, ChatGPT, and any MCP-compatible client. |
+| 🤖 **MCP Native** | 21 tools. Connects to Claude, ChatGPT, and any MCP-compatible client. |
 | 🔄 **Self-Enriching** | Nightly pipelines extract atomic facts, build entity graphs, derive inferences, supersede outdated info. |
 | 📱 **Telegram Bot** | Full conversational interface with KB access, reminders, and automatic session capture. |
 
