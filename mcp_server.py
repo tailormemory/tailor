@@ -830,6 +830,7 @@ class BearerAuthMiddleware:
                 source = data.get("source", "web")
                 title = data.get("title", "Untitled")
                 messages = data.get("messages", [])
+                conversation_id = data.get("conversation_id", "")
                 timestamp = data.get("timestamp", "")
                 if not messages:
                     return _json_response({"error": "No messages"}, 400)
@@ -840,18 +841,23 @@ class BearerAuthMiddleware:
                     content = m.get("content", "")
                     lines.append(f"{role}: {content}")
                 text = "\n\n".join(lines)
-                # Generate chunk ID based on content hash
-                content_hash = _hlive.sha256(text[:500].encode()).hexdigest()[:16]
-                chunk_id = f"live_{source}_{content_hash}"
-                # Check if already exists
+                # Generate stable chunk ID from conversation_id or content hash
+                if conversation_id:
+                    conv_hash = _hlive.sha256(conversation_id.encode()).hexdigest()[:16]
+                    chunk_id = f"live_{source}_{conv_hash}"
+                else:
+                    content_hash = _hlive.sha256(text[:500].encode()).hexdigest()[:16]
+                    chunk_id = f"live_{source}_{content_hash}"
+                # Check if this is an update
                 collection = get_collection()
+                is_update = False
                 try:
                     existing = collection.get(ids=[chunk_id])
                     if existing and existing["ids"]:
-                        return _json_response({"ok": True, "chunks": 0, "note": "Already ingested"})
+                        is_update = True
                 except Exception:
                     pass
-                # Embed and store
+                # Embed and upsert
                 try:
                     from scripts.lib.embedding import get_embeddings
                     embedding = get_embeddings(text[:8000])
@@ -864,13 +870,13 @@ class BearerAuthMiddleware:
                         "type": "conversation",
                         "document_date": timestamp[:10] if timestamp else "",
                     }
-                    collection.add(
+                    collection.upsert(
                         ids=[chunk_id],
                         embeddings=[embedding],
                         documents=[text[:10000]],
                         metadatas=[metadata],
                     )
-                    return _json_response({"ok": True, "chunks": 1})
+                    return _json_response({"ok": True, "chunks": 1, "updated": is_update})
                 except Exception as e:
                     return _json_response({"error": str(e)}, 500)
 

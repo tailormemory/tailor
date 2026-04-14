@@ -3,7 +3,7 @@
  * Receives messages from content scripts and sends them to TAILOR API.
  */
 
-async function sendToTailor(messages, source, conversationTitle) {
+async function sendToTailor(messages, source, conversationTitle, conversationId) {
   const config = await chrome.storage.sync.get(["tailorUrl", "tailorToken", "enabled"]);
   if (!config.enabled || !config.tailorUrl) return { ok: false, error: "Not configured" };
 
@@ -21,12 +21,13 @@ async function sendToTailor(messages, source, conversationTitle) {
         source,
         title: conversationTitle || "Untitled conversation",
         messages,
+        conversation_id: conversationId || "",
         timestamp: new Date().toISOString(),
       }),
     });
     const data = await resp.json();
     if (resp.ok) {
-      return { ok: true, chunks: data.chunks || 0 };
+      return { ok: true, chunks: data.chunks || 0, updated: data.updated || false };
     }
     return { ok: false, error: data.error || resp.statusText };
   } catch (e) {
@@ -36,7 +37,7 @@ async function sendToTailor(messages, source, conversationTitle) {
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "tailor_ingest") {
-    sendToTailor(msg.messages, msg.source, msg.title).then(sendResponse);
+    sendToTailor(msg.messages, msg.source, msg.title, msg.conversation_id).then(sendResponse);
     return true;
   }
   if (msg.type === "tailor_status") {

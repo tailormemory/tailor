@@ -16,9 +16,34 @@
 
   console.log(`[TAILOR] Content script loaded on ${platform}`);
 
-  let lastMessageCount = 0;
+  let lastTextHash = null;
   let flushTimer = null;
   const FLUSH_INTERVAL = 30000;
+
+  function simpleHash(str) {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
+    }
+    return hash;
+  }
+
+  function getConversationId() {
+    const path = window.location.pathname;
+    if (platform === "claude") {
+      const m = path.match(/\/chat\/([a-f0-9-]+)/);
+      if (m) return "claude:" + m[1];
+    }
+    if (platform === "chatgpt") {
+      const m = path.match(/\/c\/([a-zA-Z0-9_-]+)/);
+      if (m) return "chatgpt:" + m[1];
+    }
+    if (platform === "gemini") {
+      const m = path.match(/\/app\/([a-f0-9]+)/);
+      if (m) return "gemini:" + m[1];
+    }
+    return "";
+  }
 
   function extractMessages() {
     const messages = [];
@@ -71,15 +96,26 @@
 
   function flush() {
     const allMessages = extractMessages();
-    if (allMessages.length <= lastMessageCount) return;
-    const newMessages = allMessages.slice(lastMessageCount);
-    lastMessageCount = allMessages.length;
-    if (newMessages.length < 1) return;
+    if (allMessages.length === 0) return;
+
+    // Check if conversation actually changed
+    const fullText = allMessages.map(m => m.content).join("|");
+    const textHash = simpleHash(fullText);
+    if (textHash === lastTextHash) return;
+    lastTextHash = textHash;
+
     const title = getConversationTitle();
-    console.log(`[TAILOR] Flushing ${newMessages.length} new messages (${platform}): "${title}"`);
-    chrome.runtime.sendMessage({ type: "tailor_ingest", source: platform, title: title, messages: newMessages }, (response) => {
+    const conversationId = getConversationId();
+    console.log(`[TAILOR] Flushing full conversation (${allMessages.length} msgs, ${platform}): "${title}"`);
+    chrome.runtime.sendMessage({
+      type: "tailor_ingest",
+      source: platform,
+      title: title,
+      messages: allMessages,
+      conversation_id: conversationId,
+    }, (response) => {
       if (response?.ok) {
-        console.log(`[TAILOR] Ingested ${response.chunks || 0} chunks`);
+        console.log(`[TAILOR] Ingested ${response.chunks || 0} chunks${response.updated ? " (updated)" : ""}`);
         updateBadge("ok");
       } else {
         console.warn(`[TAILOR] Ingest failed: ${response?.error || "unknown"}`);
