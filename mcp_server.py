@@ -908,17 +908,17 @@ class BearerAuthMiddleware:
             import mimetypes
             # Resolve path relative to dashboard/ — strip leading /dashboard/
             rel = path[len("/dashboard/"):]
-            # Security: reject path traversal
-            if ".." not in rel and rel:
-                file_path = os.path.join(BASE_DIR, "dashboard", rel)
-                if os.path.isfile(file_path):
-                    mime = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
-                    with open(file_path, "rb") as _sf:
-                        data = _sf.read()
-                    response = Response(content=data, status_code=200, media_type=mime,
-                        headers={"Cache-Control": "public, max-age=604800"})
-                    await response(scope, receive, send)
-                    return
+            # Security: reject path traversal via realpath validation
+            dashboard_dir = os.path.realpath(os.path.join(BASE_DIR, "dashboard"))
+            file_path = os.path.realpath(os.path.join(dashboard_dir, rel))
+            if file_path.startswith(dashboard_dir + os.sep) and os.path.isfile(file_path):
+                mime = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+                with open(file_path, "rb") as _sf:
+                    data = _sf.read()
+                response = Response(content=data, status_code=200, media_type=mime,
+                    headers={"Cache-Control": "public, max-age=604800"})
+                await response(scope, receive, send)
+                return
 
         if path in self.PUBLIC_PATHS:
             await self.app(scope, receive, send)
