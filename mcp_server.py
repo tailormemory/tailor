@@ -113,6 +113,11 @@ TAILOR_API_KEY = os.environ.get("TAILOR_API_KEY", "") or os.environ.get("JARVIS_
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 JINA_API_KEY = os.environ.get("JINA_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+_CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type",
+}
 
 # ── Rate limiting ─────────────────────────────────────────────
 from scripts.lib.rate_limiter import AuthRateLimiter
@@ -174,18 +179,13 @@ class BearerAuthMiddleware:
                 if not msg.get("more_body", False):
                     break
             return body
-        _cors_headers = {
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Authorization, Content-Type",
-        }
         def _json_response(data, status_code=200):
             body = _json.dumps(data, ensure_ascii=False, default=str)
-            return Response(content=body, status_code=status_code, media_type="application/json", headers=_cors_headers)
+            return Response(content=body, status_code=status_code, media_type="application/json", headers=_CORS_HEADERS)
         # Handle CORS preflight
             method = scope.get("method", "GET")
             if method == "OPTIONS":
-                return Response(content="", status_code=204, headers=_cors_headers)
+                return Response(content="", status_code=204, headers=_CORS_HEADERS)
         try:
             # /api/fetch/<chunk_id>
             if path.startswith("/api/fetch/"):
@@ -892,8 +892,7 @@ class BearerAuthMiddleware:
         # CORS preflight — respond immediately, no auth needed
         method = scope.get("method", "GET")
         if method == "OPTIONS":
-            _cors = {"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Allow-Headers": "Authorization, Content-Type"}
-            response = Response(content="", status_code=204, headers=_cors)
+            response = Response(content="", status_code=204, headers=_CORS_HEADERS)
             await response(scope, receive, send)
             return
         if not TAILOR_API_KEY and not path.startswith("/api/") and path != "/dashboard":
@@ -982,16 +981,16 @@ class BearerAuthMiddleware:
                         _rate_limiter.record_failure(client_host)
                         if _rate_limiter.is_banned(client_host):
                             _rem = _rate_limiter.ban_remaining(client_host)
-                            response = Response(content='{"error":"Too many attempts","retry_after":%d}' % _rem, status_code=429, media_type="application/json", headers=_cors_headers)
+                            response = Response(content='{"error":"Too many attempts","retry_after":%d}' % _rem, status_code=429, media_type="application/json", headers=_CORS_HEADERS)
                         else:
-                            response = Response(content='{"error":"Unauthorized"}', status_code=401, media_type="application/json", headers=_cors_headers)
+                            response = Response(content='{"error":"Unauthorized"}', status_code=401, media_type="application/json", headers=_CORS_HEADERS)
                         await response(scope, receive, send)
                         return
                 # Check endpoint permission
                 if _resolved_token and not is_localhost:
                     _ep_ok, _ep_reason = _token_auth.check_endpoint(_resolved_token, path)
                     if not _ep_ok:
-                        response = Response(content='{"error":"Forbidden: insufficient permissions"}', status_code=403, media_type="application/json", headers=_cors_headers)
+                        response = Response(content='{"error":"Forbidden: insufficient permissions"}', status_code=403, media_type="application/json", headers=_CORS_HEADERS)
                         await response(scope, receive, send)
                         return
                 response = await self._handle_rest_api(path, scope, receive)
