@@ -391,7 +391,7 @@ async def main():
         print("✅ No chunks to process.")
         return
 
-    print(f"📋 {total:,} chunk da processare")
+    print(f"📋 {total:,} chunks to process")
     print(f"  Backend: {manager.status()}")
 
     facts_conn = None
@@ -502,10 +502,10 @@ async def main():
 
     elapsed = time.time() - start_time
     print(f"\n{'═' * 55}")
-    print(f"✅ Completato in {elapsed/60:.1f} minuti")
-    print(f"  Chunk processati:  {processed:,}")
-    print(f"  Fatti estratti:    {total_facts:,}")
-    print(f"  Errori:            {errors:,}")
+    print(f"Completed in {elapsed/60:.1f} minutes")
+    print(f"  Chunks processed: {processed:,}")
+    print(f"  Facts extracted: {total_facts:,}")
+    print(f"  Errors: {errors:,}")
     print(f"  Backend: {manager.status()}")
     if args.test:
         print(f"  ⚠️  TEST mode — no changes")

@@ -352,7 +352,7 @@ while kill -0 $FACT_PID 2>/dev/null; do
 done
 wait $FACT_PID 2>/dev/null
 FACT_OUTPUT=$(tail -20 "$LOG_FILE")
-FACTS_EXTRACTED=$(echo "$FACT_OUTPUT" | grep "Fatti estratti:" | awk '{print $3}' | tr -d ',')
+FACTS_EXTRACTED=$(echo "$FACT_OUTPUT" | grep "Facts extracted:" | awk '{print $3}' | tr -d ',')
 FACTS_EXTRACTED=${FACTS_EXTRACTED:-0}
 FACTS_CHUNKS=$(echo "$FACT_OUTPUT" | grep "Chunks processed:" | awk '{print $3}' | tr -d ',')
 FACTS_CHUNKS=${FACTS_CHUNKS:-0}
