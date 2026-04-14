@@ -42,12 +42,12 @@ DB_DIR = os.path.join(BASE_DIR, "db")
 CHROMA_DB_PATH = os.path.join(DB_DIR, "chroma.sqlite3")
 FACTS_DB_PATH = os.path.join(DB_DIR, "facts.sqlite3")
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from scripts.lib.config import get as cfg, get_enrichment_backends
+_USER_LANG = cfg("user", "language") or "en"
+
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 OLLAMA_CHAT_URL = os.environ.get("OLLAMA_URL", cfg("ollama", "base_url") or "http://localhost:11434") + "/api/chat"
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from scripts.lib.config import get_enrichment_backends
-from scripts.lib.config import get as cfg
-_USER_LANG = cfg("user", "language") or "en"
 
 # Build model lookup from config backends list
 _backends = get_enrichment_backends("fact_extraction")
