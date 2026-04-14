@@ -144,7 +144,7 @@ def main():
         with open(output) as f:
             for ln in f:
                 try: existing.add(json.loads(ln)["id"])
-                except: pass
+                except Exception: pass
     print(f"Existing: {len(existing)} emails")
 
     print(f"Connecting to {host}:{port}...")
@@ -164,7 +164,7 @@ def main():
             except Exception as e: print(f"  ERROR: {e}")
     finally:
         try: conn.logout()
-        except: pass
+        except Exception: pass
 
     if all_new:
         with open(output, "a") as f:

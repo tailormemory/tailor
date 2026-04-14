@@ -120,7 +120,7 @@ def find_candidate_pairs(max_pairs=MAX_COMPARISONS):
         tags = []
         try:
             tags = json.loads(row[3]) if row[3] else []
-        except:
+        except Exception:
             pass
         all_facts.append({
             "id": row[0], "fact": row[1], "category": row[2] or "",
@@ -215,7 +215,7 @@ async def call_openai(session, semaphore, new_fact, old_fact, new_date, old_date
                 data = await resp.json()
                 content = data["choices"][0]["message"]["content"].strip()
                 return json.loads(content)
-        except:
+        except Exception:
             return None
 
 
@@ -245,7 +245,7 @@ async def call_gemini(session, semaphore, new_fact, old_fact, new_date, old_date
                 if start >= 0 and end > start:
                     return json.loads(content[start:end])
                 return None
-        except:
+        except Exception:
             return None
 
 

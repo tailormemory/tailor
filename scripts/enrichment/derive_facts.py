@@ -83,7 +83,7 @@ def load_entity_groups(db, min_facts=MIN_FACTS, entity_filter=None, nightly_sinc
     for r in rows:
         try:
             tags = json.loads(r["entity_tags"])
-        except:
+        except Exception:
             continue
         for tag in tags:
             norm = normalize_entity(tag)
@@ -112,7 +112,7 @@ def load_entity_groups(db, min_facts=MIN_FACTS, entity_filter=None, nightly_sinc
         for r in all_rows:
             try:
                 tags = json.loads(r["entity_tags"])
-            except:
+            except Exception:
                 continue
             for tag in tags:
                 norm = normalize_entity(tag)

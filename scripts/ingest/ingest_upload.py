@@ -52,7 +52,7 @@ def chunk_record(rec):
         cid=f"{rid}_chunk_{i:04d}"
         if not ds and ct:
             try: ds=datetime.fromtimestamp(ct).strftime("%Y-%m-%d")
-            except: ds=""
+            except Exception: ds=""
         chunks.append({"chunk_id":cid,"conv_id":rid,"title":title,"date":ds,
             "create_time":ct,"chunk_index":i,"text":ft,"char_count":len(ft),"source":src})
         prev=part
@@ -63,7 +63,7 @@ def prepare_upload(stype, fpath):
     is_zip = fpath.lower().endswith(".zip")
     if not is_zip:
         try: is_zip = zipfile.is_zipfile(fpath)
-        except: is_zip = False
+        except Exception: is_zip = False
     if is_zip:
         exdir = fpath + "_extracted"
         os.makedirs(exdir, exist_ok=True)
@@ -146,7 +146,7 @@ def main():
     finally:
         if cdir and os.path.exists(cdir):
             try: shutil.rmtree(cdir); print(f"  Cleaned {cdir}")
-            except: pass
+            except Exception: pass
 
 if __name__ == "__main__":
     main()

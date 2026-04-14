@@ -58,7 +58,7 @@ def check_port(port):
         s.connect(("127.0.0.1", port))
         s.close()
         return True
-    except:
+    except Exception:
         return False
 
 
@@ -66,7 +66,7 @@ def check_process(pattern):
     try:
         result = subprocess.run(["pgrep", "-f", pattern], capture_output=True, timeout=5)
         return result.returncode == 0
-    except:
+    except Exception:
         return False
 
 
@@ -91,7 +91,7 @@ def send_telegram(text):
             json={"chat_id": TG_CHAT, "text": text, "parse_mode": "Markdown"},
             timeout=10
         )
-    except:
+    except Exception:
         pass
 
 

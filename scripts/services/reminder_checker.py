@@ -62,7 +62,7 @@ def run_script(script_path, args=None):
 def check_once(r, now):
     if r.get("sent"): return False
     try: return now >= datetime.fromisoformat(r["remind_at"])
-    except: return False
+    except Exception: return False
 
 def check_recurring(r, now):
     days = r.get("days", [])
@@ -70,14 +70,14 @@ def check_recurring(r, now):
     if not days or not time_str: return False
     if now.weekday() not in days: return False
     try: hour, minute = map(int, time_str.split(":"))
-    except: return False
+    except Exception: return False
     if now.hour != hour or now.minute != minute: return False
     last_sent = r.get("last_sent", "")
     if last_sent:
         try:
             ls = datetime.fromisoformat(last_sent)
             if ls.date() == now.date() and ls.hour == hour and ls.minute == minute: return False
-        except: pass
+        except Exception: pass
     return True
 
 def main():

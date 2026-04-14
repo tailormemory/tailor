@@ -180,7 +180,7 @@ def ask_classifier_json(system: str, user_prompt: str) -> dict | None:
     try:
         s = raw.index("{"); e = raw.rindex("}") + 1
         return json.loads(raw[s:e])
-    except: return None
+    except Exception: return None
 
 def classify_intent(text: str) -> tuple[str, str]:
     t = text.strip()
@@ -230,7 +230,7 @@ def handle_create_reminder(text):
             dt = datetime.fromisoformat(dt_str)
             if dt < dt_now - timedelta(minutes=5):
                 return t(f"Date ({dt.strftime('%d/%m/%Y %H:%M')}) is in the past.")
-        except: return f"{t('Invalid date')}: {dt_str}"
+        except Exception: return f"{t('Invalid date')}: {dt_str}"
         add_reminder(p["text"], dt_str)
         return f"\u2705 *{t("Reminder set")}*\n\n\U0001f4dd {p['text']}\n\U0001f4c5 {dt.strftime('%d/%m/%Y %H:%M')}"
 
@@ -248,7 +248,7 @@ def handle_delete_reminder(query):
     lines = ["\U0001f5d1 *Quale reminder cancello?*\n"]
     for i,r in enumerate(target,1):
         try: ds = datetime.fromisoformat(r.get("remind_at","")).strftime("%d/%m %H:%M")
-        except: ds = r.get("time","?")
+        except Exception: ds = r.get("time","?")
         lines.append(f"*{i}.* {r.get('text', r.get('label','?'))} — {ds}")
     lines.append("\n" + t("Reply with the number.")); return "\n".join(lines)
 
@@ -263,7 +263,7 @@ def handle_list_reminders():
         lines.append("*One-shot:*")
         for i,r in enumerate(once_active,1):
             try: ds = datetime.fromisoformat(r["remind_at"]).strftime("%d/%m/%Y %H:%M")
-            except: ds = "?"
+            except Exception: ds = "?"
             lines.append(f"  *{i}.* {r['text']} — {ds}")
     if recurring:
         lines.append("\n*Ricorrenti:*")
@@ -301,7 +301,7 @@ def handle_confirm_delete(query):
     num = None
     for w in query.split():
         try: num = int(w); break
-        except: continue
+        except Exception: continue
     if num is None:
         ords = {"prima":1,"primo":1,"seconda":2,"secondo":2,"terza":3,"terzo":3,"quarta":4,"quarto":4}
         for w in query.lower().split():
@@ -396,7 +396,7 @@ def check_and_capture_sessions():
             try:
                 s = raw.index("{"); e = raw.rindex("}") + 1
                 parsed = json.loads(raw[s:e])
-            except:
+            except Exception:
                 parsed = {"summary": raw[:500], "key_facts": "", "decisions": "", "action_items": ""}
             
             # Save to KB via tool executor
