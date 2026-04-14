@@ -1035,7 +1035,7 @@ _maintenance_mode = False
 MAINTENANCE_LOCK = os.path.join(BASE_DIR, "maintenance.lock")
 
 
-def _enter_maintenance(signum=None, frame=None):
+def _enter_maintenance(signum: int | None = None, frame=None) -> None:
     """SIGUSR1 handler: close ChromaDB for exclusive pipeline access."""
     global _collection, _chromadb_client, _maintenance_mode
     _maintenance_mode = True
@@ -1049,7 +1049,7 @@ def _enter_maintenance(signum=None, frame=None):
     print(f"[MAINTENANCE] Entered maintenance mode — ChromaDB released", flush=True)
 
 
-def _exit_maintenance(signum=None, frame=None):
+def _exit_maintenance(signum: int | None = None, frame=None) -> None:
     """SIGUSR2 handler: reopen ChromaDB, resume normal operation."""
     global _maintenance_mode
     _maintenance_mode = False
@@ -1064,7 +1064,7 @@ signal.signal(signal.SIGUSR1, _enter_maintenance)
 signal.signal(signal.SIGUSR2, _exit_maintenance)
 
 
-def get_collection():
+def get_collection() -> chromadb.Collection | None:
     """Lazy init of ChromaDB collection. Returns None during maintenance."""
     global _collection, _chromadb_client
     if _maintenance_mode:
@@ -1093,7 +1093,7 @@ _rerank_session = None
 _rerank_tokenizer = None
 _rerank_failed = False
 
-def _get_rerank_engine():
+def _get_rerank_engine() -> tuple:
     """Lazy-load ONNX session + tokenizer. Returns (session, tokenizer) or (None, None)."""
     global _rerank_session, _rerank_tokenizer, _rerank_failed
     if _rerank_session is not None:
@@ -1312,7 +1312,7 @@ def is_superseded(meta: dict) -> bool:
     return bool(meta.get("superseded_by", ""))
 
 
-def filter_superseded(ids, documents, metadatas, distances=None, n_results=None):
+def filter_superseded(ids: list, documents: list, metadatas: list, distances: list | None = None, n_results: int | None = None) -> dict:
     """Filter superseded chunks from ChromaDB results.
     Returns the same structures without chunks that have non-empty superseded_by."""
     filtered = {"ids": [], "documents": [], "metadatas": []}
@@ -2463,7 +2463,7 @@ from filelock import FileLock as _FileLock
 _REMINDERS_FILE = os.path.join(BASE_DIR, "db", "reminders.json")
 _LOCK_FILE = _REMINDERS_FILE + ".lock"
 
-def _load_reminders():
+def _load_reminders() -> list:
     lock = _FileLock(_LOCK_FILE, timeout=5)
     with lock:
         if not os.path.exists(_REMINDERS_FILE):
@@ -2471,7 +2471,7 @@ def _load_reminders():
         with open(_REMINDERS_FILE, "r") as f:
             return _json.load(f)
 
-def _save_reminders(rem):
+def _save_reminders(rem: list) -> None:
     lock = _FileLock(_LOCK_FILE, timeout=5)
     with lock:
         with open(_REMINDERS_FILE, "w") as f:
