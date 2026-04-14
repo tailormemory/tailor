@@ -211,7 +211,7 @@ All config lives in `config/tailor.yaml`:
 | `auth` | Rate limiting and multi-token authentication |
 | `pipeline` | Nightly pipeline schedule and timeouts |
 | `model_advisor` | Model discovery frequency, hardware specs, tracked providers |
-| `language` | Language for AI-generated content |
+| `user.language` | Language for AI-generated content |
 
 Example enrichment config with multi-backend rotation:
 
