@@ -38,7 +38,7 @@ load_config()
 BOT_TOKEN = get("telegram", "bot_token", "")
 CHAT_ID = str(get("telegram", "chat_id", ""))
 POLL_TIMEOUT = get("telegram", "poll_timeout", 30)
-PERSONA_NAME = get("persona", "name", "Jarvis")
+PERSONA_NAME = get("persona", "name", "Tailor")
 SYSTEM_PROMPT = get("persona", "system_prompt", "You are a helpful assistant.")
 _USER_LANG = get("user", "language") or "en"
 
