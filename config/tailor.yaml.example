@@ -88,6 +88,10 @@ embedding:
   model: nomic-embed-text
   dimensions: 768
 
+# ── Ollama (local models) ─────────────────────────────────────
+ollama:
+  base_url: http://localhost:11434
+
 # ── Knowledge Base ────────────────────────────────────────────
 kb:
   mcp_url: http://localhost:8787
