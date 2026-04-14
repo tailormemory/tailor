@@ -35,6 +35,7 @@ if [ ! -f "$TAILOR_DIR/mcp_server.py" ]; then
     exit 1
 fi
 cd "$TAILOR_DIR"
+export PYTHONPATH="$TAILOR_DIR:$PYTHONPATH"
 LOG_FILE="$TAILOR_DIR/logs/sync_and_ingest.log"
 RCLONE="${RCLONE_PATH:-$(command -v rclone 2>/dev/null || echo /opt/homebrew/bin/rclone)}"
 PYTHON="$TAILOR_DIR/.venv/bin/python3"
