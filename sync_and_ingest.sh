@@ -115,6 +115,7 @@ trap ensure_mcp_exit_maintenance EXIT
 echo "========================================" >> "$LOG_FILE"
 log "START sync_and_ingest v9"
 START_TIME=$(date +%s)
+RUN_START=$(date -u +"%Y-%m-%dT%H:%M:%S")
 # Read pipeline config from YAML (with defaults)
 DEADLINE_HOUR=$("$PYTHON" -c "
 from scripts.lib.config import get
@@ -352,12 +353,21 @@ while kill -0 $FACT_PID 2>/dev/null; do
     fi
 done
 wait $FACT_PID 2>/dev/null
-FACT_OUTPUT=$(tail -20 "$LOG_FILE")
-FACTS_EXTRACTED=$(echo "$FACT_OUTPUT" | grep "Facts extracted:" | awk '{print $3}' | tr -d ',')
-FACTS_EXTRACTED=${FACTS_EXTRACTED:-0}
-FACTS_CHUNKS=$(echo "$FACT_OUTPUT" | grep "Chunks processed:" | awk '{print $3}' | tr -d ',')
-FACTS_CHUNKS=${FACTS_CHUNKS:-0}
-FACTS_BACKEND=$(echo "$FACT_OUTPUT" | grep "Backend:" | sed 's/.*Backend: //')
+# Query DB directly for accurate counts (survives timeout/SIGTERM)
+FACTS_EXTRACTED=$("$PYTHON" -c "
+import sqlite3
+db = sqlite3.connect('$TAILOR_DIR/db/facts.sqlite3')
+count = db.execute(\"SELECT COUNT(*) FROM facts WHERE created_at >= '$RUN_START' AND relation_type = 'extracted'\").fetchone()[0]
+print(count)
+db.close()
+" 2>/dev/null || echo "0")
+FACTS_CHUNKS=$("$PYTHON" -c "
+import sqlite3
+db = sqlite3.connect('$TAILOR_DIR/db/facts.sqlite3')
+count = db.execute(\"SELECT COUNT(DISTINCT chunk_id) FROM facts WHERE created_at >= '$RUN_START' AND relation_type = 'extracted'\").fetchone()[0]
+print(count)
+db.close()
+" 2>/dev/null || echo "0")
 log "Fact extraction completed: $FACTS_EXTRACTED facts from $FACTS_CHUNKS chunks"
 
 # ── 5f. FACT SUPERSESSION (confronto fact-vs-fact sui nuovi fatti) ──
@@ -383,9 +393,16 @@ while kill -0 $SUP_PID 2>/dev/null; do
     fi
 done
 wait $SUP_PID 2>/dev/null
+# Query DB directly for accurate supersession count
+FACTS_SUPERSEDED=$("$PYTHON" -c "
+import sqlite3
+db = sqlite3.connect('$TAILOR_DIR/db/facts.sqlite3')
+count = db.execute(\"SELECT COUNT(*) FROM facts WHERE superseded_at >= '$RUN_START'\").fetchone()[0]
+print(count)
+db.close()
+" 2>/dev/null || echo "0")
+# Comparisons: fall back to log grep (no DB column for this)
 SUPERSESSION_OUTPUT=$(tail -20 "$LOG_FILE")
-FACTS_SUPERSEDED=$(echo "$SUPERSESSION_OUTPUT" | grep "SUPERSEDES:" | awk '{print $2}' | tr -d ',')
-FACTS_SUPERSEDED=${FACTS_SUPERSEDED:-0}
 FACTS_COMPARED=$(echo "$SUPERSESSION_OUTPUT" | grep "Coppie confrontate:" | awk '{print $3}' | tr -d ',')
 FACTS_COMPARED=${FACTS_COMPARED:-0}
 log "Fact supersession completed: $FACTS_SUPERSEDED superseded out of $FACTS_COMPARED comparisons"
@@ -412,10 +429,17 @@ while kill -0 $DER_PID 2>/dev/null; do
     fi
 done
 wait $DER_PID 2>/dev/null
+# Query DB directly for accurate derivation count
+FACTS_DERIVED=$("$PYTHON" -c "
+import sqlite3
+db = sqlite3.connect('$TAILOR_DIR/db/facts.sqlite3')
+count = db.execute(\"SELECT COUNT(*) FROM facts WHERE created_at >= '$RUN_START' AND relation_type = 'derived'\").fetchone()[0]
+print(count)
+db.close()
+" 2>/dev/null || echo "0")
+# Entities processed: fall back to log JSON (no DB column for this)
 DERIVES_OUTPUT=$(tail -5 "$LOG_FILE")
-# Last line is JSON: {"entities_processed": N, "facts_derived": N, "errors": N}
 DERIVES_JSON=$(echo "$DERIVES_OUTPUT" | tail -1)
-FACTS_DERIVED=$(echo "$DERIVES_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('facts_derived',0))" 2>/dev/null || echo "0")
 DERIVES_ENTITIES=$(echo "$DERIVES_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('entities_processed',0))" 2>/dev/null || echo "0")
 log "Fact derivation completed: $FACTS_DERIVED facts derived from $DERIVES_ENTITIES entities"
 
