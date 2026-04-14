@@ -87,6 +87,8 @@ embedding:
   provider: ollama
   model: nomic-embed-text
   dimensions: 768
+  # endpoint: https://api.example.com/embeddings  # Custom endpoint (optional)
+  # api_key_env: CUSTOM_EMBED_KEY                  # Env var for API key (optional)
 
 # ── Ollama (local models) ─────────────────────────────────────
 ollama:
