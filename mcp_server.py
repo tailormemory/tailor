@@ -109,7 +109,7 @@ _ollama_jobs = {}  # {job_id: {"model": str, "status": "pulling"|"done"|"error",
 
 # API Key da variabile d'ambiente
 SERVER_PORT = int(os.environ.get("PORT", "8787"))
-TAILOR_API_KEY = os.environ.get("TAILOR_API_KEY", "") or os.environ.get("JARVIS_API_KEY", "")
+TAILOR_API_KEY = os.environ.get("TAILOR_API_KEY", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 JINA_API_KEY = os.environ.get("JINA_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
