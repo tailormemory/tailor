@@ -390,9 +390,9 @@ def extract_entities_ollama(text):
 # ============================================================
 
 def get_chunks_to_process(collection, full_mode=False, source_filter="", limit=None):
-    print("Lettura chunk da ChromaDB...")
+    print("Reading chunks from ChromaDB...")
     total = collection.count()
-    print(f"  Totale chunk in KB: {total:,}")
+    print(f"  Total chunks in KB: {total:,}")
 
     all_ids, all_docs, all_metas, all_embeddings = [], [], [], []
 
@@ -406,9 +406,9 @@ def get_chunks_to_process(collection, full_mode=False, source_filter="", limit=N
         all_metas.extend(batch["metadatas"])
         all_embeddings.extend(batch["embeddings"])
         offset += len(batch["ids"])
-        print(f"  Letti {offset:,}/{total:,} chunk...", end="\r")
+        print(f"  Read {offset:,}/{total:,} chunks...", end="\r")
 
-    print(f"\n  Letti {len(all_ids):,} chunk totali")
+    print(f"\n  Read {len(all_ids):,} chunks total")
 
     to_process = []
     already_done = 0
@@ -469,11 +469,11 @@ def show_stats(collection):
             pass
 
     print(f"\n=== Entity Extraction Stats ===")
-    print(f"Chunk totali:      {total:,}")
-    print(f"Processed:        {processed:,} ({processed/total*100:.1f}%)")
-    print(f"Non processati:    {total - processed:,}")
-    print(f"Total entities:     {total_entities:,}")
-    print(f"\nPer tipo:")
+    print(f"Total chunks:      {total:,}")
+    print(f"Processed:         {processed:,} ({processed/total*100:.1f}%)")
+    print(f"Not processed:     {total - processed:,}")
+    print(f"Total entities:    {total_entities:,}")
+    print(f"\nBy type:")
     for t in ENTITY_TYPES:
         print(f"  {t:<12}: {type_counts.get(t, 0):,}")
     print(f"\nMost frequent entities (top 20):")
@@ -546,13 +546,13 @@ def main():
 
     total = len(chunks)
     model_name = EXTRACT_MODEL_OPENAI if ACTIVE_BACKEND == "openai" else (EXTRACT_MODEL_ANTHROPIC if ACTIVE_BACKEND == "anthropic" else EXTRACT_MODEL_OLLAMA)
-    print(f"\nStarting entity extraction on {total:,} chunk...")
-    print(f"Backend: {ACTIVE_BACKEND} | Modello: {model_name}")
+    print(f"\nStarting entity extraction on {total:,} chunks...")
+    print(f"Backend: {ACTIVE_BACKEND} | Model: {model_name}")
     if ACTIVE_BACKEND in ("openai", "anthropic"):
         est_cost = total * 500 / 1_000_000 * 0.75
-        print(f"Costo stimato: ~${est_cost:.2f} | Workers paralleli: {CONCURRENT_WORKERS}\n")
+        print(f"Estimated cost: ~${est_cost:.2f} | Parallel workers: {CONCURRENT_WORKERS}\n")
     else:
-        print(f"Stima tempo: {total * 3 // 60} - {total * 5 // 60} minuti\n")
+        print(f"Estimated time: {total * 3 // 60} - {total * 5 // 60} minutes\n")
 
     checkpoint = load_checkpoint()
     already_processed_ids = set(checkpoint.get("processed_ids", []))
@@ -561,7 +561,7 @@ def main():
     remaining = [c for c in chunks if c["id"] not in already_processed_ids or full_mode]
     skipped_checkpoint = len(chunks) - len(remaining)
     if skipped_checkpoint > 0:
-        print(f"Skippati da checkpoint: {skipped_checkpoint:,}")
+        print(f"Skipped from checkpoint: {skipped_checkpoint:,}")
     chunks = remaining
     total = len(chunks)
 
@@ -608,8 +608,8 @@ def main():
                     typs = json.loads(updated_meta.get("entity_types", "[]"))
                     print(f"\n--- Chunk ---")
                     print(f"ID: {chunk['id']}")
-                    print(f"Fonte: {chunk['metadata'].get('source', 'N/A')} | Titolo: {chunk['metadata'].get('title', 'N/A')[:60]}")
-                    print(f"Testo: {chunk['text'][:200]}")
+                    print(f"Source: {chunk['metadata'].get('source', 'N/A')} | Title: {chunk['metadata'].get('title', 'N/A')[:60]}")
+                    print(f"Text: {chunk['text'][:200]}")
                     print(f"Entities ({len(ents)}):")
                     for e, t in zip(ents, typs):
                         print(f"  [{t}] {e}")
@@ -683,15 +683,15 @@ def main():
 
             if processed % CHECKPOINT_EVERY == 0:
                 save_checkpoint(already_processed_ids)
-                print(f"  [checkpoint salvato: {processed:,}]")
+                print(f"  [checkpoint saved: {processed:,}]")
 
             if test_limit:
                 ents = json.loads(updated_meta.get("entities", "[]"))
                 typs = json.loads(updated_meta.get("entity_types", "[]"))
                 print(f"\n--- Chunk {i+1} ---")
                 print(f"ID: {chunk['id']}")
-                print(f"Fonte: {chunk['metadata'].get('source', 'N/A')} | Titolo: {chunk['metadata'].get('title', 'N/A')[:60]}")
-                print(f"Testo: {chunk['text'][:200]}")
+                print(f"Source: {chunk['metadata'].get('source', 'N/A')} | Title: {chunk['metadata'].get('title', 'N/A')[:60]}")
+                print(f"Text: {chunk['text'][:200]}")
                 print(f"Entities ({len(ents)}):")
                 for e, t in zip(ents, typs):
                     print(f"  [{t}] {e}")
@@ -713,16 +713,16 @@ def main():
 
     elapsed = time.time() - start_time
     print(f"\n{'='*50}")
-    print(f"Estrazione completata:")
-    print(f"  Chunk processati:  {processed:,}")
-    print(f"  Skippati (checkpoint): {skipped_checkpoint:,}")
-    print(f"  Errori:            {errors:,}")
-    print(f"  Timeout:           {timeouts:,}")
-    print(f"  Tempo totale:      {elapsed/60:.1f} minuti")
+    print(f"Extraction completed:")
+    print(f"  Chunks processed: {processed:,}")
+    print(f"  Skipped (checkpoint): {skipped_checkpoint:,}")
+    print(f"  Errors: {errors:,}")
+    print(f"  Timeouts: {timeouts:,}")
+    print(f"  Total time: {elapsed/60:.1f} minutes")
     if elapsed > 0:
-        print(f"  Average speed:    {processed/elapsed:.2f} chunk/s")
-    print(f"\nPer vedere le statistiche: python 5_extract_entities.py --stats")
-    print(f"Per rigenerare indice: python scripts/build_entity_index.py")
+        print(f"  Average speed: {processed/elapsed:.2f} chunk/s")
+    print(f"\nTo view statistics: python scripts/enrichment/extract_entities.py --stats")
+    print(f"To rebuild index: python scripts/enrichment/build_entity_index.py")
 
 
 if __name__ == "__main__":
