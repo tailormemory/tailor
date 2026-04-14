@@ -81,7 +81,7 @@ def fetch_emails(conn, since_date=None, mailbox="INBOX"):
     if not msg_ids: return []
     print(f"  Found {len(msg_ids)} messages in {mailbox}")
     results = []; errors = 0
-    email_addr = cfg("email", "address") or ""
+    email_addrs = cfg("email", "addresses") or []
     for i, mid in enumerate(msg_ids):
         try:
             st, md = conn.fetch(mid, "(RFC822)")
@@ -93,7 +93,7 @@ def fetch_emails(conn, since_date=None, mailbox="INBOX"):
             if not body or len(body) < 20: continue
             if len(body) > 50000: body = body[:50000] + "\n[...truncated]"
             msg_id = msg.get("Message-ID", mid.decode()).strip("<>")
-            is_sent = email_addr.lower() in from_a.lower() if email_addr else False
+            is_sent = any(addr.lower() in from_a.lower() for addr in email_addrs) if email_addrs else False
             results.append({
                 "id": msg_id,
                 "thread_id": (msg.get("In-Reply-To","").strip("<>") or msg_id),
