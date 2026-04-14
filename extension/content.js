@@ -49,22 +49,48 @@
     const messages = [];
 
     if (platform === "claude") {
-      const turns = document.querySelectorAll(
-        "[data-testid='human-turn'], [data-testid='ai-turn'], " +
-        "div[class*='font-claude-message'], div[class*='font-user-message']"
-      );
-      if (turns.length > 0) {
-        turns.forEach((el) => {
-          const isUser = el.matches("[data-testid='human-turn']") || el.className.includes("user") || el.className.includes("human");
+      // Strategy 1: data-testid selectors (most reliable)
+      const userEls = document.querySelectorAll("[data-testid='user-message']");
+      if (userEls.length > 0) {
+        // Walk up to find the conversation container — each turn is a sibling group
+        // User messages have data-testid='user-message', assistant messages are adjacent containers
+        const chatContainer = userEls[0].closest("[class*='container'], main, [role='main']")?.parentElement || document.querySelector("main") || document.body;
+        // Collect all turn-level containers: find the common ancestor depth
+        const turnParent = userEls[0].closest("[data-testid='user-message']")?.parentElement?.parentElement?.parentElement;
+        if (turnParent?.parentElement) {
+          const turnContainer = turnParent.parentElement;
+          Array.from(turnContainer.children).forEach((child) => {
+            const userMsg = child.querySelector("[data-testid='user-message']");
+            const text = child.innerText?.trim();
+            if (!text || text.length < 2) return;
+            if (userMsg) {
+              messages.push({ role: "user", content: userMsg.innerText?.trim() });
+            } else {
+              // Assistant turn — grab the text content, skip UI chrome
+              const prose = child.querySelector("div[class*='grid-cols'], div[class*='prose'], div[class*='markdown']");
+              const content = prose ? prose.innerText?.trim() : text;
+              if (content && content.length > 5) messages.push({ role: "assistant", content });
+            }
+          });
+        }
+      }
+      // Strategy 2: class-based fallback
+      if (messages.length === 0) {
+        document.querySelectorAll("[class*='font-claude-message'], [class*='font-user-message'], [class*='human-turn'], [class*='ai-turn']").forEach((el) => {
+          const isUser = el.className.includes("user") || el.className.includes("human");
           const text = el.innerText?.trim();
           if (text && text.length > 1) messages.push({ role: isUser ? "user" : "assistant", content: text });
         });
       }
+      // Strategy 3: last resort — any prose blocks in main
       if (messages.length === 0) {
-        document.querySelectorAll("div[class*='prose'], div[class*='whitespace-pre']").forEach((el) => {
-          const text = el.innerText?.trim();
-          if (text && text.length > 10) messages.push({ role: "unknown", content: text });
-        });
+        const main = document.querySelector("main");
+        if (main) {
+          main.querySelectorAll("div[class*='prose'], div[class*='whitespace-pre']").forEach((el) => {
+            const text = el.innerText?.trim();
+            if (text && text.length > 10) messages.push({ role: "unknown", content: text });
+          });
+        }
       }
     }
 

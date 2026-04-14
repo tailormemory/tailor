@@ -860,7 +860,7 @@ class BearerAuthMiddleware:
                 # Embed and upsert
                 try:
                     from scripts.lib.embedding import get_embeddings
-                    embedding = get_embeddings(text[:8000])
+                    embedding = get_embeddings(text[:4000])
                     # Flatten if nested list (some providers return [[...]])
                     if embedding and isinstance(embedding[0], list):
                         embedding = embedding[0]
@@ -878,6 +878,9 @@ class BearerAuthMiddleware:
                     )
                     return _json_response({"ok": True, "chunks": 1, "updated": is_update})
                 except Exception as e:
+                    import traceback as _tb_live
+                    print(f"[INGEST-LIVE ERROR] {e}", flush=True)
+                    _tb_live.print_exc()
                     return _json_response({"error": str(e)}, 500)
 
             elif path == "/api/dashboard/rate-limit":
