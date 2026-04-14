@@ -47,6 +47,8 @@ import chromadb
 # CONFIGURAZIONE
 # ============================================================
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
 DB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "db")
 COLLECTION_NAME = "tailor_kb"
 
@@ -58,7 +60,6 @@ EXTRACT_MODEL_OLLAMA = "qwen2.5:7b"
 
 # --- Backend OpenAI ---
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from scripts.lib.config import get_enrichment, get_enrichment_fallback
 _ee_cfg = get_enrichment("entity_extraction")
 _ee_fb = get_enrichment_fallback("entity_extraction")
