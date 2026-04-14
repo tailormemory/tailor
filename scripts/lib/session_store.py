@@ -7,16 +7,16 @@ import sqlite3, uuid, os
 from datetime import datetime, timedelta
 from lib.config import get
 
-def _db_path():
+def _db_path() -> str:
     return get("sessions", "db_path", "./db/telegram_sessions.sqlite3")
 
-def _timeout():
+def _timeout() -> int:
     return get("sessions", "timeout_minutes", 10)
 
-def _max_history():
+def _max_history() -> int:
     return get("sessions", "max_history", 20)
 
-def _conn():
+def _conn() -> sqlite3.Connection:
     db = _db_path()
     os.makedirs(os.path.dirname(db), exist_ok=True)
     c = sqlite3.connect(db)
@@ -25,7 +25,7 @@ def _conn():
     c.execute("PRAGMA busy_timeout=5000")
     return c
 
-def init_db():
+def init_db() -> None:
     """Create tables if they don't exist."""
     c = _conn()
     c.executescript("""
@@ -50,7 +50,7 @@ def init_db():
     c.commit()
     c.close()
 
-def _now():
+def _now() -> str:
     return datetime.now().isoformat()
 
 def get_or_create_session() -> str:
@@ -79,7 +79,7 @@ def get_or_create_session() -> str:
     c.close()
     return sid
 
-def add_message(session_id: str, role: str, content: str):
+def add_message(session_id: str, role: str, content: str) -> None:
     """Add a message and update session timestamp."""
     c = _conn()
     c.execute(
@@ -125,7 +125,7 @@ def get_session_messages(session_id: str) -> list[dict]:
     c.close()
     return [dict(r) for r in rows]
 
-def close_session(session_id: str, summary: str = ""):
+def close_session(session_id: str, summary: str = "") -> None:
     """Mark session as closed, optionally store summary."""
     c = _conn()
     c.execute(

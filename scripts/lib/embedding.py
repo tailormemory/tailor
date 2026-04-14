@@ -21,7 +21,7 @@ _endpoint = cfg("embedding", "endpoint") or "http://localhost:11434/api/embed"
 _dimensions = cfg("embedding", "dimensions")
 _api_key_env = cfg("embedding", "api_key_env") or ""
 
-def _get_api_key():
+def _get_api_key() -> str:
     if _api_key_env:
         return os.environ.get(_api_key_env, "")
     # Fallback: try common env var names based on provider

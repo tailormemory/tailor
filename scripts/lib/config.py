@@ -7,7 +7,7 @@ import os, re, yaml
 
 _DEFAULT_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "config", "tailor.yaml")
 
-def _resolve_env(val):
+def _resolve_env(val: str) -> str:
     """Replace ${VAR} with os.environ[VAR], leave as-is if not set."""
     if not isinstance(val, str):
         return val
@@ -15,7 +15,7 @@ def _resolve_env(val):
         return os.environ.get(m.group(1), m.group(0))
     return re.sub(r'\$\{([^}]+)\}', _sub, val)
 
-def _walk_resolve(obj):
+def _walk_resolve(obj: any) -> any:
     if isinstance(obj, dict):
         return {k: _walk_resolve(v) for k, v in obj.items()}
     if isinstance(obj, list):
