@@ -287,6 +287,8 @@ The MCP server also exposes a REST API used by the dashboard and available for i
 | `GET /api/dashboard/model-advisor` | Cookie/Token/Localhost | Model recommendations and advisories |
 | `POST /api/dashboard/model-advisor/install` | Cookie/Token/Localhost | Install Ollama model (background pull) |
 | `GET /api/dashboard/model-advisor/status/{id}` | Cookie/Token/Localhost | Install job status |
+| `POST /api/ingest-live` | Cookie/Token/Localhost | Live conversation ingest from Chrome extension |
+| `GET /api/dashboard/rate-limit` | Cookie/Token/Localhost | Auth rate limiting statistics |
 | `GET /api/fetch/<id>` | Localhost only | Fetch a chunk by ID |
 | `GET /api/search?q=` | Localhost only | Semantic search |
 
