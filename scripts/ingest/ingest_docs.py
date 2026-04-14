@@ -768,6 +768,7 @@ def classify_files(files, registry, full_mode=False):
     unchanged_files = []
     seen_hashes = set()
     duplicates = 0
+    permanently_failed = 0
 
     for f in files:
         fhash = file_hash(f["filepath"])
@@ -778,6 +779,13 @@ def classify_files(files, registry, full_mode=False):
             duplicates += 1
             continue
         seen_hashes.add(fhash)
+
+        # Skip permanently failed files (3+ extraction failures)
+        reg_entry = registry.get(f["filepath"], {})
+        if reg_entry.get("status") == "failed" and reg_entry.get("fail_count", 0) >= 3:
+            permanently_failed += 1
+            print(f"  [SKIP] {f['filename']} — permanently failed after {reg_entry['fail_count']} attempts")
+            continue
 
         if full_mode:
             new_files.append(f)
@@ -790,6 +798,8 @@ def classify_files(files, registry, full_mode=False):
 
     if duplicates > 0:
         print(f"  Duplicates skipped (same content): {duplicates}")
+    if permanently_failed > 0:
+        print(f"  Permanently failed (skipped): {permanently_failed}")
 
     return new_files, modified_files, unchanged_files
 
@@ -874,7 +884,17 @@ def main():
         # Estrai testo
         sections = extract_text(f["filepath"])
         if not sections:
-            print(f"  No text extracted, skip")
+            # Track extraction failure in registry
+            existing = registry.get(f["filepath"], {})
+            fail_count = existing.get("fail_count", 0) + 1
+            registry[f["filepath"]] = {
+                "hash": f["hash"],
+                "filename": f["filename"],
+                "status": "failed",
+                "fail_count": fail_count,
+                "date_last_attempt": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            print(f"  No text extracted, skip (fail_count={fail_count})")
             continue
 
         total_chars = sum(len(s["text"]) for s in sections)
