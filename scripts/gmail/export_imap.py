@@ -120,12 +120,12 @@ def main():
     if provider != "imap":
         print(f"Email provider is '{provider}', not 'imap'. Skipping.")
         return
-    creds = cfg("email", "credentials") or {}
-    host = creds.get("host", "")
-    port = creds.get("port", 993)
-    username = creds.get("username", "")
-    password = creds.get("password", "")
-    mailboxes = creds.get("mailboxes", ["INBOX", "Sent"])
+    imap_cfg = cfg("email", "imap") or {}
+    host = imap_cfg.get("host", "")
+    port = imap_cfg.get("port", 993)
+    username = imap_cfg.get("username", "")
+    password = imap_cfg.get("password", "")
+    mailboxes = imap_cfg.get("mailboxes", ["INBOX", "Sent"])
     if not host or not username or not password:
         print("ERROR: IMAP credentials incomplete"); return
 
