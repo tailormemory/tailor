@@ -117,7 +117,7 @@ Without it, the server runs open (suitable for local-only use).
 | **Email** | Gmail (OAuth2) or any IMAP provider — see [`docs/EMAIL_SETUP.md`](docs/EMAIL_SETUP.md) |
 | **ChatGPT** | Export parser (conversations.json) |
 | **Claude** | Export parser (conversations.json + projects) |
-| **Gemini** | Google Takeout parser (JSON + HTML) |
+| **Gemini** | Google Takeout parser (JSON) |
 | **Cloud Storage** | OneDrive, Google Drive, Dropbox via rclone |
 | **Browser Upload** | Drag-and-drop from the dashboard with progress tracking |
 | **Telegram** | Automatic real-time session capture |
