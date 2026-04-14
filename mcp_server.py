@@ -246,8 +246,10 @@ class BearerAuthMiddleware:
                 token = data.get("token", "")
                 _auth_info = _token_auth.authenticate(token)
                 if _auth_info:
+                    import hashlib as _hashlib
                     session_id = secrets.token_hex(32)
-                    # Store session (simple file-based)
+                    session_hash = _hashlib.sha256(session_id.encode()).hexdigest()
+                    # Store hashed session (simple file-based)
                     sessions_path = os.path.join(BASE_DIR, "db", "dashboard_sessions.json")
                     sessions = {}
                     if os.path.exists(sessions_path):
@@ -257,13 +259,13 @@ class BearerAuthMiddleware:
                         except Exception:
                             sessions = {}
                     import time as _time
-                    sessions[session_id] = {"created": _time.time(), "expires": _time.time() + 30*86400}
+                    sessions[session_hash] = {"created": _time.time(), "expires": _time.time() + 7*86400}
                     # Clean expired
                     sessions = {k: v for k, v in sessions.items() if v.get("expires", 0) > _time.time()}
                     with open(sessions_path, "w") as _sf:
                         _jauth.dump(sessions, _sf)
                     resp = _json_response({"ok": True})
-                    resp.set_cookie("tailor_session", session_id, max_age=30*86400, httponly=True, samesite="lax", path="/")
+                    resp.set_cookie("tailor_session", session_id, max_age=7*86400, httponly=True, samesite="lax", path="/")
                     _rate_limiter.record_success(_login_ip)
                     return resp
                 else:
@@ -955,20 +957,22 @@ class BearerAuthMiddleware:
                                 _resolved_token = param[6:]
                                 token_ok = True
                                 break
-                    # Check session cookie
+                    # Check session cookie (stored as SHA-256 hash)
                     if not token_ok:
                         cookie_header = hdrs.get(b"cookie", b"").decode("utf-8", errors="ignore")
                         for part in cookie_header.split(";"):
                             part = part.strip()
                             if part.startswith("tailor_session="):
                                 session_id = part[len("tailor_session="):]
+                                import hashlib as _hck
+                                session_hash = _hck.sha256(session_id.encode()).hexdigest()
                                 sessions_path = os.path.join(BASE_DIR, "db", "dashboard_sessions.json")
                                 if os.path.exists(sessions_path):
                                     import json as _jck, time as _tck
                                     try:
                                         with open(sessions_path) as _sf:
                                             sessions = _jck.load(_sf)
-                                        sess = sessions.get(session_id, {})
+                                        sess = sessions.get(session_hash, {})
                                         if sess.get("expires", 0) > _tck.time():
                                             token_ok = True
                                     except Exception:
