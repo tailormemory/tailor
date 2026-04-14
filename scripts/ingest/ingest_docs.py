@@ -13,10 +13,10 @@ Features:
 - Source tag: "document" in metadata
 
 Uso:
-  python 4_ingest_docs.py              # Incremental ingest
-  python 4_ingest_docs.py --full       # Re-ingest all documents
-  python 4_ingest_docs.py --list       # Show found files without ingesting
-  python 4_ingest_docs.py --status     # Show file status (new/modified/unchanged)
+  python scripts/ingest/ingest_docs.py              # Incremental ingest
+  python scripts/ingest/ingest_docs.py --full       # Re-ingest all documents
+  python scripts/ingest/ingest_docs.py --list       # Show found files without ingesting
+  python scripts/ingest/ingest_docs.py --status     # Show file status (new/modified/unchanged)
 
 Requirements:
   pip install pymupdf openpyxl requests chromadb python-docx python-pptx

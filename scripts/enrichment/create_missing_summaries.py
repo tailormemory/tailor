@@ -4,11 +4,11 @@ TAILOR — 10e: Crea doc_summary per file che non ce l'hanno.
 PREREQUISITO: il server MCP deve essere SPENTO.
 
 Uso:
-  python3 scripts/10e_create_missing_summaries.py                  # Crea summary mancanti
-  python3 scripts/10e_create_missing_summaries.py --dry-run        # Show what it would do
-  python3 scripts/10e_create_missing_summaries.py --stats          # Statistiche
-  python3 scripts/10e_create_missing_summaries.py --limit 10       # Max N file
-  python3 scripts/10e_create_missing_summaries.py --workers 2      # Parallelismo Haiku
+  python scripts/enrichment/create_missing_summaries.py                  # Crea summary mancanti
+  python scripts/enrichment/create_missing_summaries.py --dry-run        # Show what it would do
+  python scripts/enrichment/create_missing_summaries.py --stats          # Statistiche
+  python scripts/enrichment/create_missing_summaries.py --limit 10       # Max N file
+  python scripts/enrichment/create_missing_summaries.py --workers 2      # Parallelismo Haiku
 """
 
 import os, sys, json, asyncio, aiohttp, sqlite3, time, requests, argparse

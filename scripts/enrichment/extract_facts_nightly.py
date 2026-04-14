@@ -12,9 +12,9 @@ Logica:
 Integrated in the nightly pipeline as step 5e.
 
 Uso:
-  python 17b_extract_facts_nightly.py              # Run notturno (max 20k chunk)
-  python 17b_extract_facts_nightly.py --limit 5000 # Limita a N chunk
-  python 17b_extract_facts_nightly.py --test 10    # Test mode (no write)
+  python scripts/enrichment/extract_facts_nightly.py              # Run notturno (max 20k chunk)
+  python scripts/enrichment/extract_facts_nightly.py --limit 5000 # Limita a N chunk
+  python scripts/enrichment/extract_facts_nightly.py --test 10    # Test mode (no write)
 """
 
 import json

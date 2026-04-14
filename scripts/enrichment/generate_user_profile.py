@@ -6,9 +6,9 @@ Generates a structured user profile (static + dynamic) from the KB.
 Output: db/user_profile.json
 
 Uso:
-  python3 scripts/12_generate_user_profile.py           # Generate/update profile
-  python3 scripts/12_generate_user_profile.py --dry-run  # Show material without generating
-  python3 scripts/12_generate_user_profile.py --view      # Show current profile
+  python scripts/enrichment/generate_user_profile.py           # Generate/update profile
+  python scripts/enrichment/generate_user_profile.py --dry-run  # Show material without generating
+  python scripts/enrichment/generate_user_profile.py --view      # Show current profile
 
 Il profilo ha due sezioni:
   - static: stable facts (identity, family, companies, residence, setup)

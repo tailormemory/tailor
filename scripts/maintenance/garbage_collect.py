@@ -6,9 +6,9 @@ Removes from KB chunks and doc_summary of files that no longer exist on disk.
 PREREQUISITO: il server MCP deve essere SPENTO.
 
 Uso:
-  python3 scripts/14_garbage_collect.py              # Esegui pulizia
-  python3 scripts/14_garbage_collect.py --dry-run    # Show what it would do
-  python3 scripts/14_garbage_collect.py --stats      # Solo statistiche
+  python scripts/maintenance/garbage_collect.py              # Esegui pulizia
+  python scripts/maintenance/garbage_collect.py --dry-run    # Show what it would do
+  python scripts/maintenance/garbage_collect.py --stats      # Solo statistiche
 """
 
 import os, sys, json, argparse

@@ -5,15 +5,15 @@ Mini-batches of 5k emails, submitted one at a time to stay under the
 2M enqueued token limit.
 
 Main workflow:
-  python3 scripts/7_triage_gmail.py run              # Does everything: prepare + submit + retrieve + merge
-  python3 scripts/7_triage_gmail.py run --resume     # Resumes from where it left off
+  python3 scripts/gmail/triage_gmail.py run              # Does everything: prepare + submit + retrieve + merge
+  python3 scripts/gmail/triage_gmail.py run --resume     # Resumes from where it left off
 
 Individual commands (for debug):
-  python3 scripts/7_triage_gmail.py prepare           # Generate mini-batch files
-  python3 scripts/7_triage_gmail.py submit-next       # Submit next pending batch
-  python3 scripts/7_triage_gmail.py retrieve          # Check running batch status
-  python3 scripts/7_triage_gmail.py merge             # Final results merge
-  python3 scripts/7_triage_gmail.py --stats           # Statistics
+  python3 scripts/gmail/triage_gmail.py prepare           # Generate mini-batch files
+  python3 scripts/gmail/triage_gmail.py submit-next       # Submit next pending batch
+  python3 scripts/gmail/triage_gmail.py retrieve          # Check running batch status
+  python3 scripts/gmail/triage_gmail.py merge             # Final results merge
+  python3 scripts/gmail/triage_gmail.py --stats           # Statistics
 """
 
 import os
@@ -630,13 +630,13 @@ def show_stats():
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Uso:")
-        print("  python3 scripts/7_triage_gmail.py run              # Workflow completo")
-        print("  python3 scripts/7_triage_gmail.py run --resume     # Riprende da checkpoint")
-        print("  python3 scripts/7_triage_gmail.py prepare          # Only generate mini-batches")
-        print("  python3 scripts/7_triage_gmail.py submit-next      # Submit next batch")
-        print("  python3 scripts/7_triage_gmail.py retrieve         # Check running batch")
-        print("  python3 scripts/7_triage_gmail.py merge            # Final results merge")
-        print("  python3 scripts/7_triage_gmail.py --stats          # Statistics")
+        print("  python3 scripts/gmail/triage_gmail.py run              # Workflow completo")
+        print("  python3 scripts/gmail/triage_gmail.py run --resume     # Riprende da checkpoint")
+        print("  python3 scripts/gmail/triage_gmail.py prepare          # Only generate mini-batches")
+        print("  python3 scripts/gmail/triage_gmail.py submit-next      # Submit next batch")
+        print("  python3 scripts/gmail/triage_gmail.py retrieve         # Check running batch")
+        print("  python3 scripts/gmail/triage_gmail.py merge            # Final results merge")
+        print("  python3 scripts/gmail/triage_gmail.py --stats          # Statistics")
         sys.exit(0)
 
     cmd = sys.argv[1]

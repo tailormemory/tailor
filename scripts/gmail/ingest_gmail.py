@@ -10,10 +10,10 @@ Features:
   - Batches of 10 chunks per embedding call
 
 Usage:
-  python3 scripts/9_ingest_gmail.py              # Incremental ingest
-  python3 scripts/9_ingest_gmail.py --full       # Re-ingest (deletes existing email chunks)
-  python3 scripts/9_ingest_gmail.py --stats      # Statistics
-  python3 scripts/9_ingest_gmail.py --dry-run    # Mostra cosa farebbe senza scrivere
+  python scripts/gmail/ingest_gmail.py              # Incremental ingest
+  python scripts/gmail/ingest_gmail.py --full       # Re-ingest (deletes existing email chunks)
+  python scripts/gmail/ingest_gmail.py --stats      # Statistics
+  python scripts/gmail/ingest_gmail.py --dry-run    # Mostra cosa farebbe senza scrivere
 
 Input:  data/chunks_gmail.jsonl
 Output: ChromaDB collection (configured in tailor.yaml)

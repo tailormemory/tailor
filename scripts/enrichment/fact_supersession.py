@@ -12,12 +12,12 @@ Per il confronto testuale usa fuzzy matching locale (no LLM, no API).
 The LLM is only used for the SUPERSEDES/INDEPENDENT decision on candidate pairs.
 
 Uso:
-  python 18_fact_supersession.py                     # Incrementale
-  python 18_fact_supersession.py --test 100           # Test (no write)
-  python 18_fact_supersession.py --stats              # Statistiche
-  python 18_fact_supersession.py                      # Haiku (default, best quality)
-  python 18_fact_supersession.py --backend openai     # GPT-4o-mini
-  python 18_fact_supersession.py --backend gemini     # Gemini 2.5 Flash
+  python scripts/enrichment/fact_supersession.py                     # Incrementale
+  python scripts/enrichment/fact_supersession.py --test 100           # Test (no write)
+  python scripts/enrichment/fact_supersession.py --stats              # Statistiche
+  python scripts/enrichment/fact_supersession.py                      # Haiku (default, best quality)
+  python scripts/enrichment/fact_supersession.py --backend openai     # GPT-4o-mini
+  python scripts/enrichment/fact_supersession.py --backend gemini     # Gemini 2.5 Flash
 """
 
 import json

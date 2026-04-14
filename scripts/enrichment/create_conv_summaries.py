@@ -5,12 +5,12 @@ Uses LLM to generate structured conversation summaries
 that don't yet have a summary in the KB.
 
 Uso:
-  python3 scripts/10f_create_conv_summaries.py                  # Crea summary mancanti
-  python3 scripts/10f_create_conv_summaries.py --dry-run        # Show what it would do
-  python3 scripts/10f_create_conv_summaries.py --stats          # Statistiche per source
-  python3 scripts/10f_create_conv_summaries.py --limit 50       # Max N conversations
-  python3 scripts/10f_create_conv_summaries.py --source chatgpt # Only one source
-  python3 scripts/10f_create_conv_summaries.py --workers 3      # Parallelismo API
+  python scripts/enrichment/create_conv_summaries.py                  # Crea summary mancanti
+  python scripts/enrichment/create_conv_summaries.py --dry-run        # Show what it would do
+  python scripts/enrichment/create_conv_summaries.py --stats          # Statistiche per source
+  python scripts/enrichment/create_conv_summaries.py --limit 50       # Max N conversations
+  python scripts/enrichment/create_conv_summaries.py --source chatgpt # Only one source
+  python scripts/enrichment/create_conv_summaries.py --workers 3      # Parallelismo API
 
 Requisiti:
   pip install openai chromadb requests aiohttp

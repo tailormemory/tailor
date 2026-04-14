@@ -21,13 +21,13 @@ Backend LLM (selezionato con --backend):
 - ollama: Qwen 2.5:7b locale via Ollama (sequenziale)
 
 Uso:
-  python 5_extract_entities.py                         # Incrementale con OpenAI (10 worker)
-  python 5_extract_entities.py --workers 20            # 20 worker paralleli
-  python 5_extract_entities.py --backend ollama        # Usa Ollama locale (sequenziale)
-  python 5_extract_entities.py --full                  # Re-process all chunks
-  python 5_extract_entities.py --test 20               # Prova su 20 chunk e mostra output
-  python 5_extract_entities.py --stats                 # Show statistics for already-extracted entities
-  python 5_extract_entities.py --source chatgpt        # Only chunks from a specific source
+  python scripts/enrichment/extract_entities.py                         # Incrementale con OpenAI (10 worker)
+  python scripts/enrichment/extract_entities.py --workers 20            # 20 worker paralleli
+  python scripts/enrichment/extract_entities.py --backend ollama        # Usa Ollama locale (sequenziale)
+  python scripts/enrichment/extract_entities.py --full                  # Re-process all chunks
+  python scripts/enrichment/extract_entities.py --test 20               # Prova su 20 chunk e mostra output
+  python scripts/enrichment/extract_entities.py --stats                 # Show statistics for already-extracted entities
+  python scripts/enrichment/extract_entities.py --source chatgpt        # Only chunks from a specific source
 
 Requisiti:
   Per backend openai: pip install aiohttp, variabile OPENAI_API_KEY impostata
