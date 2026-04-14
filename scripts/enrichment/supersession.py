@@ -47,16 +47,15 @@ from datetime import datetime
 # ============================================================
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, BASE_DIR)
+from scripts.lib.config import get as cfg, get_enrichment
+
 DB_DIR = os.path.join(BASE_DIR, "db")
 COLLECTION_NAME = cfg("kb", "collection") or "tailor_kb"
 CHROMA_DB_PATH = os.path.join(DB_DIR, "chroma.sqlite3")
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from scripts.lib.config import get_enrichment
 
-# User name from config (for prompt templates)
-from config import get as cfg
 _USER_NAME = cfg("user", "name") or "the user"
 _fd_cfg = get_enrichment("fact_derivation")
 HAIKU_MODEL = _fd_cfg["model"]
