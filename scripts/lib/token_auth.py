@@ -58,6 +58,8 @@ ENDPOINT_PERMISSIONS = {
     "/api/dashboard/pipeline": "read",
     "/api/dashboard/bulk": "read",
     "/api/dashboard/model-advisor": "read",
+    "/api/dashboard/model-advisor/status/": "read",
+    "/api/dashboard/upload/status": "read",
     "/api/dashboard/rate-limit": "read",
     "/api/search": "read",
     "/api/fetch/": "read",
