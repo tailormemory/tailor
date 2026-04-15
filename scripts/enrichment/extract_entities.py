@@ -93,7 +93,7 @@ Reply ONLY with a valid JSON object, nothing else. No text before or after.
 
 Types to extract:
 - person: people names (e.g. "John", "Marco Rossi")
-- company: companies, organizations, brand (es. "Red Pill Ventures", "Fineco", "Apple")
+- company: companies, organizations, brand (es. "Acme Corp", "Fineco", "Apple")
 - project: projects, products, platforms, services (e.g. "StayChic", "TAILOR", "AdSense arbitrage")
 - amount: monetary amounts, percentages, significant numeric quantities (es. "50.000 euro", "3%", "10k")
 - location: places, cities, countries, addresses (es. "Roma", "Irlanda", "Via Crispi")
@@ -101,7 +101,7 @@ Types to extract:
 
 Rules:
 - Include only entities clearly present in the text, do not infer
-- Normalize names (e.g. "RPV" → "Red Pill Ventures" only if explicitly explained in the text)
+- Normalize names (e.g. "AC" → "Acme Corp" only if explicitly explained in the text)
 - For amount: include only significant figures, not generic numbers
 - Maximum 20 entities per chunk
 - If no relevant entities found: {"entities": [], "types": []}

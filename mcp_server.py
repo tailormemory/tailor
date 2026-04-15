@@ -1476,14 +1476,14 @@ def kb_hybrid_search(query: str, n_results: int = 10, source_filter: str = "", i
                 if clean and clean[0].isupper() and len(clean) >= 2:
                     candidates.add(clean)
 
-            # Bigrammi capitalizzati (es. "Red Pill", "the user")
+            # Bigrammi capitalizzati (es. "Acme Corp", "the user")
             for i in range(len(words) - 1):
                 w1 = _re.sub(r"[^\w]", "", words[i])
                 w2 = _re.sub(r"[^\w]", "", words[i + 1])
                 if w1 and w2 and w1[0].isupper() and w2[0].isupper():
                     candidates.add(f"{w1} {w2}")
 
-            # Trigrammi (es. "Red Pill Ventures")
+            # Trigrammi (es. "Acme Corp Inc")
             for i in range(len(words) - 2):
                 w1 = _re.sub(r"[^\w]", "", words[i])
                 w2 = _re.sub(r"[^\w]", "", words[i + 1])
