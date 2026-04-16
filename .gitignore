@@ -37,3 +37,6 @@ Thumbs.db
 # ── Models (downloaded at setup, too large for git) ──────────
 models/
 *.bak*
+
+# Chrome Web Store assets
+docs/store/
