@@ -41,6 +41,39 @@ Your conversations, documents, emails, and decisions — indexed, searchable, an
 
 ---
 
+## Screenshots
+
+<p align="center">
+  <img src="docs/images/dashboard-overview.png" alt="TAILOR Dashboard — Overview" width="900" />
+  <br/><em>Home — services health, KB stats, fact extraction progress, Model Advisor suggestions.</em>
+</p>
+
+<p align="center">
+  <img src="docs/images/dashboard-pipeline.png" alt="TAILOR Dashboard — Pipeline" width="900" />
+  <br/><em>Pipeline — live enrichment log and cron schedule.</em>
+</p>
+
+---
+
+## Running in Production
+
+TAILOR is not a proof of concept. It is battle-tested on real, daily workload:
+
+| Metric | Value |
+|---|---|
+| **Chunks indexed** | 155,265 |
+| **Atomic facts extracted** | 617,017 |
+| **Entities tracked** | 97,430 |
+| **Conversations ingested** | 37,016 (ChatGPT + Claude + documents + email) |
+| **Fact supersession events** | 753 (obsolete facts auto-marked) |
+| **Hardware** | Mac Mini M4 · 24 GB RAM · 460 GB SSD |
+| **Uptime** | 24/7, LaunchDaemon-managed |
+| **Nightly enrichment** | 3:00 AM — automated, Telegram-reported |
+
+All data lives on one self-hosted machine. No cloud, no subscription, no data sharing.
+
+---
+
 ## Quick Start
 
 ### Requirements

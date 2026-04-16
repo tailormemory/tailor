@@ -1767,7 +1767,7 @@
           React.createElement("footer", { className: cl("border-t mt-12 footer-teal", t.border) },
             React.createElement("div", { className: "max-w-6xl mx-auto px-5 py-4 flex items-center justify-between" },
               React.createElement("span", { className: cl("text-sm", t.footerText) }, "T[AI]LOR \u2014 Self-hosted AI memory that never forgets"),
-              React.createElement("span", { className: cl("text-sm font-mono", t.footerText) }, `${config?.user?.name || ""} \u00B7 ${window.location.host}`)
+              React.createElement("span", { className: cl("text-sm font-mono", t.footerText) }, window.location.host)
             )
           )
         )
