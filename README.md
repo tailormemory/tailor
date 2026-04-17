@@ -179,6 +179,7 @@ Without it, the server runs open (suitable for local-only use).
 - Local intent classification via Ollama
 - Natural language reminders with recurring schedules
 - Automatic session capture on conversation timeout
+- System status queries: KB stats, pipeline progress, fact extraction coverage, service health
 - Multi-language support via AI-powered i18n
 
 ---
