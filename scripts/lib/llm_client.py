@@ -60,6 +60,11 @@ TOOLS = [
             "required": ["content", "title"]
         }
     },
+    {
+        "name": "system_status",
+        "description": "Get system operational status: KB stats, fact extraction progress (coverage %, nights remaining), pipeline last run, services health. Use this when the user asks about system state, pipeline progress, or operational metrics.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
 ]
 
 # ═══════════════════════════════════════════════════════════════
