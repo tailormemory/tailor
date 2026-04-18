@@ -7,8 +7,26 @@ Tier 2 (prompt-based): Bot pre-fetches context, passes it in the prompt.
 Supported providers: anthropic, openai, google, ollama
 """
 
-import os, json, requests
+import os, sys, json, re, time, requests
 from lib.config import get
+
+# ═══════════════════════════════════════════════════════════════
+# Streaming event protocol (shared across providers).
+#
+# Each event is a dict with a "type" key. Consumers (e.g. the native
+# chat endpoint in lib.chat_api) translate these into SSE frames.
+#
+#   {"type": "token",      "delta": str}
+#   {"type": "tool_start", "tool": str, "input": dict}
+#   {"type": "tool_end",   "tool": str, "duration_ms": int}
+#   {"type": "done",       "tokens": int | None}
+#   {"type": "error",      "error": str}
+#
+# Providers that cannot stream (OpenAI/Google/Ollama today) inherit the
+# base LLMClient.stream_chat_with_tools(), which runs the blocking
+# chat_with_tools() and word-chunks the final string into token events.
+# AnthropicClient overrides with real SSE from the Messages API.
+# ═══════════════════════════════════════════════════════════════
 
 # ═══════════════════════════════════════════════════════════════
 # Tool Definitions (exposed to Tier 1 LLMs)
@@ -77,6 +95,20 @@ def _mcp_call(tool_name: str, args: dict) -> str:
     return execute_tool(tool_name, args)
 
 
+_WORD_CHUNK_RE = re.compile(r"\S+\s*|\s+")
+
+def _word_chunks(text: str):
+    """Split a final response into word-plus-trailing-whitespace chunks.
+    Used to fake streaming for providers without native SSE support.
+    Word-based rather than char-based so the UX reads as natural typing."""
+    if not text:
+        return
+    for m in _WORD_CHUNK_RE.finditer(text):
+        chunk = m.group(0)
+        if chunk:
+            yield chunk
+
+
 # ═══════════════════════════════════════════════════════════════
 # Base class
 # ═══════════════════════════════════════════════════════════════
@@ -99,6 +131,18 @@ class LLMClient:
     def chat_with_tools(self, system: str, messages: list[dict], tools: list = None) -> str:
         """Chat with tool use. Handles tool call loop internally. Returns final text."""
         raise NotImplementedError
+
+    def stream_chat_with_tools(self, system: str, messages: list[dict], tools: list = None):
+        """Default: run blocking chat_with_tools and word-chunk the final text.
+        Providers that support native streaming override this."""
+        try:
+            text = self.chat_with_tools(system, messages, tools=tools)
+        except Exception as e:
+            yield {"type": "error", "error": str(e)}
+            return
+        for chunk in _word_chunks(text):
+            yield {"type": "token", "delta": chunk}
+        yield {"type": "done", "tokens": None}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -166,8 +210,215 @@ class AnthropicClient(LLMClient):
                         "content": result,
                     })
             msgs.append({"role": "user", "content": tool_results})
-        
+
         return "Max tool iterations reached."
+
+    def stream_chat_with_tools(self, system: str, messages: list[dict], tools: list = None):
+        """Real SSE streaming from Anthropic Messages API, with tool loop."""
+        tools = tools or TOOLS
+        anthropic_tools = [
+            {"name": t["name"], "description": t["description"], "input_schema": t["input_schema"]}
+            for t in tools
+        ]
+        msgs = list(messages)
+        total_output_tokens = 0
+
+        for _ in range(5):
+            payload = {
+                "model": self.model,
+                "max_tokens": self.max_tokens,
+                "system": system,
+                "messages": msgs,
+                "temperature": self.temperature,
+                "tools": anthropic_tools,
+                "stream": True,
+            }
+            try:
+                resp = requests.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": self.api_key,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json=payload,
+                    stream=True,
+                    timeout=120,
+                )
+            except Exception as e:
+                yield {"type": "error", "error": f"anthropic request failed: {e}"}
+                return
+
+            if resp.status_code != 200:
+                try:
+                    err = resp.json().get("error", {}).get("message") or resp.text[:500]
+                except Exception:
+                    err = resp.text[:500]
+                yield {"type": "error", "error": f"anthropic {resp.status_code}: {err}"}
+                return
+
+            # Per-turn accumulators. Anthropic streams content blocks by index;
+            # a single turn can contain one text block and/or several tool_use blocks.
+            blocks: dict[int, dict] = {}
+            assistant_content: list[dict] = []
+            stop_reason = ""
+
+            for event_name, data in _iter_anthropic_sse(resp):
+                if event_name == "content_block_start":
+                    idx = data.get("index", 0)
+                    cb = data.get("content_block", {}) or {}
+                    btype = cb.get("type")
+                    if btype == "text":
+                        blocks[idx] = {"type": "text", "text": ""}
+                    elif btype == "tool_use":
+                        # cb.input may already be populated (non-streamed inline input)
+                        # or may be {} if the input arrives via input_json_delta events.
+                        # Capture both cases.
+                        inline_input = cb.get("input")
+                        blocks[idx] = {
+                            "type": "tool_use",
+                            "id": cb.get("id", ""),
+                            "name": cb.get("name", ""),
+                            "input_raw": "",
+                            "inline_input": inline_input if isinstance(inline_input, dict) else None,
+                            "started_at": time.monotonic(),
+                            "start_emitted": False,
+                        }
+
+                elif event_name == "content_block_delta":
+                    idx = data.get("index", 0)
+                    delta = data.get("delta", {}) or {}
+                    dtype = delta.get("type")
+                    blk = blocks.get(idx)
+                    if blk is None:
+                        continue
+                    if dtype == "text_delta":
+                        chunk = delta.get("text", "")
+                        if chunk:
+                            blk["text"] += chunk
+                            yield {"type": "token", "delta": chunk}
+                    elif dtype == "input_json_delta":
+                        blk["input_raw"] += delta.get("partial_json", "")
+                        if not blk.get("start_emitted"):
+                            # Emit tool_start as soon as we see any input arguments,
+                            # even if the input JSON is not yet complete — the UI
+                            # just needs to know a tool call has begun.
+                            blk["start_emitted"] = True
+                            yield {
+                                "type": "tool_start",
+                                "tool": blk["name"],
+                                "input": _try_json(blk["input_raw"]),
+                            }
+
+                elif event_name == "content_block_stop":
+                    idx = data.get("index", 0)
+                    blk = blocks.get(idx)
+                    if blk and blk["type"] == "tool_use" and not blk.get("start_emitted"):
+                        yield {
+                            "type": "tool_start",
+                            "tool": blk["name"],
+                            "input": _try_json(blk.get("input_raw", "") or "{}"),
+                        }
+                        blk["start_emitted"] = True
+
+                elif event_name == "message_delta":
+                    delta = data.get("delta", {}) or {}
+                    if delta.get("stop_reason"):
+                        stop_reason = delta["stop_reason"]
+                    usage = data.get("usage", {}) or {}
+                    if usage.get("output_tokens"):
+                        total_output_tokens = usage["output_tokens"]
+
+                elif event_name == "message_stop":
+                    break
+
+                elif event_name == "error":
+                    err = data.get("error", {}).get("message") or str(data)
+                    yield {"type": "error", "error": f"anthropic stream error: {err}"}
+                    return
+
+            # Reconstruct the assistant content blocks in index order for the loop-back.
+            for idx in sorted(blocks):
+                blk = blocks[idx]
+                if blk["type"] == "text":
+                    if blk["text"]:
+                        assistant_content.append({"type": "text", "text": blk["text"]})
+                elif blk["type"] == "tool_use":
+                    # Prefer streamed input (input_json_delta accumulation) when
+                    # it parses to a non-empty dict; otherwise fall back to any
+                    # inline input captured in content_block_start.
+                    parsed_input = _try_json(blk.get("input_raw", "") or "{}")
+                    if not isinstance(parsed_input, dict):
+                        parsed_input = {}
+                    if not parsed_input and isinstance(blk.get("inline_input"), dict):
+                        parsed_input = blk["inline_input"]
+                    assistant_content.append({
+                        "type": "tool_use",
+                        "id": blk["id"],
+                        "name": blk["name"],
+                        "input": parsed_input,
+                    })
+
+            if stop_reason != "tool_use":
+                yield {"type": "done", "tokens": total_output_tokens or None}
+                return
+
+            # Run tool calls, feed results back, continue the loop.
+            msgs.append({"role": "assistant", "content": assistant_content})
+            tool_results = []
+            for blk in assistant_content:
+                if blk.get("type") != "tool_use":
+                    continue
+                tool_input = blk.get("input") or {}
+                if not isinstance(tool_input, dict):
+                    tool_input = {}
+                started = time.monotonic()
+                result = _mcp_call(blk["name"], tool_input)
+                duration_ms = int((time.monotonic() - started) * 1000)
+                yield {"type": "tool_end", "tool": blk["name"], "duration_ms": duration_ms}
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": blk["id"],
+                    "content": result,
+                })
+            # Insert a visible separator between the pre-tool text (e.g. "Cerco.")
+            # and the post-tool answer, so adjacent content blocks from different
+            # turns don't render as "Knowledge Base.Problema tecnico..." with no
+            # space. Also nudge the model to continue on a fresh paragraph.
+            yield {"type": "token", "delta": "\n\n"}
+            msgs.append({"role": "user", "content": tool_results})
+
+        yield {"type": "error", "error": "max tool iterations reached"}
+
+
+def _try_json(raw: str):
+    try:
+        return json.loads(raw) if raw else {}
+    except Exception:
+        return {}
+
+
+def _iter_anthropic_sse(resp):
+    """Yield (event_name, data_dict) tuples from an Anthropic streaming response."""
+    event_name = ""
+    for raw in resp.iter_lines(decode_unicode=True):
+        if raw is None:
+            continue
+        line = raw.rstrip("\r")
+        if not line:
+            event_name = ""
+            continue
+        if line.startswith(":"):
+            continue
+        if line.startswith("event:"):
+            event_name = line[len("event:"):].strip()
+        elif line.startswith("data:"):
+            payload = line[len("data:"):].strip()
+            try:
+                data = json.loads(payload) if payload else {}
+            except Exception:
+                data = {}
+            yield event_name, data
 
 
 # ═══════════════════════════════════════════════════════════════

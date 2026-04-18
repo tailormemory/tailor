@@ -89,9 +89,27 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.types import ASGIApp, Receive, Scope, Send
 from starlette.responses import Response, JSONResponse
 
+# ── __main__ ↔ mcp_server sys.modules alias ──────────────────
+# This file is the uvicorn entrypoint and therefore loads as __main__.
+# Other code in this process — notably the chat sub-app's streaming worker
+# thread — imports the MCP tools via `from lib.tool_executor import ...`,
+# which ends up doing `import mcp_server`. Without the alias below, Python
+# would not find "mcp_server" in sys.modules (it's only there as __main__)
+# and would RE-EXECUTE this entire file inside the worker thread. That
+# re-execution (a) wastes resources re-loading ChromaDB/ONNX/etc, and
+# (b) tries to install SIGUSR1/SIGUSR2 handlers from a non-main thread,
+# which raises `ValueError: signal only works in main thread of the main
+# interpreter` — the exact crash we saw in the chat-stream diagnostic logs.
+# Aliasing makes `import mcp_server` a cache hit and keeps everything
+# consistent across processes (Telegram bot / MCP stdio) where this module
+# is imported by name rather than run as __main__.
+if __name__ == "__main__":
+    sys.modules["mcp_server"] = sys.modules["__main__"]
+
 # Configurazione
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(BASE_DIR, "scripts", "lib"))
+sys.path.insert(0, os.path.join(BASE_DIR, "scripts"))  # enables `from lib.X import ...` used in some modules
 DB_DIR = os.path.join(BASE_DIR, "db")
 # Embedding: loaded from lib.embedding (config-driven)
 from embedding import get_embedding, get_embeddings, info as embedding_info
@@ -134,6 +152,15 @@ _rate_limiter = AuthRateLimiter(
     window_seconds=_rl_cfg.get("window_minutes", 15) * 60,
     ban_seconds=_rl_cfg.get("ban_minutes", 30) * 60,
 )
+# ── Native chat sub-app (lazy so import order stays cheap) ────
+_chat_app_instance = None
+def _get_chat_app():
+    global _chat_app_instance
+    if _chat_app_instance is None:
+        from scripts.lib.chat_api import build_app as _build_chat_app
+        _chat_app_instance = _build_chat_app()
+    return _chat_app_instance
+
 # ── Multi-token auth ───────────────────────────────────────────
 from scripts.lib.token_auth import TokenAuth
 _tokens_cfg = []
@@ -943,11 +970,12 @@ class BearerAuthMiddleware:
             is_dashboard = path.startswith("/api/dashboard/")
             is_auth_api = path.startswith("/api/auth/")
             is_ingest_api = path == "/api/ingest-live"
+            is_chat = path == "/api/chat" or path.startswith("/api/chat/")
 
             # Localhost: allow all API calls without auth
-            # Remote: allow dashboard + auth API + ingest-live with cookie/token auth
+            # Remote: allow dashboard + auth API + ingest-live + native chat with cookie/token auth
             _resolved_token = ""
-            if is_localhost or is_dashboard or is_auth_api or is_ingest_api:
+            if is_localhost or is_dashboard or is_auth_api or is_ingest_api or is_chat:
                 # Remote calls need auth (except /api/auth/login which verifies itself)
                 if not is_localhost and path not in ("/api/auth/login", "/api/dashboard/setup"):
                     token_ok = False
@@ -1003,6 +1031,12 @@ class BearerAuthMiddleware:
                         response = Response(content='{"error":"Forbidden: insufficient permissions"}', status_code=403, media_type="application/json", headers=_CORS_HEADERS)
                         await response(scope, receive, send)
                         return
+                # Native chat interface (/api/chat, /api/chat/sessions, /api/chat/sessions/{id}[/rename])
+                # delegates to the chat_api sub-app so the SSE StreamingResponse retains
+                # direct control of the ASGI send channel for real-time token streaming.
+                if path == "/api/chat" or path.startswith("/api/chat/"):
+                    await _get_chat_app()(scope, receive, send)
+                    return
                 response = await self._handle_rest_api(path, scope, receive)
                 await response(scope, receive, send)
                 return
@@ -1068,9 +1102,16 @@ def _exit_maintenance(signum: int | None = None, frame=None) -> None:
     print(f"[MAINTENANCE] Exited maintenance mode — ChromaDB will reopen on next query", flush=True)
 
 
-# Register signal handlers
-signal.signal(signal.SIGUSR1, _enter_maintenance)
-signal.signal(signal.SIGUSR2, _exit_maintenance)
+# Register signal handlers. Signal handlers can ONLY be installed from the main
+# thread — if this module is somehow re-imported from a worker thread (e.g. when
+# the file is run as __main__ and a thread later does `import mcp_server`, see
+# the __main__ alias at the top of this module), skip registration rather than
+# crash. The primary fix is the sys.modules alias above; this guard is defense
+# in depth.
+import threading as _threading
+if _threading.current_thread() is _threading.main_thread():
+    signal.signal(signal.SIGUSR1, _enter_maintenance)
+    signal.signal(signal.SIGUSR2, _exit_maintenance)
 
 
 def get_collection() -> chromadb.Collection | None:
