@@ -173,6 +173,17 @@ Without it, the server runs open (suitable for local-only use).
 - **Zero external dependencies**: React, Tailwind, and all assets served locally — no CDN, no build step
 - Dark/light mode, frosted glass navbar, responsive mobile layout
 
+### 🗨️ Native Chat
+
+- First-party web chat built into the dashboard (**Chat** tab, or standalone at `/dashboard/chat.html`)
+- Server-sent events stream the model's tokens as they are generated
+- Real streaming on Anthropic (the default provider); word-chunked fallback on OpenAI, Google, and Ollama
+- Tool calls (KB search, fact lookup, `system_status`) surface inline as "⟳ searching memory…" / "✓ searched memory (Nms)" pills
+- Persistent sessions in SQLite (`db/chat_sessions.sqlite3`): list, rename, resume, delete
+- Markdown rendering via `marked` + `DOMPurify` (loaded from CDN; vendor them locally for fully offline-first setups)
+- Auth: reuses the dashboard cookie session — no separate login, single-user
+- Configurable under `chat_interface:` in `config/tailor.yaml` (enable/disable, history window, keepalive interval, empty-state suggestions, optional dedicated system prompt)
+
 ### 💬 Telegram Bot
 
 - Claude/GPT as conversation brain with full KB access

@@ -3,11 +3,16 @@
 # ═══════════════════════════════════════════════════════════════
 
 # ── User data (NEVER commit) ─────────────────────────────────
-db/
+# Use db/* (not db/) so specific subpaths can be re-included below
+db/*
 data/
 credentials/
 backups/
 logs/
+
+# ── Exceptions: SQL schema migrations SHOULD be tracked ──────
+!db/migrations/
+!db/migrations/*.sql
 
 # ── Config with secrets ──────────────────────────────────────
 config/tailor.yaml

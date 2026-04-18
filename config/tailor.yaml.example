@@ -150,6 +150,25 @@ persona:
 branding:
   app_name: TAILOR
 
+# ── Native chat interface (dashboard web UI) ─────────────────
+# The "Chat" tab in the dashboard talks directly to the local LLM brain.
+# Auth: reuses the dashboard cookie session. Single-user.
+chat_interface:
+  enabled: true
+  max_history_messages: 20        # messages sent to the LLM per turn (includes the current user turn)
+  sse_keepalive_seconds: 15       # idle heartbeat to keep reverse proxies from timing out
+  max_message_length: 8000        # hard cap on a single user message
+  suggest_prompts:
+    - "What did I work on yesterday?"
+    - "Summarize my TAILOR project status"
+    - "Show me recent decisions"
+  # Optional: override the web-channel system prompt.
+  # If unset, the code falls back to `persona.system_prompt` for backward compatibility.
+  # Recommended: keep the web prompt separate — Telegram constraints (no Markdown,
+  # short messages) don't apply here.
+  # system_prompt: |
+  #   Sei TAILOR, l'assistente AI personale...
+
 # ── Cloud Sync ────────────────────────────────────────────────
 # Cloud storage providers to sync before document ingest.
 # Each entry maps to an rclone remote. Set up rclone first: rclone config

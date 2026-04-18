@@ -1,0 +1,6 @@
+# TAILOR — development-only dependencies (tests, linters).
+# Install with: .venv/bin/pip install -r requirements-dev.txt
+# Runtime deps live in requirements.txt and must stay minimal.
+
+pytest>=8.0
+httpx>=0.27
