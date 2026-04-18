@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TAILOR — Chat</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text x='50%25' y='55%25' dominant-baseline='middle' text-anchor='middle' fill='%230d9488' font-size='11' font-weight='700' font-family='sans-serif'>[AI]</text></svg>" />
+  <script src="/dashboard/vendor/react.min.js"></script>
+  <script src="/dashboard/vendor/react-dom.min.js"></script>
+  <script src="/dashboard/vendor/tailwind.js"></script>
+  <!-- Markdown rendering via CDN. Vendor these locally if offline-first is required. -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.7/dist/purify.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Outfit', sans-serif; background: linear-gradient(135deg, #050608 0%, #070a0f 50%, #050608 100%); color: #e4e4e7; min-height: 100vh; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #1a3a3a; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #0d9488; }
+    code, pre, .font-mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+    /* Markdown tweaks scoped to chat messages */
+    .chat-prose p { margin: 0.5em 0; }
+    .chat-prose p:first-child { margin-top: 0; }
+    .chat-prose p:last-child { margin-bottom: 0; }
+    .chat-prose code { background: rgba(255,255,255,0.06); padding: 0.1em 0.35em; border-radius: 4px; font-size: 0.9em; }
+    .chat-prose pre { background: rgba(0,0,0,0.35); border: 1px solid rgba(255,255,255,0.06); border-radius: 8px; padding: 0.75em 1em; margin: 0.75em 0; overflow-x: auto; font-size: 0.9em; }
+    .chat-prose pre code { background: transparent; padding: 0; }
+    .chat-prose ul, .chat-prose ol { padding-left: 1.5em; margin: 0.5em 0; }
+    .chat-prose li { margin: 0.2em 0; }
+    .chat-prose a { color: #5eead4; text-decoration: underline; }
+    .chat-prose strong { color: #fff; }
+    .chat-prose blockquote { border-left: 3px solid #134e4a; padding-left: 0.75em; margin: 0.75em 0; color: #a1a1aa; }
+    textarea:focus { box-shadow: 0 0 0 3px rgba(20,184,166,0.15); }
+    .chat-composer textarea { box-shadow: none !important; }
+    .chat-composer textarea:focus { box-shadow: none !important; outline: none !important; }
+    .chat-composer:focus-within { box-shadow: 0 0 0 3px rgba(20,184,166,0.15); border-color: rgba(20,184,166,0.6); }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script src="/dashboard/chat.jsx"></script>
+  <script>
+    (function () {
+      var theme = {
+        text: "text-zinc-100", textMuted: "text-zinc-500", textFaint: "text-zinc-600", textLabel: "text-zinc-400",
+        border: "border-zinc-800/40",
+        tile: "bg-zinc-900/40",
+        input: "bg-zinc-900 border-zinc-700",
+      };
+      var h = React.createElement;
+      function Page() {
+        return h("div", { className: "max-w-6xl mx-auto px-5 py-6" },
+          h("header", { className: "flex items-center justify-between mb-4" },
+            h("div", { className: "flex items-center" },
+              h("span", { style: { fontSize: "22px", fontWeight: 700, letterSpacing: "1px" } }, "T"),
+              h("span", { style: { color: "#0d9488", fontSize: "25px" } }, "["),
+              h("span", { style: { color: "#0d9488", fontSize: "22px", fontWeight: 700 } }, "AI"),
+              h("span", { style: { color: "#0d9488", fontSize: "25px" } }, "]"),
+              h("span", { style: { fontSize: "22px", fontWeight: 700, letterSpacing: "1px" } }, "LOR"),
+              h("span", { className: "ml-3 text-xs tracking-widest text-zinc-500" }, "CHAT")
+            ),
+            h("a", { href: "/dashboard", className: "text-xs text-teal-400 hover:text-teal-300" }, "\u2190 Dashboard")
+          ),
+          h(window.TailorChat.Tab, { theme: theme })
+        );
+      }
+      ReactDOM.createRoot(document.getElementById("root")).render(h(Page));
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,474 @@
+/*
+ * TAILOR — native chat tab for the dashboard.
+ *
+ * Plain ES2017 using React.createElement (no Babel in browser — matches the
+ * rest of dashboard/index.html). Exposed globals when loaded:
+ *   window.TailorChat.Tab({ theme })  — React component for the "Chat" tab.
+ *
+ * Dependencies expected to already be on window:
+ *   React, ReactDOM, marked, DOMPurify.
+ */
+
+(function () {
+  "use strict";
+
+  var React = window.React;
+  var h = React.createElement;
+  var useState = React.useState;
+  var useEffect = React.useEffect;
+  var useRef = React.useRef;
+  var useCallback = React.useCallback;
+
+  // ── utilities ────────────────────────────────────────────────
+
+  function cl() {
+    var out = [];
+    for (var i = 0; i < arguments.length; i++) if (arguments[i]) out.push(arguments[i]);
+    return out.join(" ");
+  }
+
+  function relTime(iso) {
+    if (!iso) return "";
+    var t = Date.parse(iso);
+    if (isNaN(t)) return "";
+    var s = Math.max(0, Math.floor((Date.now() - t) / 1000));
+    if (s < 60) return s + "s ago";
+    var m = Math.floor(s / 60);
+    if (m < 60) return m + "m ago";
+    var h = Math.floor(m / 60);
+    if (h < 24) return h + "h ago";
+    var d = Math.floor(h / 24);
+    if (d < 30) return d + "d ago";
+    return new Date(t).toLocaleDateString();
+  }
+
+  function renderMarkdown(text) {
+    var marked = window.marked;
+    var purify = window.DOMPurify;
+    if (!text) return "";
+    if (!marked || !purify) {
+      var esc = String(text).replace(/[&<>]/g, function (c) {
+        return c === "&" ? "&amp;" : c === "<" ? "&lt;" : "&gt;";
+      });
+      return "<p>" + esc.replace(/\n\n+/g, "</p><p>").replace(/\n/g, "<br/>") + "</p>";
+    }
+    marked.setOptions({ breaks: true, gfm: true });
+    return purify.sanitize(marked.parse(text));
+  }
+
+  // ── SSE reader ───────────────────────────────────────────────
+
+  function readSSE(response, onEvent, signal) {
+    if (!response.body || !response.body.getReader) {
+      return Promise.reject(new Error("ReadableStream not supported"));
+    }
+    var reader = response.body.getReader();
+    var decoder = new TextDecoder();
+    var buffer = "";
+    function pump() {
+      return reader.read().then(function (res) {
+        if (res.done) return;
+        buffer += decoder.decode(res.value, { stream: true });
+        var parts = buffer.split(/\r?\n\r?\n/);
+        buffer = parts.pop() || "";
+        for (var i = 0; i < parts.length; i++) {
+          var block = parts[i];
+          if (!block || block.charAt(0) === ":") continue;
+          var lines = block.split(/\r?\n/);
+          var eventName = "message";
+          var dataLines = [];
+          for (var j = 0; j < lines.length; j++) {
+            var line = lines[j];
+            if (line.indexOf("event:") === 0) eventName = line.slice(6).trim();
+            else if (line.indexOf("data:") === 0) dataLines.push(line.slice(5).replace(/^ /, ""));
+          }
+          var dataStr = dataLines.join("\n");
+          var data = null;
+          if (dataStr) { try { data = JSON.parse(dataStr); } catch (_e) { data = dataStr; } }
+          try { onEvent(eventName, data); } catch (_e) { /* swallow handler errors */ }
+        }
+        if (signal && signal.aborted) return;
+        return pump();
+      });
+    }
+    return pump();
+  }
+
+  // ── API ──────────────────────────────────────────────────────
+
+  var API_BASE = window.location.origin;
+
+  function api(path, opts) {
+    opts = opts || {};
+    opts.credentials = "include";
+    opts.headers = opts.headers || {};
+    return fetch(API_BASE + path, opts);
+  }
+
+  // ── UI components ────────────────────────────────────────────
+
+  function SessionItem(props) {
+    var t = props.theme, s = props.session, active = props.active;
+    var activeCls = active
+      ? "bg-teal-500/10 border-teal-500/30 text-teal-200"
+      : cl("border-transparent hover:bg-white/[0.03]", t.textLabel);
+    return h("div", {
+      onClick: props.onSelect,
+      className: cl(
+        "group flex items-center gap-2 px-3 py-2 rounded-lg border cursor-pointer text-sm",
+        activeCls
+      ),
+    },
+      h("div", { className: "flex-1 min-w-0" },
+        h("div", { className: "truncate" }, s.title || "New chat"),
+        h("div", { className: cl("text-xs mt-0.5 font-mono", t.textFaint) }, relTime(s.updated_at))
+      ),
+      h("button", {
+        onClick: function (e) { e.stopPropagation(); props.onDelete(s.id); },
+        title: "Delete session",
+        className: cl("opacity-0 group-hover:opacity-100 transition text-xs px-1.5 py-0.5 rounded", t.textFaint, "hover:text-red-400"),
+      }, "\u2715")
+    );
+  }
+
+  function ToolPill(props) {
+    var t = props.theme, call = props.call, done = props.done, duration = props.duration;
+    var base = "inline-flex items-center gap-1.5 text-xs font-mono px-2 py-0.5 rounded border mr-2";
+    if (done) {
+      return h("span", { className: cl(base, "border-zinc-700/50", t.textFaint) },
+        "\u2713 ", call.tool, duration != null ? " (" + duration + "ms)" : ""
+      );
+    }
+    return h("span", { className: cl(base, "border-teal-600/40 text-teal-300 bg-teal-900/10") },
+      h("span", { className: "animate-pulse" }, "\u27F3"), " ", call.tool,
+      call.input && call.input.query ? ": \"" + String(call.input.query).slice(0, 40) + "\"" : ""
+    );
+  }
+
+  function MessageRow(props) {
+    var t = props.theme, m = props.message, streaming = props.streaming;
+    var isUser = m.role === "user";
+
+    if (isUser) {
+      return h("div", { className: "flex justify-end my-3" },
+        h("div", {
+          className: cl(
+            "max-w-[70%] rounded-2xl px-4 py-2.5 text-sm whitespace-pre-wrap break-words",
+            "bg-teal-600/25 text-zinc-100 border border-teal-600/30"
+          ),
+        }, m.content)
+      );
+    }
+
+    var tools = m.tool_calls || [];
+    var results = m.tool_results || [];
+    var durationByTool = {};
+    for (var i = 0; i < results.length; i++) {
+      durationByTool[results[i].tool] = results[i].duration_ms;
+    }
+    var labelCls = cl("text-xs uppercase tracking-widest font-mono mb-1", t.textFaint);
+    var contentHtml = renderMarkdown(m.content || "");
+
+    return h("div", { className: "my-4" },
+      h("div", { className: labelCls }, "TAILOR", streaming ? h("span", { className: "ml-2 animate-pulse text-teal-400" }, "\u25CF") : null),
+      tools.length > 0 ? h("div", { className: "mb-1.5 flex flex-wrap gap-y-1" },
+        tools.map(function (call, k) {
+          var done = durationByTool.hasOwnProperty(call.tool) || !streaming;
+          return h(ToolPill, {
+            key: k,
+            theme: t,
+            call: call,
+            done: done,
+            duration: durationByTool[call.tool],
+          });
+        })
+      ) : null,
+      h("div", {
+        className: cl("chat-prose text-sm leading-relaxed", t.text),
+        dangerouslySetInnerHTML: { __html: contentHtml || (streaming ? "" : "<p class=\"italic opacity-60\">(empty response)</p>") },
+      })
+    );
+  }
+
+  function Composer(props) {
+    var t = props.theme;
+    var taRef = useRef(null);
+
+    function autoresize() {
+      var el = taRef.current;
+      if (!el) return;
+      el.style.height = "auto";
+      var max = 6 * 24; // ~6 rows
+      el.style.height = Math.min(el.scrollHeight, max) + "px";
+    }
+    useEffect(autoresize, [props.value]);
+
+    function onKey(e) {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        if (!props.busy && props.value.trim()) props.onSend();
+      }
+    }
+
+    return h("div", { className: cl("chat-composer border rounded-2xl p-2 flex items-center gap-2", t.border, t.input) },
+      h("textarea", {
+        ref: taRef,
+        value: props.value,
+        onChange: function (e) { props.onChange(e.target.value); },
+        onKeyDown: onKey,
+        rows: 1,
+        disabled: props.busy,
+        placeholder: "Ask TAILOR...",
+        className: cl(
+          "flex-1 resize-none bg-transparent outline-none border-0 px-2 py-1.5 text-sm leading-relaxed self-center",
+          t.text, "placeholder-zinc-500"
+        ),
+        style: { minHeight: "36px", maxHeight: "144px" },
+      }),
+      props.busy
+        ? h("button", {
+            onClick: props.onStop,
+            className: "px-3 py-2 rounded-xl text-sm font-medium bg-red-600/80 hover:bg-red-600 text-white transition",
+          }, "Stop")
+        : h("button", {
+            onClick: props.onSend,
+            disabled: !props.value.trim(),
+            className: cl(
+              "px-4 py-2 rounded-xl text-sm font-semibold transition",
+              props.value.trim()
+                ? "bg-teal-600 hover:bg-teal-500 text-white"
+                : "bg-zinc-800 text-zinc-500 cursor-not-allowed"
+            ),
+          }, "Send")
+    );
+  }
+
+  function EmptyState(props) {
+    var t = props.theme;
+    var prompts = props.suggestPrompts || [];
+    return h("div", { className: "flex flex-col items-center justify-center text-center py-16 px-6" },
+      h("div", { className: cl("text-2xl font-semibold mb-2", t.text) }, "Start a conversation with TAILOR"),
+      h("div", { className: cl("text-sm mb-6", t.textMuted) },
+        "Your memory, your model, your machine."
+      ),
+      h("div", { className: "flex flex-col gap-2 w-full max-w-md" },
+        prompts.map(function (p, i) {
+          return h("button", {
+            key: i,
+            onClick: function () { props.onSuggest(p); },
+            className: cl(
+              "text-left text-sm px-4 py-3 rounded-xl border transition",
+              t.border, t.textLabel,
+              "hover:border-teal-500/40 hover:text-teal-300 hover:bg-teal-500/[0.04]"
+            ),
+          }, p);
+        })
+      )
+    );
+  }
+
+  // ── Tab ──────────────────────────────────────────────────────
+
+  function Tab(props) {
+    var t = props.theme;
+    var _s = useState([]); var sessions = _s[0], setSessions = _s[1];
+    var _p = useState([]); var prompts = _p[0], setPrompts = _p[1];
+    var _en = useState(true); var enabled = _en[0], setEnabled = _en[1];
+    var _a = useState(null); var activeId = _a[0], setActiveId = _a[1];
+    var _m = useState([]); var messages = _m[0], setMessages = _m[1];
+    var _i = useState(""); var input = _i[0], setInput = _i[1];
+    var _b = useState(false); var busy = _b[0], setBusy = _b[1];
+    var _e = useState(null); var error = _e[0], setError = _e[1];
+    var abortRef = useRef(null);
+    var scrollRef = useRef(null);
+    // True when activeId was just assigned from an in-flight stream.
+    // Suppresses the next session-detail fetch so the optimistic
+    // [user, assistant-streaming] state isn't clobbered by the server's
+    // partial snapshot (which only has the user message persisted so far).
+    var skipNextLoadRef = useRef(false);
+
+    var refreshSessions = useCallback(function () {
+      return api("/api/chat/sessions").then(function (r) { return r.json(); }).then(function (body) {
+        if (!body) return;
+        if (body.enabled === false) setEnabled(false);
+        setSessions(body.sessions || []);
+        setPrompts(body.suggest_prompts || []);
+      });
+    }, []);
+
+    useEffect(function () { refreshSessions(); }, [refreshSessions]);
+
+    useEffect(function () {
+      if (!activeId) { setMessages([]); return; }
+      if (skipNextLoadRef.current) { skipNextLoadRef.current = false; return; }
+      api("/api/chat/sessions/" + encodeURIComponent(activeId)).then(function (r) { return r.json(); }).then(function (body) {
+        if (body && body.messages) setMessages(body.messages);
+      });
+    }, [activeId]);
+
+    useEffect(function () {
+      var el = scrollRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
+    }, [messages]);
+
+    function newChat() {
+      setActiveId(null);
+      setMessages([]);
+      setInput("");
+      setError(null);
+    }
+
+    function deleteSession(sid) {
+      if (!confirm("Delete this chat?")) return;
+      api("/api/chat/sessions/" + encodeURIComponent(sid), { method: "DELETE" }).then(function () {
+        if (activeId === sid) newChat();
+        refreshSessions();
+      });
+    }
+
+    function send(text) {
+      var payload = (text != null ? text : input).trim();
+      if (!payload || busy) return;
+      setError(null);
+      setInput("");
+      setBusy(true);
+
+      var userMsg = { role: "user", content: payload, created_at: new Date().toISOString() };
+      var streamMsg = { role: "assistant", content: "", tool_calls: [], tool_results: [], streaming: true };
+      setMessages(function (prev) { return prev.concat([userMsg, streamMsg]); });
+
+      var controller = new AbortController();
+      abortRef.current = controller;
+
+      api("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: activeId, message: payload }),
+        signal: controller.signal,
+      }).then(function (resp) {
+        if (!resp.ok) {
+          return resp.text().then(function (tx) { throw new Error("HTTP " + resp.status + ": " + tx); });
+        }
+        return readSSE(resp, function (eventName, data) {
+          if (eventName === "session") {
+            if (data && data.session_id && !activeId) {
+              // Adopt the server-assigned id without triggering the
+              // session-detail fetch — our local state is already correct.
+              skipNextLoadRef.current = true;
+              setActiveId(data.session_id);
+            }
+          } else if (eventName === "token") {
+            var delta = (data && data.delta) || "";
+            setMessages(function (prev) {
+              var out = prev.slice();
+              var last = Object.assign({}, out[out.length - 1]);
+              last.content = (last.content || "") + delta;
+              out[out.length - 1] = last;
+              return out;
+            });
+          } else if (eventName === "tool_start") {
+            setMessages(function (prev) {
+              var out = prev.slice();
+              var last = Object.assign({}, out[out.length - 1]);
+              last.tool_calls = (last.tool_calls || []).concat([{ tool: data.tool, input: data.input || {} }]);
+              out[out.length - 1] = last;
+              return out;
+            });
+          } else if (eventName === "tool_end") {
+            setMessages(function (prev) {
+              var out = prev.slice();
+              var last = Object.assign({}, out[out.length - 1]);
+              last.tool_results = (last.tool_results || []).concat([{ tool: data.tool, duration_ms: data.duration_ms }]);
+              out[out.length - 1] = last;
+              return out;
+            });
+          } else if (eventName === "error") {
+            setError((data && data.error) || "unknown error");
+          }
+        }, controller.signal);
+      }).then(function () {
+        setMessages(function (prev) {
+          var out = prev.slice();
+          var last = Object.assign({}, out[out.length - 1]);
+          delete last.streaming;
+          out[out.length - 1] = last;
+          return out;
+        });
+        refreshSessions();
+      }).catch(function (err) {
+        if (err && err.name === "AbortError") {
+          // Stopped by user — partial message already persisted server-side on disconnect.
+          refreshSessions();
+        } else {
+          setError(String((err && err.message) || err));
+        }
+      }).then(function () {
+        setBusy(false);
+        abortRef.current = null;
+      });
+    }
+
+    function stop() {
+      if (abortRef.current) abortRef.current.abort();
+    }
+
+    if (!enabled) {
+      return h("div", { className: cl("rounded-2xl border p-8 text-center", t.border, t.tile) },
+        h("div", { className: cl("text-lg font-semibold mb-1", t.text) }, "Chat interface disabled"),
+        h("div", { className: cl("text-sm", t.textMuted) }, "Enable it in ", h("code", { className: "font-mono" }, "config/tailor.yaml"), " → ", h("code", { className: "font-mono" }, "chat_interface.enabled"), ".")
+      );
+    }
+
+    return h("div", {
+      className: cl("grid gap-4 rounded-2xl border overflow-hidden", t.border),
+      style: { gridTemplateColumns: "240px 1fr", height: "calc(100vh - 240px)", minHeight: "520px" }
+    },
+      // Left pane
+      h("div", { className: cl("flex flex-col border-r", t.border, t.tile) },
+        h("div", { className: "p-3" },
+          h("button", {
+            onClick: newChat,
+            className: "w-full py-2 rounded-xl text-sm font-semibold bg-teal-600 hover:bg-teal-500 text-white transition",
+          }, "+ New chat")
+        ),
+        h("div", { className: "flex-1 overflow-y-auto px-2 pb-3 space-y-1" },
+          sessions.length === 0
+            ? h("div", { className: cl("text-xs text-center py-4", t.textFaint) }, "No sessions yet")
+            : sessions.map(function (s) {
+                return h(SessionItem, {
+                  key: s.id,
+                  theme: t,
+                  session: s,
+                  active: s.id === activeId,
+                  onSelect: function () { setActiveId(s.id); },
+                  onDelete: deleteSession,
+                });
+              })
+        )
+      ),
+      // Right pane
+      h("div", { className: "flex flex-col min-w-0 min-h-0" },
+        h("div", { ref: scrollRef, className: "flex-1 overflow-y-auto px-5 py-4 min-h-0" },
+          messages.length === 0
+            ? h(EmptyState, { theme: t, suggestPrompts: prompts, onSuggest: function (p) { send(p); } })
+            : messages.map(function (m, i) {
+                return h(MessageRow, { key: i, theme: t, message: m, streaming: !!m.streaming });
+              })
+        ),
+        error ? h("div", { className: "mx-5 mb-2 text-xs px-3 py-2 rounded-lg border border-red-800/50 bg-red-900/20 text-red-300 font-mono" }, "error: " + error) : null,
+        h("div", { className: "px-4 pb-4 pt-2 flex-shrink-0" },
+          h(Composer, {
+            theme: t,
+            value: input,
+            onChange: setInput,
+            onSend: function () { send(); },
+            onStop: stop,
+            busy: busy,
+          })
+        )
+      )
+    );
+  }
+
+  window.TailorChat = { Tab: Tab, renderMarkdown: renderMarkdown };
+})();

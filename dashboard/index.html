@@ -8,6 +8,9 @@
   <script src="/dashboard/vendor/react.min.js"></script>
   <script src="/dashboard/vendor/react-dom.min.js"></script>
   <script src="/dashboard/vendor/tailwind.js"></script>
+  <!-- Markdown rendering for the Chat tab. CDN — vendor locally if offline-first needed. -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.7/dist/purify.min.js"></script>
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -33,10 +36,30 @@
     input:focus, select:focus, textarea:focus { box-shadow: 0 0 0 3px rgba(20,184,166,0.15) !important; }
     /* Subtle teal border on footer */
     .footer-teal { border-color: rgba(20,184,166,0.08) !important; }
+    /* Chat tab markdown rendering */
+    .chat-prose p { margin: 0.5em 0; }
+    .chat-prose p:first-child { margin-top: 0; }
+    .chat-prose p:last-child { margin-bottom: 0; }
+    .chat-prose code { background: rgba(255,255,255,0.06); padding: 0.1em 0.35em; border-radius: 4px; font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 0.9em; }
+    .chat-prose pre { background: rgba(0,0,0,0.35); border: 1px solid rgba(255,255,255,0.06); border-radius: 8px; padding: 0.75em 1em; margin: 0.75em 0; overflow-x: auto; font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 0.9em; }
+    .chat-prose pre code { background: transparent; padding: 0; }
+    .chat-prose ul, .chat-prose ol { padding-left: 1.5em; margin: 0.5em 0; }
+    .chat-prose li { margin: 0.2em 0; }
+    .chat-prose a { color: #5eead4; text-decoration: underline; }
+    .chat-prose strong { color: #fff; }
+    .chat-prose blockquote { border-left: 3px solid #134e4a; padding-left: 0.75em; margin: 0.75em 0; color: #a1a1aa; }
+    /* Composer: suppress the global textarea:focus teal ring (which bleeds as a
+       vertical stripe next to the Send button because of the flex gap). Move
+       the focus ring onto the whole container via :focus-within instead. */
+    .chat-composer textarea { box-shadow: none !important; }
+    .chat-composer textarea:focus { box-shadow: none !important; outline: none !important; }
+    .chat-composer:focus-within { box-shadow: 0 0 0 3px rgba(20,184,166,0.15); border-color: rgba(20,184,166,0.6); }
   </style>
 </head>
 <body>
   <div id="root"></div>
+  <!-- Chat tab component. Exposes window.TailorChat.Tab. -->
+  <script src="/dashboard/chat.jsx"></script>
   <script>
     const { useState, useEffect, createContext, useContext, useCallback } = React;
 
@@ -154,6 +177,7 @@
 
     const TABS = [
       { id: "home", label: "Home", icon: "\u2B21" },
+      { id: "chat", label: "Chat", icon: "\u25B6" },
       { id: "kb", label: "Knowledge Base", icon: "\u25C6" },
       { id: "pipeline", label: "Pipeline", icon: "\u25B8" },
       { id: "config", label: "Configuration", icon: "\u2699" },
@@ -1713,6 +1737,11 @@
 
       const pages = {
         home: React.createElement(HomePage, { stats, services, setTab, modelAdvisor }),
+        chat: window.TailorChat
+          ? React.createElement(window.TailorChat.Tab, { theme: t })
+          : React.createElement("div", { className: cl("rounded-2xl border p-8 text-center", t.border, t.tile) },
+              React.createElement("div", { className: cl("text-sm", t.textMuted) }, "Chat component failed to load. Check /dashboard/chat.jsx.")
+            ),
         kb: React.createElement(KBPage, { stats, config }),
         pipeline: React.createElement(PipelinePage, { pipeline }),
         config: React.createElement(ConfigPage, { config, onConfigSaved: refresh }),
