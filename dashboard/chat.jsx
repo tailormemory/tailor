@@ -115,18 +115,24 @@
     return h("div", {
       onClick: props.onSelect,
       className: cl(
-        "group flex items-center gap-2 px-3 py-2 rounded-lg border cursor-pointer text-sm",
+        "group flex items-center gap-2 px-2 py-2 rounded-lg border cursor-pointer text-sm min-h-[44px]",
         activeCls
       ),
     },
-      h("div", { className: "flex-1 min-w-0" },
+      h("div", { className: "flex-1 min-w-0 px-1" },
         h("div", { className: "truncate" }, s.title || "New chat"),
         h("div", { className: cl("text-xs mt-0.5 font-mono", t.textFaint) }, relTime(s.updated_at))
       ),
+      // Delete button: hover-revealed on desktop, always visible on touch (touch devices can't hover).
       h("button", {
         onClick: function (e) { e.stopPropagation(); props.onDelete(s.id); },
         title: "Delete session",
-        className: cl("opacity-0 group-hover:opacity-100 transition text-xs px-1.5 py-0.5 rounded", t.textFaint, "hover:text-red-400"),
+        "aria-label": "Delete session",
+        className: cl(
+          "shrink-0 w-9 h-9 rounded-lg flex items-center justify-center text-sm",
+          "opacity-100 md:opacity-0 md:group-hover:opacity-100 transition",
+          t.textFaint, "hover:text-red-400 hover:bg-white/[0.04]"
+        ),
       }, "\u2715")
     );
   }
@@ -219,8 +225,10 @@
         rows: 1,
         disabled: props.busy,
         placeholder: "Ask TAILOR...",
+        // On mobile we enforce 16px font via scoped CSS (.chat-composer textarea
+        // @ max-width:767px) so iOS Safari/Chrome don't auto-zoom on focus.
         className: cl(
-          "flex-1 resize-none bg-transparent outline-none border-0 px-2 py-1.5 text-sm leading-relaxed self-center",
+          "flex-1 resize-none bg-transparent outline-none border-0 px-2 py-1.5 text-base md:text-sm leading-relaxed self-center",
           t.text, "placeholder-zinc-500"
         ),
         style: { minHeight: "36px", maxHeight: "144px" },
@@ -228,18 +236,31 @@
       props.busy
         ? h("button", {
             onClick: props.onStop,
-            className: "px-3 py-2 rounded-xl text-sm font-medium bg-red-600/80 hover:bg-red-600 text-white transition",
+            className: "min-h-[44px] min-w-[44px] px-4 rounded-xl text-sm font-medium bg-red-600/80 hover:bg-red-600 text-white transition",
           }, "Stop")
         : h("button", {
             onClick: props.onSend,
             disabled: !props.value.trim(),
             className: cl(
-              "px-4 py-2 rounded-xl text-sm font-semibold transition",
+              "min-h-[44px] min-w-[44px] px-4 rounded-xl text-sm font-semibold transition",
               props.value.trim()
                 ? "bg-teal-600 hover:bg-teal-500 text-white"
                 : "bg-zinc-800 text-zinc-500 cursor-not-allowed"
             ),
           }, "Send")
+    );
+  }
+
+  // Hamburger SVG — inlined to avoid adding an icon dep.
+  function HamburgerIcon() {
+    return h("svg", {
+      width: 20, height: 20, viewBox: "0 0 20 20",
+      fill: "none", stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round",
+      "aria-hidden": "true",
+    },
+      h("line", { x1: 3, y1: 6, x2: 17, y2: 6 }),
+      h("line", { x1: 3, y1: 10, x2: 17, y2: 10 }),
+      h("line", { x1: 3, y1: 14, x2: 17, y2: 14 })
     );
   }
 
@@ -286,6 +307,27 @@
     // [user, assistant-streaming] state isn't clobbered by the server's
     // partial snapshot (which only has the user message persisted so far).
     var skipNextLoadRef = useRef(false);
+    // Mobile drawer state. On desktop the sidebar is always visible
+    // (via md: utilities) and this flag is effectively ignored.
+    var _so = useState(false); var sidebarOpen = _so[0], setSidebarOpen = _so[1];
+
+    function openSidebar() { setSidebarOpen(true); }
+    function closeSidebar() { setSidebarOpen(false); }
+
+    // ESC closes the mobile drawer; also lock body scroll while it's open
+    // so iOS rubber-band doesn't reveal the page underneath.
+    useEffect(function () {
+      function onKey(e) { if (e.key === "Escape") closeSidebar(); }
+      if (sidebarOpen) {
+        document.addEventListener("keydown", onKey);
+        var prev = document.body.style.overflow;
+        document.body.style.overflow = "hidden";
+        return function () {
+          document.removeEventListener("keydown", onKey);
+          document.body.style.overflow = prev;
+        };
+      }
+    }, [sidebarOpen]);
 
     var refreshSessions = useCallback(function () {
       return api("/api/chat/sessions").then(function (r) { return r.json(); }).then(function (body) {
@@ -419,16 +461,45 @@
       );
     }
 
+    var activeSession = null;
+    for (var si = 0; si < sessions.length; si++) {
+      if (sessions[si].id === activeId) { activeSession = sessions[si]; break; }
+    }
+    var mobileTitle = activeSession ? (activeSession.title || "New chat") : "New chat";
+
     return h("div", {
-      className: cl("grid gap-4 rounded-2xl border overflow-hidden", t.border),
-      style: { gridTemplateColumns: "240px 1fr", height: "calc(100vh - 240px)", minHeight: "520px" }
+      className: cl("chat-shell relative rounded-2xl border overflow-hidden flex", t.border),
     },
-      // Left pane
-      h("div", { className: cl("flex flex-col border-r", t.border, t.tile) },
-        h("div", { className: "p-3" },
+      // Mobile-only backdrop behind the drawer. Renders when the drawer is
+      // open; tap to close. Hidden on md+ where the sidebar is always in flow.
+      sidebarOpen ? h("div", {
+        className: "fixed inset-0 z-30 bg-black/60 md:hidden",
+        onClick: closeSidebar,
+        "aria-hidden": "true",
+      }) : null,
+
+      // Sidebar.
+      // Mobile: fixed drawer, slides in from left.
+      // Desktop: static column in the flex row, always visible.
+      h("aside", {
+        className: cl(
+          "flex flex-col border-r",
+          t.border, t.tile,
+          "fixed inset-y-0 left-0 z-40 w-72 shadow-2xl transform transition-transform duration-200 ease-out",
+          sidebarOpen ? "translate-x-0" : "-translate-x-full",
+          "md:static md:inset-auto md:w-60 md:flex-shrink-0 md:translate-x-0 md:shadow-none md:transition-none"
+        ),
+        "aria-label": "Chat sessions",
+      },
+        h("div", { className: "p-3 flex items-center gap-2" },
           h("button", {
-            onClick: newChat,
-            className: "w-full py-2 rounded-xl text-sm font-semibold bg-teal-600 hover:bg-teal-500 text-white transition",
+            onClick: closeSidebar,
+            className: "md:hidden w-11 h-11 rounded-xl flex items-center justify-center text-zinc-300 hover:bg-white/[0.05]",
+            "aria-label": "Close sessions",
+          }, "\u2715"),
+          h("button", {
+            onClick: function () { newChat(); closeSidebar(); },
+            className: "flex-1 min-h-[44px] rounded-xl text-sm font-semibold bg-teal-600 hover:bg-teal-500 text-white transition",
           }, "+ New chat")
         ),
         h("div", { className: "flex-1 overflow-y-auto px-2 pb-3 space-y-1" },
@@ -440,23 +511,38 @@
                   theme: t,
                   session: s,
                   active: s.id === activeId,
-                  onSelect: function () { setActiveId(s.id); },
+                  onSelect: function () { setActiveId(s.id); closeSidebar(); },
                   onDelete: deleteSession,
                 });
               })
         )
       ),
-      // Right pane
-      h("div", { className: "flex flex-col min-w-0 min-h-0" },
-        h("div", { ref: scrollRef, className: "flex-1 overflow-y-auto px-5 py-4 min-h-0" },
+
+      // Main pane (messages + composer).
+      h("div", { className: "flex-1 flex flex-col min-w-0 min-h-0" },
+        // Mobile top bar: hamburger + current session title. Desktop hides this.
+        h("div", {
+          className: cl("md:hidden flex items-center gap-2 px-2 py-2 border-b", t.border),
+        },
+          h("button", {
+            onClick: openSidebar,
+            className: "w-11 h-11 rounded-xl flex items-center justify-center text-zinc-300 hover:bg-white/[0.05]",
+            "aria-label": "Open sessions",
+          }, h(HamburgerIcon)),
+          h("div", { className: cl("flex-1 min-w-0 truncate text-sm font-medium", t.text) }, mobileTitle)
+        ),
+
+        h("div", { ref: scrollRef, className: "flex-1 overflow-y-auto px-4 md:px-5 py-4 min-h-0" },
           messages.length === 0
             ? h(EmptyState, { theme: t, suggestPrompts: prompts, onSuggest: function (p) { send(p); } })
             : messages.map(function (m, i) {
                 return h(MessageRow, { key: i, theme: t, message: m, streaming: !!m.streaming });
               })
         ),
-        error ? h("div", { className: "mx-5 mb-2 text-xs px-3 py-2 rounded-lg border border-red-800/50 bg-red-900/20 text-red-300 font-mono" }, "error: " + error) : null,
-        h("div", { className: "px-4 pb-4 pt-2 flex-shrink-0" },
+        error ? h("div", { className: "mx-4 md:mx-5 mb-2 text-xs px-3 py-2 rounded-lg border border-red-800/50 bg-red-900/20 text-red-300 font-mono" }, "error: " + error) : null,
+        // chat-composer-wrap carries the safe-area-inset-bottom padding so the
+        // composer clears the iOS home indicator on notched phones.
+        h("div", { className: "chat-composer-wrap px-3 md:px-4 pt-2 flex-shrink-0" },
           h(Composer, {
             theme: t,
             value: input,
