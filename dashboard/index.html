@@ -54,6 +54,31 @@
     .chat-composer textarea { box-shadow: none !important; }
     .chat-composer textarea:focus { box-shadow: none !important; outline: none !important; }
     .chat-composer:focus-within { box-shadow: 0 0 0 3px rgba(20,184,166,0.15); border-color: rgba(20,184,166,0.6); }
+
+    /* ── Chat shell responsive sizing ────────────────────────────
+       Desktop: subtract the full dashboard chrome (header + nav + footer + padding).
+       Mobile: smaller chrome, no footer takes the full visible area; 100dvh gives
+       us the *dynamic* viewport height so the iOS URL bar collapsing/expanding
+       doesn't cause layout jumps. Fall back to 100vh on engines without dvh. */
+    .chat-shell { height: calc(100vh - 240px); min-height: 520px; }
+    @supports (height: 100dvh) {
+      .chat-shell { height: calc(100dvh - 240px); }
+    }
+    @media (max-width: 767px) {
+      .chat-shell {
+        height: calc(100vh - 180px);
+        min-height: 420px;
+      }
+      @supports (height: 100dvh) {
+        .chat-shell { height: calc(100dvh - 180px); }
+      }
+      /* iOS auto-zooms on input focus when font-size is < 16px. Force 16px on
+         the composer textarea (scoped to mobile only so desktop stays compact). */
+      .chat-composer textarea { font-size: 16px !important; }
+    }
+    /* Respect the home-indicator / notch on phones — scope to the chat composer
+       so it doesn't affect other dashboard surfaces. */
+    .chat-composer-wrap { padding-bottom: max(1rem, env(safe-area-inset-bottom)); }
   </style>
 </head>
 <body>

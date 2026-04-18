@@ -36,6 +36,23 @@
     .chat-composer textarea { box-shadow: none !important; }
     .chat-composer textarea:focus { box-shadow: none !important; outline: none !important; }
     .chat-composer:focus-within { box-shadow: 0 0 0 3px rgba(20,184,166,0.15); border-color: rgba(20,184,166,0.6); }
+
+    /* Responsive chat shell — see dashboard/index.html for the full rationale. */
+    .chat-shell { height: calc(100vh - 120px); min-height: 520px; }
+    @supports (height: 100dvh) {
+      .chat-shell { height: calc(100dvh - 120px); }
+    }
+    @media (max-width: 767px) {
+      .chat-shell {
+        height: calc(100vh - 100px);
+        min-height: 420px;
+      }
+      @supports (height: 100dvh) {
+        .chat-shell { height: calc(100dvh - 100px); }
+      }
+      .chat-composer textarea { font-size: 16px !important; }
+    }
+    .chat-composer-wrap { padding-bottom: max(1rem, env(safe-area-inset-bottom)); }
   </style>
 </head>
 <body>
