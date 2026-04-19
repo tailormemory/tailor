@@ -543,6 +543,41 @@ class BearerAuthMiddleware:
                 config_path = os.path.join(BASE_DIR, "config", "tailor.yaml")
                 return _json_response(read_current(config_path))
 
+            elif path == "/api/dashboard/config/backups":
+                # List the rolling backup snapshots, newest first. The
+                # UI backups panel renders this directly; the "Restore"
+                # button on each row POSTs to /restore below.
+                from scripts.lib.config_runtime import list_backups
+                config_path = os.path.join(BASE_DIR, "config", "tailor.yaml")
+                return _json_response({"backups": list_backups(config_path)})
+
+            elif path == "/api/dashboard/config/restore":
+                # Replace tailor.yaml with the contents of the named
+                # backup (full replace, not a merge). Goes through the
+                # same write + marker + reload + revert pipeline as
+                # /save, so the UX around a broken restore matches the
+                # UX around a broken save.
+                body = await _receive_body(scope, receive)
+                import json as _jcfg
+                try:
+                    data = _jcfg.loads(body) if body else {}
+                except Exception:
+                    return _json_response({"error": "Invalid JSON body"}, 400)
+                filename = (data.get("filename") or "").strip() if isinstance(data, dict) else ""
+                from scripts.lib.config_runtime import restore_backup, ConfigSaveError
+                config_path = os.path.join(BASE_DIR, "config", "tailor.yaml")
+                try:
+                    result = restore_backup(filename, config_path)
+                except ConfigSaveError as e:
+                    return _json_response({"error": e.message}, e.status)
+                return _json_response({
+                    "ok": True,
+                    "message": "Restored",
+                    "restored_from": result["restored_from"],
+                    "backup": result["backup"],
+                    "reloaded": result["reloaded"],
+                })
+
             elif path == "/api/dashboard/config/restart":
                 # Force restart: SIGTERM to self, LaunchDaemon KeepAlive
                 # relaunches us in ~5s. We schedule the kill on a background

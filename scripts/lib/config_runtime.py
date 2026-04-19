@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -473,38 +474,53 @@ def save_config(
     if dry_run:
         return {"ok": True, "dry_run": True, "backup": "", "reloaded": {}}
 
+    return _apply_validated(merged, config_path)
+
+
+def _apply_validated(final_config: dict, config_path: str) -> dict[str, Any]:
+    """The risky tail of save_config, shared with restore_backup.
+
+    Assumes `final_config` is the COMPLETE target state — no further
+    merging. Handles backup → write → marker → soft_reload → revert, in
+    that order, so both entry points produce the same invariants:
+
+      - a .backups/ snapshot of the pre-change state
+      - a .pending-save marker protecting the transition for SAFETY_WINDOW
+      - singletons resynced to the new state, OR yaml reverted and the
+        marker cleared if soft_reload raised
+
+    Keep this function single-copy. Duplicating it across save and restore
+    is how subtle divergences creep in (one flow grows a check the other
+    doesn't, rollback paths drift).
+    """
     backup_path = create_backup(config_path)
 
     try:
         os.makedirs(os.path.dirname(os.path.abspath(config_path)), exist_ok=True)
         with open(config_path, "w") as f:
             yaml.safe_dump(
-                merged, f, default_flow_style=False, allow_unicode=True, sort_keys=False
+                final_config, f, default_flow_style=False, allow_unicode=True, sort_keys=False
             )
     except Exception as e:
         raise ConfigSaveError(500, f"Failed to write config: {e}")
 
-    # Write the pending-save marker BEFORE reloading singletons. If the
-    # process dies during soft_reload — or the reload succeeds but a later
-    # request crashes hard within SAFETY_WINDOW_SECONDS — the next boot
-    # rolls back to `backup_path`.
+    # Marker BEFORE reloading singletons. If the process dies during
+    # soft_reload — or reload succeeds but a later request crashes hard
+    # within SAFETY_WINDOW_SECONDS — the next boot rolls back to backup_path.
     backup_name = os.path.basename(backup_path) if backup_path else ""
     write_pending_save(config_path, backup_name)
 
     try:
         reloaded = soft_reload()
     except Exception as e:
-        # Reload crashed unexpectedly. Revert in-process so the live file
-        # matches the live (old) singletons; marker is cleared inside
-        # _revert_after_reload_failure so the next boot doesn't double-revert.
         _revert_after_reload_failure(config_path, backup_path, e)
         raise ConfigSaveError(
             500, f"Soft-reload failed, config reverted: {e}"
         )
 
-    # Leave .pending-save on disk — it's the safety net for crashes that
-    # happen AFTER this call returns (e.g. first API request hits a lazy
-    # init that the new config breaks). It'll be cleared by the next boot.
+    # Leave .pending-save on disk — safety net for crashes after we return
+    # (e.g. first API request hits a lazy init the new config breaks). It'll
+    # be cleared by the next boot via apply_pending_rollback.
 
     return {
         "ok": True,
@@ -579,3 +595,132 @@ def parse_incoming(body: Any) -> dict:
     # Bare dict — treat the whole body as the config (preserves Setup
     # Wizard's existing contract, which posts sections at the top level).
     return body
+
+
+# ── Backup listing + restore ────────────────────────────────────
+#
+# Both ride on the primitives defined above: list_backups reads the same
+# directory create_backup writes to, and restore_backup funnels through
+# _apply_validated so a restore is subject to the exact same validation,
+# marker, and revert-on-reload-failure guarantees as a save.
+
+
+# Filename format laid down by create_backup: tailor-YYYYMMDD-HHMMSS.yaml,
+# with an optional "-N" tiebreaker for the same-second collision case.
+_BACKUP_NAME_RE = re.compile(r"^tailor-(\d{8})-(\d{6})(?:-\d+)?\.yaml$")
+
+
+def _parse_backup_iso(filename: str) -> str:
+    """Extract ISO 8601 timestamp from a backup filename, or '' if the name
+    doesn't match our format. Prefer this over mtime: shutil.copy2 preserves
+    the source's mtime, so mtime reflects the last edit of the *original*
+    yaml, not when the backup was created."""
+    m = _BACKUP_NAME_RE.match(filename)
+    if not m:
+        return ""
+    try:
+        return datetime.strptime(
+            m.group(1) + m.group(2), "%Y%m%d%H%M%S"
+        ).isoformat()
+    except ValueError:
+        return ""
+
+
+def list_backups(config_path: str) -> list[dict[str, Any]]:
+    """Return backup snapshots sorted newest-first.
+
+    Sort key is the filename (lexicographic), matching the order
+    create_backup uses when rotating — so "most recent at index 0" is
+    consistent between list and rotation.
+    """
+    bdir = backup_dir_for(config_path)
+    if not os.path.isdir(bdir):
+        return []
+    out: list[dict[str, Any]] = []
+    for fname in os.listdir(bdir):
+        if not _BACKUP_NAME_RE.match(fname):
+            continue
+        full = os.path.join(bdir, fname)
+        try:
+            st = os.stat(full)
+        except OSError:
+            continue
+        out.append({
+            "filename": fname,
+            "saved_at": _parse_backup_iso(fname),
+            "size_bytes": st.st_size,
+        })
+    out.sort(key=lambda e: e["filename"], reverse=True)
+    return out
+
+
+def _resolve_backup_path(filename: str, config_path: str) -> str:
+    """Validate `filename` refers to a real backup inside .backups/ and
+    return its absolute path. Raises ConfigSaveError on anything suspicious.
+
+    Defense in depth:
+      - reject path separators and parent-dir refs (prevents `../../etc/passwd`)
+      - reject hidden files / wrong prefix / wrong extension (only files
+        create_backup itself produces should be restorable)
+      - resolve the final path and require it to live inside .backups/
+        (catches symlink tricks and any escape the regex didn't)
+    """
+    if not isinstance(filename, str) or not filename:
+        raise ConfigSaveError(400, "filename is required")
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise ConfigSaveError(400, f"Invalid filename: {filename!r}")
+    if not _BACKUP_NAME_RE.match(filename):
+        raise ConfigSaveError(
+            400,
+            f"Filename must match tailor-YYYYMMDD-HHMMSS.yaml: {filename!r}",
+        )
+
+    bdir = backup_dir_for(config_path)
+    bdir_abs = os.path.realpath(bdir)
+    full = os.path.realpath(os.path.join(bdir, filename))
+
+    if os.path.commonpath([full, bdir_abs]) != bdir_abs:
+        raise ConfigSaveError(400, "Path traversal blocked")
+
+    if not os.path.isfile(full):
+        raise ConfigSaveError(404, f"Backup not found: {filename}")
+
+    return full
+
+
+def restore_backup(filename: str, config_path: str) -> dict[str, Any]:
+    """Replace tailor.yaml with the contents of `filename` (a backup under
+    .backups/). Not a merge — the backup IS the target state.
+
+    Rides on _apply_validated, so:
+      - a fresh backup of the CURRENT state is taken before the restore
+        (that's what rollback would revert to if the restored content
+        turns out to break something)
+      - .pending-save marker points at the pre-restore backup, so a
+        crash inside SAFETY_WINDOW triggers auto-rollback to where
+        the user was before clicking "restore"
+      - soft_reload / revert behavior is identical to save
+
+    No blacklist check: restoring is "put me back to this exact state
+    I was in before", and anything in the backup was on disk already.
+    The write-side blacklist stops fresh UI edits into auth/paths/etc.,
+    which is a different concern.
+    """
+    full = _resolve_backup_path(filename, config_path)
+
+    try:
+        with open(full) as f:
+            parsed = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        raise ConfigSaveError(400, f"Backup is not parseable YAML: {e}")
+
+    if not isinstance(parsed, dict):
+        raise ConfigSaveError(400, "Backup root is not a mapping")
+
+    ok, err = validate_loadable(parsed)
+    if not ok:
+        raise ConfigSaveError(400, f"Backup failed validation: {err}")
+
+    result = _apply_validated(parsed, config_path)
+    result["restored_from"] = filename
+    return result

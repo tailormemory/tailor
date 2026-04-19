@@ -28,8 +28,10 @@ from scripts.lib.config_runtime import (  # noqa: E402
     apply_pending_rollback,
     check_blacklist,
     create_backup,
+    list_backups,
     parse_incoming,
     read_current,
+    restore_backup,
     save_config,
     soft_reload,
     validate_loadable,
@@ -770,3 +772,273 @@ def test_soft_reload_failure_with_no_backup_logs_and_raises(tmp_path, monkeypatc
     # loudly, and the user can recover manually. What we must NOT have is
     # a leftover marker pointing at an empty backup.
     assert not os.path.exists(_marker_path(str(cfg_path)))
+
+
+# ── list_backups ────────────────────────────────────────────────
+
+
+def test_list_backups_empty_when_no_dir(tmp_path):
+    cfg_path = str(tmp_path / "config" / "tailor.yaml")
+    assert list_backups(cfg_path) == []
+
+
+def test_list_backups_returns_metadata(config_path):
+    save_config({"user": {"name": "A"}}, config_path)
+    save_config({"user": {"name": "B"}}, config_path)
+
+    entries = list_backups(config_path)
+
+    assert len(entries) == 2
+    for e in entries:
+        assert set(e.keys()) == {"filename", "saved_at", "size_bytes"}
+        assert e["filename"].startswith("tailor-") and e["filename"].endswith(".yaml")
+        assert e["size_bytes"] > 0
+        # saved_at is ISO 8601 parsed from the filename.
+        assert "T" in e["saved_at"]
+
+
+def test_list_backups_sorted_newest_first(config_path):
+    # Seed backups with known lexicographic order — oldest first, newest last.
+    bdir = config_runtime.backup_dir_for(config_path)
+    os.makedirs(bdir, exist_ok=True)
+    names = [
+        "tailor-20240101-000000.yaml",
+        "tailor-20250606-120000.yaml",
+        "tailor-20260419-090000.yaml",
+    ]
+    for n in names:
+        with open(os.path.join(bdir, n), "w") as f:
+            f.write("seed: true\n")
+
+    entries = list_backups(config_path)
+
+    # Newest-first: reverse lexicographic. Matches the rotation sort so
+    # "most recent" in the UI = "most recent" in the rotation logic.
+    assert [e["filename"] for e in entries] == list(reversed(names))
+
+
+def test_list_backups_ignores_non_matching_files(config_path):
+    bdir = config_runtime.backup_dir_for(config_path)
+    os.makedirs(bdir, exist_ok=True)
+    # Files that should be ignored:
+    with open(os.path.join(bdir, "README.md"), "w") as f:
+        f.write("notes\n")
+    with open(os.path.join(bdir, "tailor.yaml"), "w") as f:  # wrong format
+        f.write("x: 1\n")
+    with open(os.path.join(bdir, ".hidden"), "w") as f:
+        f.write("x: 1\n")
+    # One legit backup:
+    with open(os.path.join(bdir, "tailor-20260101-010101.yaml"), "w") as f:
+        f.write("x: 1\n")
+
+    entries = list_backups(config_path)
+
+    assert len(entries) == 1
+    assert entries[0]["filename"] == "tailor-20260101-010101.yaml"
+
+
+def test_list_backups_tolerates_collision_suffix(config_path):
+    bdir = config_runtime.backup_dir_for(config_path)
+    os.makedirs(bdir, exist_ok=True)
+    # create_backup uses "tailor-...-N.yaml" on same-second collisions.
+    for n in ["tailor-20260101-010101.yaml", "tailor-20260101-010101-1.yaml"]:
+        with open(os.path.join(bdir, n), "w") as f:
+            f.write("x: 1\n")
+    entries = list_backups(config_path)
+    # Both are recognised by the regex and included. Within-second ordering
+    # isn't chronologically meaningful here (ASCII '-' < '.', so the "-1"
+    # suffix sorts before the plain name) — an acceptable quirk given how
+    # rare two saves per second is. The invariant the UI cares about is
+    # "all backups visible"; same-second siblings can swap positions.
+    assert {e["filename"] for e in entries} == set([
+        "tailor-20260101-010101.yaml",
+        "tailor-20260101-010101-1.yaml",
+    ])
+
+
+# ── restore_backup — filename validation ─────────────────────────
+
+
+@pytest.mark.parametrize("bad", [
+    "../etc/passwd",
+    "../../tailor.yaml",
+    "/etc/passwd",
+    "..",
+    "foo/bar.yaml",
+    "tailor-20260101-010101/evil.yaml",
+])
+def test_restore_rejects_path_traversal(config_path, bad):
+    with pytest.raises(ConfigSaveError) as exc:
+        restore_backup(bad, config_path)
+    assert exc.value.status == 400
+
+
+@pytest.mark.parametrize("bad", [
+    ".pending-save",
+    ".hidden.yaml",
+    "tailor.yaml",              # missing timestamp
+    "tailor-bad.yaml",          # malformed timestamp
+    "backup-20260101-010101.yaml",  # wrong prefix
+    "tailor-20260101-010101.txt",    # wrong extension
+    "",
+])
+def test_restore_rejects_bad_filename(config_path, bad):
+    with pytest.raises(ConfigSaveError) as exc:
+        restore_backup(bad, config_path)
+    assert exc.value.status == 400
+
+
+def test_restore_missing_file_404(config_path):
+    with pytest.raises(ConfigSaveError) as exc:
+        restore_backup("tailor-19990101-000000.yaml", config_path)
+    assert exc.value.status == 404
+
+
+def test_restore_rejects_non_string_filename(config_path):
+    with pytest.raises(ConfigSaveError) as exc:
+        restore_backup(None, config_path)  # type: ignore[arg-type]
+    assert exc.value.status == 400
+
+
+# ── restore_backup — happy path ──────────────────────────────────
+
+
+def test_restore_is_full_replace_not_merge(config_path):
+    """Restore must produce yaml content EQUAL to the backup, not a merge.
+    If someone 'fixes' this by funneling through save_config unmodified,
+    this test will catch it: the merge would leave embedding/user from the
+    current config in place, but restore must drop them to match the backup.
+    """
+    # Current config has llm + embedding + user. Stash a backup that contains
+    # ONLY llm (no embedding, no user) and restore it.
+    bdir = config_runtime.backup_dir_for(config_path)
+    os.makedirs(bdir, exist_ok=True)
+    backup_name = "tailor-20260419-120000.yaml"
+    backup_content = yaml.safe_dump({"llm": {"provider": "google", "model": "gemini-2.5-flash"}})
+    with open(os.path.join(bdir, backup_name), "w") as f:
+        f.write(backup_content)
+
+    restore_backup(backup_name, config_path)
+
+    restored = yaml.safe_load(open(config_path).read())
+    assert restored == {"llm": {"provider": "google", "model": "gemini-2.5-flash"}}
+    # Crucially: embedding and user are GONE, not merged from the old live config.
+    assert "embedding" not in restored
+    assert "user" not in restored
+
+
+def test_restore_takes_backup_of_current_before_replacing(config_path):
+    # Seed a backup file to restore from.
+    bdir = config_runtime.backup_dir_for(config_path)
+    os.makedirs(bdir, exist_ok=True)
+    target = "tailor-20260419-120000.yaml"
+    with open(os.path.join(bdir, target), "w") as f:
+        f.write("llm:\n  provider: google\n")
+
+    pre_restore_content = open(config_path).read()
+
+    result = restore_backup(target, config_path)
+
+    # A NEW backup must have been created capturing the pre-restore state,
+    # so an "undo the restore" is as simple as restoring THAT backup.
+    new_backup_name = result["backup"]
+    assert new_backup_name and new_backup_name != target
+    new_backup_path = os.path.join(bdir, new_backup_name)
+    assert os.path.exists(new_backup_path)
+    assert open(new_backup_path).read() == pre_restore_content
+
+
+def test_restore_writes_pending_save_marker(config_path):
+    bdir = config_runtime.backup_dir_for(config_path)
+    os.makedirs(bdir, exist_ok=True)
+    target = "tailor-20260419-120000.yaml"
+    with open(os.path.join(bdir, target), "w") as f:
+        f.write("llm:\n  provider: google\n")
+
+    result = restore_backup(target, config_path)
+
+    marker = _marker_path(config_path)
+    assert os.path.exists(marker)
+    # Marker points at the PRE-restore backup (the fresh one created above),
+    # not at the target backup. So a crash inside the safety window rolls
+    # back to where the user was before they clicked restore.
+    import json as _j
+    payload = _j.loads(open(marker).read())
+    assert payload["backup"] == result["backup"]
+    assert payload["backup"] != target
+
+
+def test_restore_returns_restored_from_field(config_path):
+    bdir = config_runtime.backup_dir_for(config_path)
+    os.makedirs(bdir, exist_ok=True)
+    target = "tailor-20260419-120000.yaml"
+    with open(os.path.join(bdir, target), "w") as f:
+        f.write("llm:\n  provider: google\n")
+
+    result = restore_backup(target, config_path)
+
+    assert result["restored_from"] == target
+    assert result["ok"] is True
+
+
+def test_restore_rejects_backup_with_unparseable_yaml(config_path):
+    bdir = config_runtime.backup_dir_for(config_path)
+    os.makedirs(bdir, exist_ok=True)
+    bad = "tailor-20260419-120000.yaml"
+    with open(os.path.join(bdir, bad), "w") as f:
+        f.write("llm:\n  provider: [unclosed\n")
+
+    original = open(config_path).read()
+    with pytest.raises(ConfigSaveError) as exc:
+        restore_backup(bad, config_path)
+    assert exc.value.status == 400
+    # Live config untouched — we detected the bad backup before any write.
+    assert open(config_path).read() == original
+
+
+def test_restore_reload_failure_triggers_revert(config_path, monkeypatch):
+    """Same revert machinery as save — a restore that breaks soft_reload
+    must leave the live config equal to its PRE-restore state, and clear
+    the marker so the next boot doesn't double-revert."""
+    bdir = config_runtime.backup_dir_for(config_path)
+    os.makedirs(bdir, exist_ok=True)
+    target = "tailor-20260419-120000.yaml"
+    with open(os.path.join(bdir, target), "w") as f:
+        f.write("llm:\n  provider: google\n")
+
+    original = open(config_path).read()
+
+    original_soft_reload = config_runtime.soft_reload
+    calls = {"n": 0}
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("restore reload boom")
+        return original_soft_reload()
+    monkeypatch.setattr(config_runtime, "soft_reload", flaky)
+
+    with pytest.raises(ConfigSaveError) as exc:
+        restore_backup(target, config_path)
+    assert exc.value.status == 500
+
+    # Pre-restore content is back — restore failed closed.
+    assert open(config_path).read() == original
+    assert not os.path.exists(_marker_path(config_path))
+
+
+def test_restore_does_not_honour_blacklist(config_path):
+    """A backup is a snapshot of real state that was on disk. If it contains
+    an auth section (because that's what the user had), restoring must put
+    it back. The blacklist stops fresh UI *edits* into auth/paths/etc., a
+    different concern."""
+    bdir = config_runtime.backup_dir_for(config_path)
+    os.makedirs(bdir, exist_ok=True)
+    target = "tailor-20260419-120000.yaml"
+    with open(os.path.join(bdir, target), "w") as f:
+        f.write("auth:\n  token: previous_token\nllm:\n  provider: anthropic\n")
+
+    result = restore_backup(target, config_path)
+
+    assert result["ok"] is True
+    restored = yaml.safe_load(open(config_path).read())
+    assert restored["auth"]["token"] == "previous_token"
