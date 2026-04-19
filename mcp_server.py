@@ -473,42 +473,23 @@ class BearerAuthMiddleware:
 
             elif path == "/api/dashboard/config/save":
                 body = await _receive_body(scope, receive)
-                import json as _jcfg, yaml as _ycfg
+                import json as _jcfg
                 try:
                     data = _jcfg.loads(body) if body else {}
                 except Exception:
                     return _json_response({"error": "Invalid JSON body"}, 400)
-                if not data:
-                    return _json_response({"error": "Empty config"}, 400)
+                from scripts.lib.config_runtime import save_config, ConfigSaveError
                 config_path = os.path.join(BASE_DIR, "config", "tailor.yaml")
-                # If existing config, load and merge
-                existing = {}
-                if os.path.exists(config_path):
-                    try:
-                        with open(config_path) as _cf:
-                            existing = _ycfg.safe_load(_cf) or {}
-                    except Exception:
-                        existing = {}
-                # Deep merge: incoming sections overwrite existing sections
-                for section, values in data.items():
-                    if isinstance(values, dict) and isinstance(existing.get(section), dict):
-                        existing[section].update(values)
-                    else:
-                        existing[section] = values
-                # Write YAML
                 try:
-                    with open(config_path, "w") as _cf:
-                        _ycfg.dump(existing, _cf, default_flow_style=False, allow_unicode=True, sort_keys=False)
-                    # Force config reload on next access
-                    try:
-                        from scripts.lib.config import _config
-                        import scripts.lib.config as _cfg_mod
-                        _cfg_mod._config = None
-                    except Exception:
-                        pass
-                    return _json_response({"ok": True, "message": "Config saved"})
-                except Exception as e:
-                    return _json_response({"error": f"Failed to write config: {e}"}, 500)
+                    result = save_config(data, config_path)
+                except ConfigSaveError as e:
+                    return _json_response({"error": e.message}, e.status)
+                return _json_response({
+                    "ok": True,
+                    "message": "Config saved",
+                    "backup": result["backup"],
+                    "reloaded": result["reloaded"],
+                })
 
             # ── Upload conversation files ──
             elif path == "/api/dashboard/upload":

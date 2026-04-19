@@ -16,6 +16,7 @@ logs/
 
 # ── Config with secrets ──────────────────────────────────────
 config/tailor.yaml
+config/.backups/
 
 # ── Archive (old scripts, backups, dated READMEs) ────────────
 archive/
