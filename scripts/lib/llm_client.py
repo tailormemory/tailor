@@ -627,6 +627,81 @@ def get_brain() -> LLMClient:
         _brain = cls(cfg)
     return _brain
 
+
+# Per-provider env-var names for API keys. Same precedence as the existing
+# config-file paths: if llm.api_key is left as ${ANTHROPIC_API_KEY} etc. the
+# env var wins. `build_brain` uses these directly to avoid depending on the
+# default llm config when the caller explicitly picks a different provider.
+_PROVIDER_API_KEY_ENV = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "google": "GOOGLE_API_KEY",
+    "ollama": None,  # no key — local endpoint
+}
+
+
+def build_brain(provider: str, model: str) -> LLMClient:
+    """Build an LLM client ad-hoc for a specific provider/model.
+
+    Unlike `get_brain()`, this does NOT cache — each call returns a fresh
+    instance. Used by the chat API to honour a session's pinned
+    provider/model without mutating the process-wide singleton.
+
+    Behaviour:
+      * `provider` must be a key of `_PROVIDERS`; otherwise ValueError.
+      * `model` is passed through to the provider constructor as-is.
+      * For cloud providers (anthropic, openai, google), the API key is
+        read from the corresponding env var. If missing, raise ValueError
+        with a clear message so the caller can surface a 400 rather than
+        letting an opaque 500 escape at first HTTP call.
+      * For ollama, the `base_url` and `keep_alive` settings are inherited
+        from the default llm config if present (otherwise the defaults
+        baked into `OllamaClient.__init__` apply).
+      * `max_tokens` / `temperature` are inherited from the default llm
+        config so per-session brains match the cost/behaviour envelope of
+        the default brain. This also lets `chat_interface.system_prompt`
+        reasoning stay consistent across providers.
+
+    The returned client is short-lived (build per request). That's fine
+    for cloud providers (stateless HTTP) and for ollama (requests
+    wrapper); no hidden resources to tear down.
+    """
+    cls = _PROVIDERS.get(provider)
+    if not cls:
+        raise ValueError(
+            f"Unknown LLM provider: {provider!r}. Supported: {sorted(_PROVIDERS.keys())}"
+        )
+    if not model or not isinstance(model, str):
+        raise ValueError("build_brain() requires a non-empty model string")
+
+    # Inherit knobs from the default llm config so per-session clients
+    # have sensible defaults without forcing the caller to repeat them.
+    default_cfg = get("llm") or {}
+    cfg: dict = {
+        "provider": provider,
+        "model": model,
+        "max_tokens": default_cfg.get("max_tokens", 1000),
+        "temperature": default_cfg.get("temperature", 0.3),
+        "tool_use": default_cfg.get("tool_use", True),
+    }
+
+    env_name = _PROVIDER_API_KEY_ENV.get(provider)
+    if env_name:
+        key = os.environ.get(env_name, "")
+        if not key:
+            raise ValueError(
+                f"Missing API key: set {env_name} to use provider {provider!r}."
+            )
+        cfg["api_key"] = key
+    if provider == "ollama":
+        # Preserve user-configured ollama endpoint / keep_alive if any.
+        if default_cfg.get("provider") == "ollama":
+            for k in ("base_url", "keep_alive"):
+                if k in default_cfg:
+                    cfg[k] = default_cfg[k]
+
+    return cls(cfg)
+
 def get_classifier() -> LLMClient:
     """Get the classifier LLM client — singleton."""
     global _classifier
