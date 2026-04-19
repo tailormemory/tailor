@@ -484,6 +484,69 @@ class OpenAIClient(LLMClient):
 
 
 # ═══════════════════════════════════════════════════════════════
+# DeepSeek (OpenAI-compatible API)
+# ═══════════════════════════════════════════════════════════════
+
+class DeepSeekClient(OpenAIClient):
+    """DeepSeek client. API is OpenAI-compatible; only the endpoint differs.
+    
+    DeepSeek offers V3.2 (general chat) and R1 (reasoning) via the same schema.
+    See https://api-docs.deepseek.com/ — /chat/completions accepts the same
+    payload as OpenAI, including tool use.
+    """
+    
+    _ENDPOINT = "https://api.deepseek.com/v1/chat/completions"
+    
+    def _call_api(self, system: str, messages: list[dict], tools: list = None, max_tokens: int = 0):
+        oai_msgs = [{"role": "system", "content": system}] + messages
+        payload = {
+            "model": self.model,
+            "messages": oai_msgs,
+            "max_tokens": max_tokens or self.max_tokens,
+            "temperature": self.temperature,
+        }
+        if tools:
+            payload["tools"] = [{"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["input_schema"]}} for t in tools]
+        resp = requests.post(
+            self._ENDPOINT,
+            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+            json=payload, timeout=60,
+        )
+        return resp.json()
+    
+    def chat_with_tools(self, system: str, messages: list[dict], tools: list = None) -> str:
+        tools = tools or TOOLS
+        oai_msgs = [{"role": "system", "content": system}] + list(messages)
+        
+        for _ in range(5):
+            payload = {
+                "model": self.model,
+                "messages": oai_msgs,
+                "max_tokens": self.max_tokens,
+                "temperature": self.temperature,
+                "tools": [{"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["input_schema"]}} for t in tools],
+            }
+            resp = requests.post(
+                self._ENDPOINT,
+                headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+                json=payload, timeout=60,
+            )
+            data = resp.json()
+            msg = data.get("choices", [{}])[0].get("message", {})
+            
+            if not msg.get("tool_calls"):
+                return msg.get("content", "").strip()
+            
+            oai_msgs.append(msg)
+            for tc in msg["tool_calls"]:
+                args = json.loads(tc["function"]["arguments"])
+                result = _mcp_call(tc["function"]["name"], args)
+                oai_msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+        
+        return "Max tool iterations reached."
+
+
+# ═══════════════════════════════════════════════════════════════
 # Google (Gemini)
 # ═══════════════════════════════════════════════════════════════
 
@@ -611,6 +674,7 @@ _PROVIDERS = {
     "openai": OpenAIClient,
     "google": GoogleClient,
     "ollama": OllamaClient,
+    "deepseek": DeepSeekClient,
 }
 
 _brain = None
@@ -637,6 +701,7 @@ _PROVIDER_API_KEY_ENV = {
     "openai": "OPENAI_API_KEY",
     "google": "GOOGLE_API_KEY",
     "ollama": None,  # no key — local endpoint
+    "deepseek": "DEEPSEEK_API_KEY",
 }
 
 

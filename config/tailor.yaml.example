@@ -177,7 +177,8 @@ chat_interface:
   # brain (from llm.* above) and the dropdown is hidden.
   # `label` is free-form; omit it to fall back to "<provider>/<model>".
   # Cloud providers need their API key in the corresponding env var
-  # (ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY). Ollama needs none.
+  # (ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY / DEEPSEEK_API_KEY).
+  # Ollama needs none.
   # available_providers:
   #   - provider: anthropic
   #     model: claude-haiku-4-5-20251001
@@ -191,6 +192,9 @@ chat_interface:
   #   - provider: google
   #     model: gemini-2.5-flash
   #     label: "Gemini 2.5 Flash"
+  #   - provider: deepseek
+  #     model: deepseek-chat
+  #     label: "DeepSeek V3.2"
 
 # ── Cloud Sync ────────────────────────────────────────────────
 # Cloud storage providers to sync before document ingest.
