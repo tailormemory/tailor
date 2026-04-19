@@ -486,12 +486,19 @@ class BearerAuthMiddleware:
                 })
 
             elif path == "/api/dashboard/config/save":
+                # All config endpoints follow the same response contract:
+                #   success → {"ok": true, ...payload}          HTTP 200
+                #   error   → {"ok": false, "error", "status"}  HTTP <status>
+                # The frontend has a single apiCall() helper that reads that
+                # shape — don't diverge from it unless you update apiCall too.
                 body = await _receive_body(scope, receive)
                 import json as _jcfg
                 try:
                     data = _jcfg.loads(body) if body else {}
                 except Exception:
-                    return _json_response({"error": "Invalid JSON body"}, 400)
+                    return _json_response(
+                        {"ok": False, "error": "Invalid JSON body", "status": 400}, 400
+                    )
                 from scripts.lib.config_runtime import (
                     save_config, parse_incoming, ConfigSaveError,
                 )
@@ -500,7 +507,10 @@ class BearerAuthMiddleware:
                     incoming = parse_incoming(data)
                     result = save_config(incoming, config_path)
                 except ConfigSaveError as e:
-                    return _json_response({"error": e.message}, e.status)
+                    return _json_response(
+                        {"ok": False, "error": e.message, "status": e.status},
+                        e.status,
+                    )
                 return _json_response({
                     "ok": True,
                     "message": "Config saved",
@@ -511,15 +521,19 @@ class BearerAuthMiddleware:
             elif path == "/api/dashboard/config/validate":
                 # Dry-run variant of /save. Runs the exact same pipeline
                 # (blacklist + merge + validate_loadable) but stops before
-                # any disk write or singleton reset — so the UI can give
-                # instant feedback on the YAML editor without side effects.
+                # any disk write or singleton reset.
+                #
+                # Returns the same {ok, error, status} contract as every
+                # other mutating endpoint — including the HTTP status code
+                # matching the failure. The UI can treat validate and save
+                # errors with the same handler.
                 body = await _receive_body(scope, receive)
                 import json as _jcfg
                 try:
                     data = _jcfg.loads(body) if body else {}
                 except Exception:
                     return _json_response(
-                        {"valid": False, "error": "Invalid JSON body"}
+                        {"ok": False, "error": "Invalid JSON body", "status": 400}, 400
                     )
                 from scripts.lib.config_runtime import (
                     save_config, parse_incoming, ConfigSaveError,
@@ -530,9 +544,10 @@ class BearerAuthMiddleware:
                     save_config(incoming, config_path, dry_run=True)
                 except ConfigSaveError as e:
                     return _json_response(
-                        {"valid": False, "error": e.message, "status": e.status}
+                        {"ok": False, "error": e.message, "status": e.status},
+                        e.status,
                     )
-                return _json_response({"valid": True, "error": None})
+                return _json_response({"ok": True})
 
             elif path == "/api/dashboard/config/current":
                 # Raw read of tailor.yaml (no env var resolution — see
@@ -541,7 +556,7 @@ class BearerAuthMiddleware:
                 # both the form view and the raw YAML editor.
                 from scripts.lib.config_runtime import read_current
                 config_path = os.path.join(BASE_DIR, "config", "tailor.yaml")
-                return _json_response(read_current(config_path))
+                return _json_response({"ok": True, **read_current(config_path)})
 
             elif path == "/api/dashboard/config/backups":
                 # List the rolling backup snapshots, newest first. The
@@ -549,7 +564,7 @@ class BearerAuthMiddleware:
                 # button on each row POSTs to /restore below.
                 from scripts.lib.config_runtime import list_backups
                 config_path = os.path.join(BASE_DIR, "config", "tailor.yaml")
-                return _json_response({"backups": list_backups(config_path)})
+                return _json_response({"ok": True, "backups": list_backups(config_path)})
 
             elif path == "/api/dashboard/config/restore":
                 # Replace tailor.yaml with the contents of the named
@@ -562,14 +577,19 @@ class BearerAuthMiddleware:
                 try:
                     data = _jcfg.loads(body) if body else {}
                 except Exception:
-                    return _json_response({"error": "Invalid JSON body"}, 400)
+                    return _json_response(
+                        {"ok": False, "error": "Invalid JSON body", "status": 400}, 400
+                    )
                 filename = (data.get("filename") or "").strip() if isinstance(data, dict) else ""
                 from scripts.lib.config_runtime import restore_backup, ConfigSaveError
                 config_path = os.path.join(BASE_DIR, "config", "tailor.yaml")
                 try:
                     result = restore_backup(filename, config_path)
                 except ConfigSaveError as e:
-                    return _json_response({"error": e.message}, e.status)
+                    return _json_response(
+                        {"ok": False, "error": e.message, "status": e.status},
+                        e.status,
+                    )
                 return _json_response({
                     "ok": True,
                     "message": "Restored",

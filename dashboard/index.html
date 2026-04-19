@@ -105,6 +105,35 @@
       } catch { return null; }
     }
 
+    // Normalized call against the config endpoints. All of them follow
+    //   success → {ok: true, ...payload}           HTTP 200
+    //   error   → {ok: false, error, status}        HTTP <status>
+    // so this helper returns one consistent shape regardless of which one
+    // you hit: {ok: true, data} or {ok: false, error, status}.
+    async function apiCall(path, { method = "GET", body = null } = {}) {
+      try {
+        const opts = { method, credentials: "include", headers: {} };
+        if (body !== null) {
+          opts.headers["Content-Type"] = "application/json";
+          opts.body = JSON.stringify(body);
+        }
+        const sep = path.includes("?") ? "&" : "?";
+        const url = `${API_BASE}${path}${API_TOKEN ? `${sep}token=${API_TOKEN}` : ""}`;
+        const r = await fetch(url, opts);
+        let data = null;
+        try { data = await r.json(); } catch {}
+        if (data && data.ok === false) {
+          return { ok: false, error: data.error || `HTTP ${r.status}`, status: data.status || r.status };
+        }
+        if (!r.ok) {
+          return { ok: false, error: `HTTP ${r.status}`, status: r.status };
+        }
+        return { ok: true, data: data || {} };
+      } catch (e) {
+        return { ok: false, error: (e && e.message) || "Connection failed", status: 0 };
+      }
+    }
+
     // ── Theme ──
     const ThemeContext = createContext();
     const useTheme = () => useContext(ThemeContext);
@@ -271,6 +300,10 @@
         { value: "qwen2.5:7b", label: "Qwen 2.5 7B (local)" },
         { value: "llama3.1:8b", label: "Llama 3.1 8B (local)" },
         { value: "mistral:7b", label: "Mistral 7B (local)" },
+      ],
+      deepseek: [
+        { value: "deepseek-chat", label: "DeepSeek V3 (general)" },
+        { value: "deepseek-reasoner", label: "DeepSeek R1 (reasoning)" },
       ],
     };
 
@@ -1199,7 +1232,592 @@
       );
     }
 
-    function ConfigPage({ config, onConfigSaved }) {
+    // ── Runtime Configuration Editor (form mode) ──
+    //
+    // Unified editor over the whitelist of sections safe to touch live.
+    // See scripts/lib/config_runtime.py BLACKLIST_SECTIONS for what's NOT
+    // in here (auth/paths/database/nightly) — the backend rejects those
+    // with 403 so this frontend doesn't need to re-enforce.
+    //
+    // Dirty state policy (three tiers, by user-intent strength):
+    //   - Discard button      → immediate revert, no confirm
+    //       (user explicitly asked; loaded state is trivially re-fetchable)
+    //   - In-app tab switch   → window.confirm("Discard N unsaved changes?")
+    //       (user may not realize they'd lose edits)
+    //   - Browser navigation  → beforeunload handler
+    //       (OS-level dialog, only fires when dirty)
+    //
+    // Validation feedback is two-layer:
+    //   - client-side inline per-field for type/required (cheap checks)
+    //   - server-side banner at top for everything /save rejects
+    //     (a single error string from the backend, not per-field yet)
+    const RUNTIME_EDITABLE_SECTIONS = [
+      "chat_interface", "llm", "classifier", "embedding",
+      "persona", "branding", "user",
+    ];
+
+    // Provider dropdown for the runtime editor — kept separate from the
+    // legacy dropdowns (which are each slightly different; don't unify
+    // without an audit that won't regress the Setup Wizard).
+    const LLM_PROVIDERS_RUNTIME = [
+      { value: "anthropic", label: "Anthropic (Claude)" },
+      { value: "openai", label: "OpenAI (GPT)" },
+      { value: "google", label: "Google (Gemini)" },
+      { value: "ollama", label: "Ollama (local)" },
+      { value: "deepseek", label: "DeepSeek" },
+    ];
+
+    const RUNTIME_LANG_OPTIONS = [
+      { value: "en", label: "English" },
+      { value: "it", label: "Italian" },
+      { value: "es", label: "Spanish" },
+      { value: "fr", label: "French" },
+      { value: "de", label: "German" },
+      { value: "pt", label: "Portuguese" },
+    ];
+
+    // Clone without _normalized sentinel or other non-config cruft.
+    const cloneConfigForEdit = (cfg) => JSON.parse(JSON.stringify(cfg || {}));
+
+    // Compute which top-level sections differ from `loaded`. We send only
+    // those to /save — backend does shallow merge within each section, so
+    // sending a full section is a safe overwrite even if only one key changed.
+    const computeSavePayload = (draft, loaded) => {
+      const out = {};
+      for (const key of RUNTIME_EDITABLE_SECTIONS) {
+        const a = draft[key];
+        const b = loaded[key];
+        if (JSON.stringify(a) !== JSON.stringify(b)) {
+          out[key] = a;
+        }
+      }
+      return out;
+    };
+
+    function RuntimeConfigEditor({ mode, onDirtyChange, onSaved }) {
+      const t = themes[mode];
+      const [loaded, setLoaded] = useState(null);
+      const [draft, setDraft] = useState(null);
+      const [expanded, setExpanded] = useState({ llm: true }); // llm open by default
+      const [loading, setLoading] = useState(true);
+      const [loadError, setLoadError] = useState("");
+      const [saving, setSaving] = useState(false);
+      const [serverError, setServerError] = useState("");
+      const [saveMsg, setSaveMsg] = useState("");
+      const [fieldErrors, setFieldErrors] = useState({}); // {"llm.model": "Required"}
+
+      // Fetch current config on mount.
+      const reload = useCallback(async () => {
+        setLoading(true);
+        const r = await apiCall("/api/dashboard/config/current");
+        if (r.ok) {
+          const cfg = r.data.config || {};
+          // Seed empty editable sections so form bindings have something
+          // to write into without needing to guard every nested access.
+          for (const key of RUNTIME_EDITABLE_SECTIONS) {
+            if (!cfg[key]) cfg[key] = {};
+          }
+          setLoaded(cloneConfigForEdit(cfg));
+          setDraft(cloneConfigForEdit(cfg));
+          setLoadError("");
+        } else {
+          setLoadError(r.error);
+        }
+        setLoading(false);
+      }, []);
+
+      useEffect(() => { reload(); }, [reload]);
+
+      const dirty = !!(loaded && draft && JSON.stringify(draft) !== JSON.stringify(loaded));
+
+      // Notify parent so it can intercept tab changes.
+      useEffect(() => { if (onDirtyChange) onDirtyChange(dirty); }, [dirty, onDirtyChange]);
+
+      // Browser-level "you have unsaved changes" dialog.
+      useEffect(() => {
+        if (!dirty) return;
+        const handler = (e) => { e.preventDefault(); e.returnValue = ""; };
+        window.addEventListener("beforeunload", handler);
+        return () => window.removeEventListener("beforeunload", handler);
+      }, [dirty]);
+
+      const patch = (section, updates) =>
+        setDraft(d => ({ ...d, [section]: { ...(d[section] || {}), ...updates } }));
+
+      const toggle = (key) => setExpanded(s => ({ ...s, [key]: !s[key] }));
+
+      // Basic client-side validation run on Save click. Returns map of
+      // fieldId → error message; empty map = valid. Intentionally narrow:
+      // required + type checks only. Semantic validity (is this a real
+      // model name?) belongs to the backend / runtime.
+      const runClientValidation = () => {
+        const errs = {};
+        const d = draft || {};
+        if (!d.llm?.provider) errs["llm.provider"] = "Required";
+        if (!d.llm?.model) errs["llm.model"] = "Required";
+        if (!d.embedding?.provider) errs["embedding.provider"] = "Required";
+        if (!d.embedding?.model) errs["embedding.model"] = "Required";
+        if (!d.classifier?.provider) errs["classifier.provider"] = "Required";
+        if (!d.classifier?.model) errs["classifier.model"] = "Required";
+        // Numeric fields: if present, must be a finite number.
+        for (const [path, val] of [
+          ["llm.temperature", d.llm?.temperature],
+          ["llm.max_tokens", d.llm?.max_tokens],
+          ["classifier.temperature", d.classifier?.temperature],
+          ["embedding.dimensions", d.embedding?.dimensions],
+          ["chat_interface.max_history_messages", d.chat_interface?.max_history_messages],
+          ["chat_interface.max_message_length", d.chat_interface?.max_message_length],
+          ["chat_interface.sse_keepalive_seconds", d.chat_interface?.sse_keepalive_seconds],
+        ]) {
+          if (val !== undefined && val !== "" && (typeof val !== "number" || !Number.isFinite(val))) {
+            errs[path] = "Must be a number";
+          }
+        }
+        return errs;
+      };
+
+      const handleSave = async () => {
+        setServerError(""); setSaveMsg("");
+        const errs = runClientValidation();
+        setFieldErrors(errs);
+        if (Object.keys(errs).length > 0) {
+          setServerError("Some fields need attention — see highlighted entries below.");
+          return;
+        }
+        const payload = computeSavePayload(draft, loaded);
+        if (Object.keys(payload).length === 0) return;
+        setSaving(true);
+        const r = await apiCall("/api/dashboard/config/save", { method: "POST", body: payload });
+        if (r.ok) {
+          setSaveMsg(`Saved. Backup: ${r.data.backup || "(none — first save)"}`);
+          setTimeout(() => setSaveMsg(""), 4000);
+          await reload();
+          if (onSaved) onSaved();
+        } else {
+          setServerError(r.error || "Save failed");
+        }
+        setSaving(false);
+      };
+
+      const handleDiscard = () => {
+        setDraft(cloneConfigForEdit(loaded));
+        setFieldErrors({});
+        setServerError("");
+        setSaveMsg("");
+      };
+
+      // ── Render ─────────────────────────────────────────────
+      if (loading) {
+        return React.createElement(Tile, null,
+          React.createElement(Skeleton, { className: "h-4 w-32 mb-3" }),
+          React.createElement(Skeleton, { className: "h-32 w-full" })
+        );
+      }
+      if (loadError) {
+        return React.createElement(Tile, null,
+          React.createElement("div", { className: "text-sm text-red-400" },
+            `Failed to load configuration: ${loadError}`)
+        );
+      }
+
+      const d = draft || {};
+
+      // ── Shared field components ────────────────────────────
+      const Field = ({ id, label, help, children }) => React.createElement("div", { className: "mb-4" },
+        React.createElement("label", { className: cl("text-sm font-medium block mb-1.5", t.textLabel) }, label),
+        children,
+        fieldErrors[id] && React.createElement("p", { className: "text-xs text-red-400 mt-1" }, fieldErrors[id]),
+        help && !fieldErrors[id] && React.createElement("p", { className: cl("text-xs mt-1", t.textFaint) }, help),
+      );
+
+      const inputCls = cl(
+        "w-full px-4 py-2.5 rounded-xl border text-sm outline-none transition-all",
+        "focus:ring-2 focus:ring-teal-500/30 focus:border-teal-500",
+        t.input,
+      );
+
+      const TextInput = ({ id, value, onChange, placeholder, type = "text", mono = false }) =>
+        React.createElement("input", {
+          type, value: value ?? "", placeholder,
+          onChange: (e) => onChange(e.target.value),
+          className: cl(inputCls, mono ? "font-mono" : "",
+            fieldErrors[id] ? "border-red-500/60" : ""),
+        });
+
+      const NumberInput = ({ id, value, onChange, step = 1, min, max, placeholder }) =>
+        React.createElement("input", {
+          type: "number", value: value ?? "", placeholder, step, min, max,
+          onChange: (e) => {
+            const v = e.target.value;
+            onChange(v === "" ? undefined : Number(v));
+          },
+          className: cl(inputCls, "font-mono", fieldErrors[id] ? "border-red-500/60" : ""),
+        });
+
+      const TextArea = ({ value, onChange, rows = 4, placeholder, mono = false }) =>
+        React.createElement("textarea", {
+          value: value ?? "", placeholder, rows,
+          onChange: (e) => onChange(e.target.value),
+          className: cl(inputCls, "resize-y", mono ? "font-mono" : ""),
+          style: { minHeight: `${rows * 1.5}em` },
+        });
+
+      const SelectInput = ({ id, value, onChange, options, allowEmpty = false }) =>
+        React.createElement("select", {
+          value: value ?? "",
+          onChange: (e) => onChange(e.target.value),
+          className: cl(inputCls, fieldErrors[id] ? "border-red-500/60" : ""),
+        },
+          allowEmpty && React.createElement("option", { value: "" }, "— select —"),
+          options.map(o => React.createElement("option", { key: o.value, value: o.value }, o.label)),
+        );
+
+      const Checkbox = ({ value, onChange, label }) =>
+        React.createElement("label", { className: cl("flex items-center gap-2 text-sm cursor-pointer", t.text) },
+          React.createElement("input", {
+            type: "checkbox", checked: !!value,
+            onChange: (e) => onChange(e.target.checked),
+            className: "w-4 h-4 rounded accent-teal-500",
+          }),
+          label,
+        );
+
+      // ── Accordion row ──────────────────────────────────────
+      const AccSection = ({ id, title, icon, subtitle, children }) => {
+        const open = !!expanded[id];
+        return React.createElement("div", { className: cl("rounded-xl border overflow-hidden", t.borderLight) },
+          React.createElement("button", {
+            onClick: () => toggle(id),
+            className: cl("w-full flex items-center justify-between px-4 py-3 text-left transition-colors",
+              mode === "dark" ? "bg-zinc-900/50 hover:bg-zinc-900/70" : "bg-zinc-50 hover:bg-zinc-100")
+          },
+            React.createElement("div", { className: "flex items-center gap-3" },
+              React.createElement("span", { className: "text-lg" }, icon),
+              React.createElement("div", null,
+                React.createElement("div", { className: cl("text-sm font-semibold", t.text) }, title),
+                subtitle && React.createElement("div", { className: cl("text-xs", t.textFaint) }, subtitle),
+              ),
+            ),
+            React.createElement("span", { className: cl("text-sm", t.textFaint) }, open ? "\u25BC" : "\u25B8"),
+          ),
+          open && React.createElement("div", { className: cl("px-4 py-4 border-t", t.borderLight, mode === "dark" ? "bg-zinc-950/40" : "bg-white") },
+            children,
+          ),
+        );
+      };
+
+      // ── Chat Interface ─────────────────────────────────────
+      const ci = d.chat_interface || {};
+      const chatInterfaceFields = React.createElement("div", null,
+        React.createElement(Field, { id: "chat_interface.system_prompt", label: "System prompt",
+          help: "Shown to the chat LLM on every conversation start." },
+          React.createElement(TextArea, {
+            value: ci.system_prompt, rows: 5,
+            onChange: v => patch("chat_interface", { system_prompt: v }),
+            placeholder: "You are Tailor, a personal AI assistant...",
+          }),
+        ),
+        React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-3 gap-3" },
+          React.createElement(Field, { id: "chat_interface.max_history_messages", label: "Max history messages",
+            help: "Turns of context retained per session." },
+            React.createElement(NumberInput, {
+              id: "chat_interface.max_history_messages", value: ci.max_history_messages,
+              onChange: v => patch("chat_interface", { max_history_messages: v }),
+              min: 1, step: 1,
+            }),
+          ),
+          React.createElement(Field, { id: "chat_interface.max_message_length", label: "Max message length",
+            help: "Characters per user input." },
+            React.createElement(NumberInput, {
+              id: "chat_interface.max_message_length", value: ci.max_message_length,
+              onChange: v => patch("chat_interface", { max_message_length: v }),
+              min: 1, step: 1,
+            }),
+          ),
+          React.createElement(Field, { id: "chat_interface.sse_keepalive_seconds", label: "SSE keep-alive (s)",
+            help: "Heartbeat interval for streaming." },
+            React.createElement(NumberInput, {
+              id: "chat_interface.sse_keepalive_seconds", value: ci.sse_keepalive_seconds,
+              onChange: v => patch("chat_interface", { sse_keepalive_seconds: v }),
+              min: 1, step: 1,
+            }),
+          ),
+        ),
+        React.createElement(Field, { label: "Suggested prompts", help: "One per line. Rendered as buttons on an empty chat." },
+          React.createElement(TextArea, {
+            value: (ci.suggest_prompts || []).join("\n"), rows: 4,
+            onChange: v => patch("chat_interface", {
+              suggest_prompts: v.split("\n").map(s => s.trim()).filter(Boolean),
+            }),
+            placeholder: "What did I do yesterday?\nSummarize this week's decisions",
+          }),
+        ),
+        // Available providers table (provider + model + label per row).
+        React.createElement("div", { className: "mb-2" },
+          React.createElement("div", { className: cl("text-sm font-medium mb-2", t.textLabel) }, "Available providers in chat"),
+          React.createElement("div", { className: cl("text-xs mb-2", t.textFaint) },
+            "Shown in the per-session provider dropdown. Each row needs a provider and model."),
+          React.createElement("div", { className: "space-y-2" },
+            (ci.available_providers || []).map((row, idx) =>
+              React.createElement("div", { key: idx, className: cl("flex items-center gap-2 p-2 rounded-xl border", t.borderLight, mode === "dark" ? "bg-zinc-900/40" : "bg-zinc-50") },
+                React.createElement("select", {
+                  value: row.provider || "",
+                  onChange: (e) => {
+                    const arr = [...(ci.available_providers || [])];
+                    arr[idx] = { ...arr[idx], provider: e.target.value };
+                    patch("chat_interface", { available_providers: arr });
+                  },
+                  className: cl("w-36 px-2 py-1.5 rounded-lg border text-sm", t.input),
+                },
+                  React.createElement("option", { value: "" }, "Provider..."),
+                  LLM_PROVIDERS_RUNTIME.map(p => React.createElement("option", { key: p.value, value: p.value }, p.label)),
+                ),
+                React.createElement("input", {
+                  type: "text", value: row.model || "", placeholder: "model name",
+                  onChange: (e) => {
+                    const arr = [...(ci.available_providers || [])];
+                    arr[idx] = { ...arr[idx], model: e.target.value };
+                    patch("chat_interface", { available_providers: arr });
+                  },
+                  className: cl("flex-1 px-2 py-1.5 rounded-lg border text-sm font-mono", t.input),
+                }),
+                React.createElement("input", {
+                  type: "text", value: row.label || "", placeholder: "label (optional)",
+                  onChange: (e) => {
+                    const arr = [...(ci.available_providers || [])];
+                    arr[idx] = { ...arr[idx], label: e.target.value };
+                    patch("chat_interface", { available_providers: arr });
+                  },
+                  className: cl("flex-1 px-2 py-1.5 rounded-lg border text-sm", t.input),
+                }),
+                React.createElement("button", {
+                  onClick: () => {
+                    const arr = [...(ci.available_providers || [])];
+                    arr.splice(idx, 1);
+                    patch("chat_interface", { available_providers: arr });
+                  },
+                  className: "text-xs px-2 py-1 rounded text-red-400 hover:bg-red-500/10",
+                }, "\u2715"),
+              ),
+            ),
+          ),
+          React.createElement("button", {
+            onClick: () => patch("chat_interface", {
+              available_providers: [...(ci.available_providers || []), { provider: "", model: "", label: "" }],
+            }),
+            className: cl("mt-2 text-xs px-3 py-1.5 rounded-lg border border-dashed", t.borderLight, "hover:border-teal-500 hover:text-teal-400", t.textFaint),
+          }, "+ Add provider row"),
+        ),
+      );
+
+      // ── LLM default ────────────────────────────────────────
+      const dl = d.llm || {};
+      const llmFields = React.createElement("div", null,
+        React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-2 gap-3" },
+          React.createElement(Field, { id: "llm.provider", label: "Provider" },
+            React.createElement(SelectInput, {
+              id: "llm.provider", value: dl.provider,
+              onChange: v => {
+                const models = LLM_MODELS[v] || [];
+                patch("llm", { provider: v, model: models[0]?.value || dl.model || "" });
+              },
+              options: LLM_PROVIDERS_RUNTIME, allowEmpty: true,
+            }),
+          ),
+          React.createElement(Field, { id: "llm.model", label: "Model" },
+            (LLM_MODELS[dl.provider] && LLM_MODELS[dl.provider].length > 0)
+              ? React.createElement(SelectInput, {
+                  id: "llm.model", value: dl.model,
+                  onChange: v => patch("llm", { model: v }),
+                  options: LLM_MODELS[dl.provider], allowEmpty: true,
+                })
+              : React.createElement(TextInput, {
+                  id: "llm.model", value: dl.model, mono: true,
+                  onChange: v => patch("llm", { model: v }),
+                  placeholder: "model identifier",
+                }),
+          ),
+          React.createElement(Field, { id: "llm.temperature", label: "Temperature",
+            help: "0 = deterministic. 2 = chaotic. Rejection by provider at runtime if out of range." },
+            React.createElement(NumberInput, {
+              id: "llm.temperature", value: dl.temperature, step: 0.1,
+              onChange: v => patch("llm", { temperature: v }),
+            }),
+          ),
+          React.createElement(Field, { id: "llm.max_tokens", label: "Max tokens" },
+            React.createElement(NumberInput, {
+              id: "llm.max_tokens", value: dl.max_tokens, min: 1, step: 100,
+              onChange: v => patch("llm", { max_tokens: v }),
+            }),
+          ),
+        ),
+        React.createElement("div", { className: "mt-2" },
+          React.createElement(Checkbox, {
+            value: dl.tool_use, label: "Enable tool use (KB search, profile lookups, etc.)",
+            onChange: v => patch("llm", { tool_use: v }),
+          }),
+        ),
+      );
+
+      // ── Classifier ─────────────────────────────────────────
+      const dc = d.classifier || {};
+      const classifierFields = React.createElement("div", null,
+        React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-3 gap-3" },
+          React.createElement(Field, { id: "classifier.provider", label: "Provider" },
+            React.createElement(SelectInput, {
+              id: "classifier.provider", value: dc.provider,
+              onChange: v => patch("classifier", { provider: v }),
+              options: LLM_PROVIDERS_RUNTIME, allowEmpty: true,
+            }),
+          ),
+          React.createElement(Field, { id: "classifier.model", label: "Model" },
+            React.createElement(TextInput, {
+              id: "classifier.model", value: dc.model, mono: true,
+              onChange: v => patch("classifier", { model: v }),
+              placeholder: "e.g. qwen2.5:7b",
+            }),
+          ),
+          React.createElement(Field, { id: "classifier.temperature", label: "Temperature" },
+            React.createElement(NumberInput, {
+              id: "classifier.temperature", value: dc.temperature, step: 0.1,
+              onChange: v => patch("classifier", { temperature: v }),
+            }),
+          ),
+        ),
+      );
+
+      // ── Embedding ──────────────────────────────────────────
+      const de = d.embedding || {};
+      const embFields = React.createElement("div", null,
+        React.createElement("div", { className: cl("text-sm mb-3 p-3 rounded-xl",
+          mode === "dark" ? "bg-amber-900/15 text-amber-300 border border-amber-800/30" : "bg-amber-50 text-amber-700 border border-amber-200") },
+          "\u26A0\uFE0F Changing provider or model requires re-embedding the entire Knowledge Base (hours-to-days of compute depending on size). ",
+          "Dimensions must match whatever the new model actually produces — mismatch silently breaks retrieval."),
+        React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-3 gap-3" },
+          React.createElement(Field, { id: "embedding.provider", label: "Provider" },
+            React.createElement(SelectInput, {
+              id: "embedding.provider", value: de.provider,
+              onChange: v => {
+                const models = EMBED_MODELS[v] || [];
+                const model = models[0]?.value || de.model || "";
+                patch("embedding", { provider: v, model, dimensions: EMBED_DIMS[model] || de.dimensions });
+              },
+              options: [
+                { value: "ollama", label: "Ollama (local)" },
+                { value: "openai", label: "OpenAI" },
+                { value: "google", label: "Google" },
+              ], allowEmpty: true,
+            }),
+          ),
+          React.createElement(Field, { id: "embedding.model", label: "Model" },
+            (EMBED_MODELS[de.provider] && EMBED_MODELS[de.provider].length > 0)
+              ? React.createElement(SelectInput, {
+                  id: "embedding.model", value: de.model,
+                  onChange: v => patch("embedding", { model: v, dimensions: EMBED_DIMS[v] || de.dimensions }),
+                  options: EMBED_MODELS[de.provider], allowEmpty: true,
+                })
+              : React.createElement(TextInput, {
+                  id: "embedding.model", value: de.model, mono: true,
+                  onChange: v => patch("embedding", { model: v }),
+                }),
+          ),
+          React.createElement(Field, { id: "embedding.dimensions", label: "Dimensions" },
+            React.createElement(NumberInput, {
+              id: "embedding.dimensions", value: de.dimensions, min: 1, step: 1,
+              onChange: v => patch("embedding", { dimensions: v }),
+            }),
+          ),
+        ),
+      );
+
+      // ── Persona (Telegram system prompt) ──────────────────
+      const dp = d.persona || {};
+      const personaFields = React.createElement("div", null,
+        React.createElement(Field, { label: "Telegram system prompt",
+          help: "System prompt for the Telegram bot persona (separate from the chat UI)." },
+          React.createElement(TextArea, {
+            value: dp.system_prompt, rows: 5,
+            onChange: v => patch("persona", { system_prompt: v }),
+            placeholder: "You are Tailor, speaking concisely in a personal tone...",
+          }),
+        ),
+      );
+
+      // ── Branding ───────────────────────────────────────────
+      const db = d.branding || {};
+      const brandingFields = React.createElement("div", null,
+        React.createElement(Field, { label: "Application name",
+          help: "Shown in the header. Has to fit next to the T[AI]LOR logomark — keep it short." },
+          React.createElement(TextInput, { value: db.app_name, onChange: v => patch("branding", { app_name: v }) }),
+        ),
+      );
+
+      // ── User ───────────────────────────────────────────────
+      const du = d.user || {};
+      const userFields = React.createElement("div", null,
+        React.createElement(Field, { label: "Your name" },
+          React.createElement(TextInput, { value: du.name, onChange: v => patch("user", { name: v }) }),
+        ),
+        React.createElement(Field, { label: "Bio",
+          help: "Used by profile generation and persona context. A paragraph is plenty." },
+          React.createElement(TextArea, { value: du.bio, rows: 3, onChange: v => patch("user", { bio: v }) }),
+        ),
+        React.createElement(Field, { label: "Language",
+          help: "Used for UI translation and log output. Changing triggers a translation-cache invalidation." },
+          React.createElement(SelectInput, {
+            value: du.language, allowEmpty: true,
+            onChange: v => patch("user", { language: v }),
+            options: RUNTIME_LANG_OPTIONS,
+          }),
+        ),
+      );
+
+      // ── Outer render ───────────────────────────────────────
+      return React.createElement(Tile, null,
+        React.createElement("div", { className: "flex items-center justify-between mb-4" },
+          React.createElement("div", null,
+            React.createElement("h3", { className: cl("text-sm font-semibold uppercase tracking-widest", t.textLabel) }, "Runtime Configuration"),
+            React.createElement("div", { className: cl("text-xs mt-0.5", t.textFaint) },
+              "Edits apply immediately via soft-reload. Changes outside this whitelist need tailor.yaml."),
+          ),
+          React.createElement("div", { className: "flex items-center gap-2" },
+            saveMsg && React.createElement("span", { className: cl("text-xs", t.accent) }, saveMsg),
+            React.createElement("button", {
+              onClick: handleDiscard, disabled: !dirty,
+              className: cl("px-3 py-1.5 rounded-lg text-sm font-semibold transition-all",
+                !dirty ? "opacity-40 cursor-not-allowed" : (mode === "dark" ? "bg-zinc-800 hover:bg-zinc-700 text-zinc-300" : "bg-zinc-100 hover:bg-zinc-200 text-zinc-700")),
+            }, "Discard"),
+            React.createElement("button", {
+              onClick: handleSave, disabled: !dirty || saving,
+              className: cl("px-4 py-1.5 rounded-lg text-sm font-semibold transition-all",
+                (!dirty || saving) ? "opacity-40 cursor-not-allowed bg-teal-600/40 text-white" : "bg-teal-600 hover:bg-teal-500 text-white"),
+            }, saving ? "Saving..." : (dirty ? "Save" : "Saved")),
+          ),
+        ),
+        serverError && React.createElement("div", {
+          className: cl("mb-3 px-3 py-2 rounded-lg border text-sm",
+            mode === "dark" ? "bg-red-900/20 border-red-800/40 text-red-300" : "bg-red-50 border-red-200 text-red-700"),
+        }, "\u26A0\uFE0F ", serverError),
+        React.createElement("div", { className: "space-y-2" },
+          React.createElement(AccSection, { id: "chat_interface", title: "Chat interface", icon: "\u{1F4AC}",
+            subtitle: "System prompt, available providers, suggested prompts, limits" }, chatInterfaceFields),
+          React.createElement(AccSection, { id: "llm", title: "Default LLM", icon: "\u{1F9E0}",
+            subtitle: "Provider, model, temperature, tool use" }, llmFields),
+          React.createElement(AccSection, { id: "classifier", title: "Intent classifier", icon: "\u{1F500}",
+            subtitle: "Provider and model for intent routing" }, classifierFields),
+          React.createElement(AccSection, { id: "embedding", title: "Embedding", icon: "\u{1F52E}",
+            subtitle: "Vector model — changing this requires re-embedding" }, embFields),
+          React.createElement(AccSection, { id: "persona", title: "Telegram persona", icon: "\u{1F4F1}",
+            subtitle: "System prompt for the Telegram bot" }, personaFields),
+          React.createElement(AccSection, { id: "branding", title: "Branding", icon: "\u{1F3F7}\uFE0F",
+            subtitle: "App name" }, brandingFields),
+          React.createElement(AccSection, { id: "user", title: "About you", icon: "\u{1F464}",
+            subtitle: "Name, bio, language" }, userFields),
+        ),
+      );
+    }
+
+    function ConfigPage({ config, onConfigSaved, onDirtyChange }) {
       const t = useTheme();
       const mode = t === themes.dark ? "dark" : "light";
       const [editing, setEditing] = useState(null); // which section is being edited
@@ -1500,8 +2118,14 @@
       );
 
       return React.createElement("div", { className: "space-y-5" },
-        React.createElement("div", { className: "flex items-center justify-between" },
-          React.createElement("h3", { className: cl("text-sm font-semibold uppercase tracking-widest", t.textLabel) }, "Configuration"),
+        // New unified runtime editor at the top. Covers the whitelisted
+        // sections; legacy per-section cards below for Telegram / Enrichment /
+        // Pipeline (not in the whitelist but still editable here).
+        React.createElement(RuntimeConfigEditor, {
+          mode, onDirtyChange, onSaved: onConfigSaved,
+        }),
+        React.createElement("div", { className: "flex items-center justify-between pt-4" },
+          React.createElement("h3", { className: cl("text-sm font-semibold uppercase tracking-widest", t.textLabel) }, "Other configuration"),
           React.createElement("div", { className: "flex items-center gap-3" },
             saveMsg && !editing && React.createElement("span", { className: cl("text-sm", t.accent) }, saveMsg),
             React.createElement(Tag, { variant: "muted" }, "config/tailor.yaml")
@@ -1691,6 +2315,24 @@
       const [profile, setProfile] = useState(null);
       const [pipeline, setPipeline] = useState(null);
       const [modelAdvisor, setModelAdvisor] = useState(null);
+      // Config editor dirty bit, bubbled up so tab switches can warn.
+      const [configDirty, setConfigDirty] = useState(false);
+
+      // Tab switch interceptor: if the config editor has unsaved work and
+      // the user clicks a different tab, confirm first. Confirming treats
+      // the edits as discarded (the editor will re-read /current on remount).
+      const requestTabChange = (next) => {
+        if (next === tab) return;
+        if (tab === "config" && configDirty) {
+          const ok = window.confirm(
+            "You have unsaved configuration changes.\n" +
+            "Switching tabs will discard them. Continue?"
+          );
+          if (!ok) return;
+          setConfigDirty(false);
+        }
+        setTab(next);
+      };
 
       const toggleMode = () => {
         const next = mode === "dark" ? "light" : "dark";
@@ -1769,7 +2411,7 @@
             ),
         kb: React.createElement(KBPage, { stats, config }),
         pipeline: React.createElement(PipelinePage, { pipeline }),
-        config: React.createElement(ConfigPage, { config, onConfigSaved: refresh }),
+        config: React.createElement(ConfigPage, { config, onConfigSaved: refresh, onDirtyChange: setConfigDirty }),
         profile: React.createElement(ProfilePage, { profile }),
       };
 
@@ -1810,7 +2452,7 @@
           React.createElement("nav", { className: cl("border-b", t.border) },
             React.createElement("div", { className: "max-w-6xl mx-auto px-5 flex gap-1 overflow-x-auto py-1" },
               TABS.map(tb => React.createElement("button", {
-                key: tb.id, onClick: () => setTab(tb.id),
+                key: tb.id, onClick: () => requestTabChange(tb.id),
                 className: cl("px-4 py-2.5 text-sm font-semibold tracking-wider rounded-xl transition-all whitespace-nowrap", tab === tb.id ? t.navActive : t.navInactive)
               }, React.createElement("span", { className: "mr-1.5 text-sm" }, tb.icon), tb.label))
             )
