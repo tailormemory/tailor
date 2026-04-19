@@ -20,6 +20,9 @@ _model = cfg("embedding", "model") or "nomic-embed-text"
 _endpoint = cfg("embedding", "endpoint") or "http://localhost:11434/api/embed"
 _dimensions = cfg("embedding", "dimensions")
 _api_key_env = cfg("embedding", "api_key_env") or ""
+_keep_alive = cfg("embedding", "keep_alive")
+if _keep_alive is None:
+    _keep_alive = -1  # Keep model hot by default (avoids cold start)
 
 def _get_api_key() -> str:
     if _api_key_env:
@@ -34,7 +37,7 @@ def _get_api_key() -> str:
 
 # ── Ollama ────────────────────────────────────────────────────
 def _embed_ollama(texts: list[str]) -> list[list[float]]:
-    payload = {"model": _model, "input": [t[:4000] for t in texts]}
+    payload = {"model": _model, "input": [t[:4000] for t in texts], "keep_alive": _keep_alive}
     r = requests.post(_endpoint, json=payload, timeout=30)
     r.raise_for_status()
     return r.json()["embeddings"]

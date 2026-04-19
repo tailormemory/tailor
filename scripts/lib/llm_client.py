@@ -572,6 +572,8 @@ class OllamaClient(LLMClient):
         super().__init__(cfg)
         self.base_url = cfg.get("base_url", "http://localhost:11434")
         self.tool_use = False  # Always Tier 2
+        # Keep model hot by default (avoids cold-start latency on intermittent use)
+        self.keep_alive = cfg.get("keep_alive", -1)
     
     def chat(self, system: str, messages: list[dict], max_tokens: int = 0) -> str:
         # Build Ollama raw prompt
@@ -587,6 +589,7 @@ class OllamaClient(LLMClient):
                 f"{self.base_url}/api/generate",
                 json={"model": self.model, "prompt": prompt, "stream": False, "raw": True,
                       "think": False,
+                      "keep_alive": self.keep_alive,
                       "options": {"temperature": self.temperature, "num_predict": max_tokens or self.max_tokens}},
                 timeout=60,
             )
