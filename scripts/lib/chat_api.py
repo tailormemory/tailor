@@ -75,6 +75,7 @@ def build_app(
     cfg_get=None,
     tools=None,
     db_path: str | None = None,
+    brain_builder=None,
 ) -> Starlette:
     """Build the chat sub-application.
 
@@ -84,13 +85,18 @@ def build_app(
         If None, one is constructed from `db_path` or the config value
         `chat_interface.db_path` (default: <repo>/db/chat_sessions.sqlite3).
     llm_factory : callable | None
-        Returns an LLMClient instance. Defaults to lib.llm_client.get_brain.
+        Returns an LLMClient instance for the *default* brain. Defaults to
+        lib.llm_client.get_brain.
     cfg_get : callable | None
         (section, key=None, default=None) -> value. Defaults to lib.config.get.
     tools : list | None
         Tool schema list for the LLM. Defaults to lib.llm_client.TOOLS.
     db_path : str | None
         Optional override for the SQLite path when `store` is None.
+    brain_builder : callable | None
+        (provider: str, model: str) -> LLMClient, used for per-session
+        provider selection. Defaults to lib.llm_client.build_brain. Tests
+        inject a fake here to avoid hitting real provider SDKs.
     """
     from chat_session_store import ChatSessionStore  # local import: test isolation
     if cfg_get is None:
@@ -101,6 +107,8 @@ def build_app(
     if tools is None:
         from llm_client import TOOLS as _TOOLS
         tools = _TOOLS
+    if brain_builder is None:
+        from llm_client import build_brain as brain_builder  # type: ignore
     if store is None:
         if db_path is None:
             db_path = cfg_get("chat_interface", "db_path", None) or os.path.join(
@@ -131,9 +139,35 @@ def build_app(
                 status_code=400,
             )
 
+        req_provider = body.get("provider") if isinstance(body.get("provider"), str) else None
+        req_model = body.get("model") if isinstance(body.get("model"), str) else None
+
         created = False
         if session_id is None:
-            session_id = store.create_session()
+            # New session: allow the caller to pin a provider/model, but only
+            # if it matches an entry in chat_interface.available_providers.
+            # Validating against the config whitelist keeps "any valid
+            # provider name" from becoming an open door to arbitrary models.
+            pin_provider, pin_model = None, None
+            if req_provider and req_model:
+                if not _is_available(cfg_get, req_provider, req_model):
+                    return JSONResponse(
+                        {
+                            "error": (
+                                f"provider/model not in chat_interface.available_providers: "
+                                f"{req_provider}/{req_model}"
+                            )
+                        },
+                        status_code=400,
+                    )
+                pin_provider, pin_model = req_provider, req_model
+            elif req_provider or req_model:
+                # One without the other is always wrong — require the pair.
+                return JSONResponse(
+                    {"error": "provider and model must be set together"},
+                    status_code=400,
+                )
+            session_id = store.create_session(provider=pin_provider, model=pin_model)
             created = True
         else:
             if not isinstance(session_id, str) or store.get_session(session_id) is None:
@@ -144,11 +178,29 @@ def build_app(
         if created:
             store.auto_title(session_id, message)
 
+        # Resolve the brain for this turn. The DB is the source of truth —
+        # provider/model in the request body are ignored for existing
+        # sessions (the pair is immutable once the session is created).
+        sess = store.get_session(session_id) or {}
+        pinned_provider = sess.get("provider")
+        pinned_model = sess.get("model")
+        if pinned_provider and pinned_model:
+            try:
+                per_session_llm = brain_builder(pinned_provider, pinned_model)
+            except Exception as e:
+                return JSONResponse(
+                    {"error": f"cannot build brain for {pinned_provider}/{pinned_model}: {e}"},
+                    status_code=400,
+                )
+            turn_factory = (lambda _brain=per_session_llm: _brain)
+        else:
+            turn_factory = llm_factory
+
         # Build the LLM message history from persisted rows (truncated).
         history = _build_llm_history(store, session_id, max_history)
         system_prompt = _resolve_system_prompt(cfg_get)
 
-        stream_iter = _run_stream(llm_factory, system_prompt, history, tools, keepalive)
+        stream_iter = _run_stream(turn_factory, system_prompt, history, tools, keepalive)
         sse = _sse_generator(
             store=store,
             session_id=session_id,
@@ -202,8 +254,12 @@ def build_app(
             return JSONResponse({"error": "not found"}, status_code=404)
         return JSONResponse({"ok": True})
 
+    async def list_providers(request: Request) -> Response:
+        return JSONResponse(_providers_payload(cfg_get))
+
     routes = [
         Route("/api/chat", post_chat, methods=["POST"]),
+        Route("/api/chat/providers", list_providers, methods=["GET"]),
         Route("/api/chat/sessions", list_sessions, methods=["GET"]),
         Route("/api/chat/sessions/{session_id}", get_session_detail, methods=["GET"]),
         Route("/api/chat/sessions/{session_id}/rename", rename_session, methods=["POST"]),
@@ -222,6 +278,59 @@ def _enabled(cfg_get) -> bool:
     if isinstance(v, bool):
         return v
     return str(v).lower() not in ("false", "0", "no", "off")
+
+
+def _available_providers_list(cfg_get) -> list[dict]:
+    """Normalise chat_interface.available_providers into [{provider,model,label}].
+    Returns [] if unset/empty/malformed — the API layer treats that as
+    'only the default is available' and the UI hides the dropdown."""
+    raw = cfg_get("chat_interface", "available_providers", None) or []
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        p = item.get("provider")
+        m = item.get("model")
+        if not (isinstance(p, str) and p and isinstance(m, str) and m):
+            continue
+        label = item.get("label")
+        if not isinstance(label, str) or not label:
+            label = f"{p}/{m}"
+        out.append({"provider": p, "model": m, "label": label})
+    return out
+
+
+def _default_brain_choice(cfg_get) -> dict | None:
+    """Return {provider, model} of the default brain, or None if llm.* is
+    incomplete. Used to seed the UI selection and to surface it in the
+    /api/chat/providers payload."""
+    llm = cfg_get("llm", None, None) or {}
+    if isinstance(llm, dict):
+        p = llm.get("provider")
+        m = llm.get("model")
+        if isinstance(p, str) and p and isinstance(m, str) and m:
+            return {"provider": p, "model": m}
+    return None
+
+
+def _is_available(cfg_get, provider: str, model: str) -> bool:
+    for item in _available_providers_list(cfg_get):
+        if item["provider"] == provider and item["model"] == model:
+            return True
+    return False
+
+
+def _providers_payload(cfg_get) -> dict:
+    """Build the GET /api/chat/providers response. If available_providers
+    is unset or empty, fall back to a single-item list containing the
+    default so the UI always has something to select."""
+    avail = _available_providers_list(cfg_get)
+    default = _default_brain_choice(cfg_get)
+    if not avail and default:
+        avail = [{**default, "label": f"{default['provider']}/{default['model']} (default)"}]
+    return {"default": default, "available": avail}
 
 
 def _build_llm_history(store, session_id: str, max_history: int) -> list[dict]:

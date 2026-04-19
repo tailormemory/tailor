@@ -59,13 +59,21 @@ def store(tmp_path):
     return ChatSessionStore(str(tmp_path / "chat_sessions.sqlite3"))
 
 
-def build(store, events, cfg_overrides=None):
+def build(store, events, cfg_overrides=None, brain_builder=None):
     llm = FakeLLM(events)
+    # Default brain_builder raises — tests that exercise per-session
+    # provider/model pass a bespoke one so the default is never hit.
+    if brain_builder is None:
+        def brain_builder(provider, model):
+            raise AssertionError(
+                f"brain_builder should not be invoked by this test (got {provider}/{model})"
+            )
     app = build_app(
         store=store,
         llm_factory=lambda: llm,
         cfg_get=make_cfg(cfg_overrides),
         tools=[],
+        brain_builder=brain_builder,
     )
     return TestClient(app), llm
 
@@ -362,3 +370,190 @@ def test_system_prompt_falls_back_to_persona(store):
     )
     client.post("/api/chat", json={"session_id": None, "message": "x"})
     assert llm.calls[0]["system"] == "Legacy Telegram prompt."
+
+
+# ── per-session provider/model (Level B) ───────────────────────
+
+AVAILABLE = [
+    {"provider": "anthropic", "model": "claude-haiku-4-5-20251001", "label": "Claude Haiku 4.5"},
+    {"provider": "ollama", "model": "qwen3.5:9b", "label": "Qwen 3.5 9B"},
+]
+
+
+def test_providers_endpoint_returns_default_and_available(store):
+    client, _ = build(
+        store, [],
+        cfg_overrides={
+            ("llm", "provider"): "anthropic",
+            ("llm", "model"): "claude-haiku-4-5-20251001",
+            ("chat_interface", "available_providers"): AVAILABLE,
+        },
+    )
+    resp = client.get("/api/chat/providers")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["default"] == {"provider": "anthropic", "model": "claude-haiku-4-5-20251001"}
+    assert len(body["available"]) == 2
+    assert body["available"][0]["label"] == "Claude Haiku 4.5"
+
+
+def test_providers_endpoint_falls_back_to_default_when_list_empty(store):
+    client, _ = build(
+        store, [],
+        cfg_overrides={
+            ("llm", "provider"): "anthropic",
+            ("llm", "model"): "claude-haiku-4-5-20251001",
+        },
+    )
+    body = client.get("/api/chat/providers").json()
+    assert body["default"]["provider"] == "anthropic"
+    assert len(body["available"]) == 1
+    assert "(default)" in body["available"][0]["label"]
+
+
+def test_post_chat_rejects_provider_not_in_available(store):
+    client, llm = build(
+        store,
+        [{"type": "token", "delta": "ok"}, {"type": "done", "tokens": 1}],
+        cfg_overrides={("chat_interface", "available_providers"): AVAILABLE},
+    )
+    resp = client.post("/api/chat", json={
+        "session_id": None, "message": "hi",
+        "provider": "openai", "model": "gpt-4o-mini",
+    })
+    assert resp.status_code == 400
+    assert "available_providers" in resp.json()["error"]
+    # Default brain was never invoked.
+    assert llm.calls == []
+
+
+def test_post_chat_rejects_provider_without_model(store):
+    client, _ = build(
+        store,
+        [{"type": "token", "delta": "ok"}, {"type": "done", "tokens": 1}],
+        cfg_overrides={("chat_interface", "available_providers"): AVAILABLE},
+    )
+    resp = client.post("/api/chat", json={
+        "session_id": None, "message": "hi",
+        "provider": "ollama",
+    })
+    assert resp.status_code == 400
+    assert "together" in resp.json()["error"]
+
+
+def test_post_chat_with_valid_provider_persists_on_session_and_uses_brain_builder(store):
+    """New session with a whitelisted provider/model → session row carries
+    both, and the per-session brain is built (not the default singleton)."""
+    session_llm = FakeLLM([
+        {"type": "token", "delta": "hola"},
+        {"type": "done", "tokens": 1},
+    ])
+    built = []
+
+    def builder(provider, model):
+        built.append((provider, model))
+        return session_llm
+
+    client, default_llm = build(
+        store,
+        [{"type": "token", "delta": "SHOULD-NOT-RUN"}, {"type": "done", "tokens": 1}],
+        cfg_overrides={("chat_interface", "available_providers"): AVAILABLE},
+        brain_builder=builder,
+    )
+    resp = client.post("/api/chat", json={
+        "session_id": None, "message": "ciao",
+        "provider": "ollama", "model": "qwen3.5:9b",
+    })
+    assert resp.status_code == 200
+
+    events = parse_sse(resp.text)
+    session_id = events[0][1]["session_id"]
+    row = store.get_session(session_id)
+    assert row["provider"] == "ollama"
+    assert row["model"] == "qwen3.5:9b"
+
+    assert built == [("ollama", "qwen3.5:9b")]
+    assert len(session_llm.calls) == 1
+    # The default singleton was *not* invoked — this is the whole point.
+    assert default_llm.calls == []
+
+
+def test_post_chat_without_provider_uses_default_singleton(store):
+    client, default_llm = build(
+        store,
+        [{"type": "token", "delta": "ok"}, {"type": "done", "tokens": 1}],
+        cfg_overrides={("chat_interface", "available_providers"): AVAILABLE},
+    )
+    resp = client.post("/api/chat", json={"session_id": None, "message": "hi"})
+    assert resp.status_code == 200
+    events = parse_sse(resp.text)
+    session_id = events[0][1]["session_id"]
+    row = store.get_session(session_id)
+    assert row["provider"] is None
+    assert row["model"] is None
+    assert len(default_llm.calls) == 1
+
+
+def test_post_chat_existing_session_ignores_body_provider(store):
+    """Per spec: provider/model in the body are ignored for existing sessions
+    — the DB value is the source of truth and is immutable."""
+    sid = store.create_session(provider="ollama", model="qwen3.5:9b")
+    session_llm = FakeLLM([{"type": "token", "delta": "ok"}, {"type": "done", "tokens": 1}])
+    built = []
+
+    def builder(provider, model):
+        built.append((provider, model))
+        return session_llm
+
+    client, default_llm = build(
+        store, [{"type": "token", "delta": "DEFAULT"}, {"type": "done", "tokens": 1}],
+        cfg_overrides={("chat_interface", "available_providers"): AVAILABLE},
+        brain_builder=builder,
+    )
+    # Caller tries to switch to a different provider mid-session; ignored.
+    resp = client.post("/api/chat", json={
+        "session_id": sid, "message": "follow up",
+        "provider": "anthropic", "model": "claude-haiku-4-5-20251001",
+    })
+    assert resp.status_code == 200
+    assert built == [("ollama", "qwen3.5:9b")]
+    assert default_llm.calls == []
+
+
+def test_post_chat_existing_session_without_pinned_uses_default(store):
+    """Backward compat: sessions created before migration 003 (or without
+    provider) continue to use the default brain."""
+    sid = store.create_session()  # NULL provider/model
+    client, default_llm = build(
+        store,
+        [{"type": "token", "delta": "ok"}, {"type": "done", "tokens": 1}],
+        cfg_overrides={("chat_interface", "available_providers"): AVAILABLE},
+    )
+    resp = client.post("/api/chat", json={"session_id": sid, "message": "x"})
+    assert resp.status_code == 200
+    assert len(default_llm.calls) == 1
+
+
+def test_get_session_detail_exposes_provider_and_model(store):
+    sid = store.create_session(provider="ollama", model="qwen3.5:9b")
+    store.append_message(sid, "user", "hi")
+    client, _ = build(store, [])
+    body = client.get(f"/api/chat/sessions/{sid}").json()
+    assert body["session"]["provider"] == "ollama"
+    assert body["session"]["model"] == "qwen3.5:9b"
+
+
+def test_post_chat_builder_error_returns_400(store):
+    """If build_brain raises (e.g. missing API key), the API should surface
+    a clean 400 rather than a 500."""
+    def builder(provider, model):
+        raise ValueError("Missing API key: set ANTHROPIC_API_KEY")
+
+    sid = store.create_session(provider="anthropic", model="claude-haiku-4-5-20251001")
+    client, _ = build(
+        store, [], brain_builder=builder,
+        cfg_overrides={("chat_interface", "available_providers"): AVAILABLE},
+    )
+    resp = client.post("/api/chat", json={"session_id": sid, "message": "hi"})
+    assert resp.status_code == 400
+    assert "ANTHROPIC_API_KEY" in resp.json()["error"]
