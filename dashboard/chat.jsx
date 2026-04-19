@@ -264,6 +264,37 @@
     );
   }
 
+  // Native <select> for provider/model. Native is the right default for
+  // mobile UX — iOS/Android render it as an OS picker which is far more
+  // usable than a custom dropdown on a touch device. Styled to match the
+  // dashboard's input fields. The value is encoded as "provider|model".
+  function ProviderSelector(props) {
+    var t = props.theme;
+    var options = props.providers || [];
+    var sel = props.value || {};
+    var cur = sel.provider && sel.model ? sel.provider + "|" + sel.model : "";
+    return h("label", { className: "flex items-center gap-2 text-xs" },
+      h("span", { className: cl("uppercase tracking-widest font-mono", t.textFaint) }, "Model"),
+      h("select", {
+        value: cur,
+        onChange: function (e) {
+          var v = e.target.value.split("|");
+          if (v.length === 2) props.onChange({ provider: v[0], model: v[1] });
+        },
+        disabled: props.disabled,
+        className: cl(
+          "px-2 py-1.5 rounded-lg border text-sm min-h-[36px] max-w-[240px] truncate",
+          t.input
+        ),
+      },
+        options.map(function (p) {
+          var key = p.provider + "|" + p.model;
+          return h("option", { key: key, value: key }, p.label || key);
+        })
+      )
+    );
+  }
+
   function EmptyState(props) {
     var t = props.theme;
     var prompts = props.suggestPrompts || [];
@@ -310,6 +341,14 @@
     // Mobile drawer state. On desktop the sidebar is always visible
     // (via md: utilities) and this flag is effectively ignored.
     var _so = useState(false); var sidebarOpen = _so[0], setSidebarOpen = _so[1];
+    // Per-session provider/model selection — populated from /api/chat/providers.
+    // `selected` starts at the server-reported default and the user can override
+    // it via the dropdown shown in the "New chat" empty state. `defaultSel`
+    // is retained so `newChat()` can reset back to the server default regardless
+    // of any previously-loaded session's pin.
+    var _av = useState([]); var providers = _av[0], setProviders = _av[1];
+    var _def = useState(null); var defaultSel = _def[0], setDefaultSel = _def[1];
+    var _sel = useState(null); var selected = _sel[0], setSelected = _sel[1];
 
     function openSidebar() { setSidebarOpen(true); }
     function closeSidebar() { setSidebarOpen(false); }
@@ -340,11 +379,50 @@
 
     useEffect(function () { refreshSessions(); }, [refreshSessions]);
 
+    // Fetch available providers once. Falls back silently on error — the
+    // dropdown just won't render, and the API will use the default brain.
+    useEffect(function () {
+      api("/api/chat/providers").then(function (r) { return r.json(); }).then(function (body) {
+        if (!body) return;
+        var avail = Array.isArray(body.available) ? body.available : [];
+        setProviders(avail);
+        var def = null;
+        if (body.default && body.default.provider && body.default.model) {
+          def = { provider: body.default.provider, model: body.default.model };
+        } else if (avail.length > 0) {
+          def = { provider: avail[0].provider, model: avail[0].model };
+        }
+        if (def) {
+          setDefaultSel(def);
+          setSelected(def);
+        }
+      }).catch(function () { /* dropdown simply won't render */ });
+    }, []);
+
+    // Map (provider, model) → label from the fetched list; falls back to
+    // "<provider>/<model>" when the pair isn't in available_providers (e.g.
+    // a session pinned on a provider that was later removed from config).
+    function labelFor(provider, model) {
+      if (!provider || !model) return "";
+      for (var i = 0; i < providers.length; i++) {
+        var p = providers[i];
+        if (p.provider === provider && p.model === model) return p.label;
+      }
+      return provider + "/" + model;
+    }
+
     useEffect(function () {
       if (!activeId) { setMessages([]); return; }
       if (skipNextLoadRef.current) { skipNextLoadRef.current = false; return; }
       api("/api/chat/sessions/" + encodeURIComponent(activeId)).then(function (r) { return r.json(); }).then(function (body) {
-        if (body && body.messages) setMessages(body.messages);
+        if (!body) return;
+        if (body.messages) setMessages(body.messages);
+        // If the loaded session has a pinned provider, surface it as the
+        // currently-selected pair. This also drives the "via <label>" badge
+        // in the mobile top bar.
+        if (body.session && body.session.provider && body.session.model) {
+          setSelected({ provider: body.session.provider, model: body.session.model });
+        }
       });
     }, [activeId]);
 
@@ -358,6 +436,9 @@
       setMessages([]);
       setInput("");
       setError(null);
+      // Reset the dropdown to the server's default so a new chat doesn't
+      // silently inherit the previously-loaded session's pinned provider.
+      if (defaultSel) setSelected(defaultSel);
     }
 
     function deleteSession(sid) {
@@ -382,10 +463,19 @@
       var controller = new AbortController();
       abortRef.current = controller;
 
+      // Include provider/model ONLY on new sessions. For existing sessions
+      // the backend ignores them anyway (DB row is the source of truth),
+      // but sending them would be semantically misleading.
+      var reqBody = { session_id: activeId, message: payload };
+      if (activeId == null && selected && selected.provider && selected.model) {
+        reqBody.provider = selected.provider;
+        reqBody.model = selected.model;
+      }
+
       api("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: activeId, message: payload }),
+        body: JSON.stringify(reqBody),
         signal: controller.signal,
       }).then(function (resp) {
         if (!resp.ok) {
@@ -466,6 +556,15 @@
       if (sessions[si].id === activeId) { activeSession = sessions[si]; break; }
     }
     var mobileTitle = activeSession ? (activeSession.title || "New chat") : "New chat";
+    // Pinned provider label for active sessions (read-only badge in the
+    // mobile top bar + above the chat). Null when the session uses default.
+    var pinnedLabel = (activeSession && activeSession.provider && activeSession.model)
+      ? labelFor(activeSession.provider, activeSession.model)
+      : null;
+    // Show the provider selector only on a fresh "new chat" — before a session
+    // is created/selected. After the first send `activeId` is set and the
+    // selection is locked in the DB.
+    var showSelector = activeId == null && providers.length > 1;
 
     return h("div", {
       className: cl("chat-shell relative rounded-2xl border overflow-hidden flex", t.border),
@@ -520,7 +619,8 @@
 
       // Main pane (messages + composer).
       h("div", { className: "flex-1 flex flex-col min-w-0 min-h-0" },
-        // Mobile top bar: hamburger + current session title. Desktop hides this.
+        // Mobile top bar: hamburger + current session title + pinned-provider
+        // badge (if any). Desktop hides the whole bar.
         h("div", {
           className: cl("md:hidden flex items-center gap-2 px-2 py-2 border-b", t.border),
         },
@@ -529,8 +629,45 @@
             className: "w-11 h-11 rounded-xl flex items-center justify-center text-zinc-300 hover:bg-white/[0.05]",
             "aria-label": "Open sessions",
           }, h(HamburgerIcon)),
-          h("div", { className: cl("flex-1 min-w-0 truncate text-sm font-medium", t.text) }, mobileTitle)
+          h("div", { className: cl("flex-1 min-w-0 truncate text-sm font-medium", t.text) }, mobileTitle),
+          pinnedLabel ? h("span", {
+            className: cl("shrink-0 text-[10px] font-mono px-2 py-0.5 rounded border", t.textFaint, "border-zinc-700/50"),
+            title: "Model: " + pinnedLabel,
+          }, pinnedLabel) : null
         ),
+
+        // Chat header strip. Shown when there's something to show — either the
+        // provider selector (new chat) or the pinned-provider badge (loaded
+        // session). Otherwise collapses to nothing so the conversation owns
+        // the full vertical space.
+        (showSelector || pinnedLabel) ? h("div", {
+          className: cl("hidden md:flex items-center justify-end gap-3 px-5 py-2 border-b", t.border),
+        },
+          showSelector ? h(ProviderSelector, {
+            theme: t,
+            providers: providers,
+            value: selected,
+            onChange: setSelected,
+            disabled: busy,
+          }) : null,
+          (!showSelector && pinnedLabel) ? h("span", {
+            className: cl("text-xs font-mono", t.textFaint),
+          }, "via ", h("span", { className: t.text }, pinnedLabel)) : null
+        ) : null,
+
+        // Mobile variant of the provider selector — stacked above the scroll
+        // area so the dropdown has room on a narrow viewport.
+        showSelector ? h("div", {
+          className: cl("md:hidden flex items-center justify-between gap-2 px-3 py-2 border-b", t.border),
+        },
+          h(ProviderSelector, {
+            theme: t,
+            providers: providers,
+            value: selected,
+            onChange: setSelected,
+            disabled: busy,
+          })
+        ) : null,
 
         h("div", { ref: scrollRef, className: "flex-1 overflow-y-auto px-4 md:px-5 py-4 min-h-0" },
           messages.length === 0
