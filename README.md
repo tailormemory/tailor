@@ -501,6 +501,7 @@ Both have: atomic facts, supersession, user profiles, hybrid search, temporal gr
 - **Chrome Web Store** — Publish the browser extension for one-click install (submitted, pending review).
 - **Model Advisor v2** — Benchmark comparison, automatic backend suggestions when a faster/cheaper model fits the same enrichment role.
 - **Runtime provider switching** — Hot-reload LLM provider and model configuration without restart. Switch backends from the dashboard in real time.
+- **API key management UI** — Configure provider API keys (Anthropic, OpenAI, Google, DeepSeek, ...) directly from the dashboard. Encrypted local storage, test-connection button, import from .env, export, and rotation — no more editing plists or shell configs.
 - **Auto-forgetting** — Configurable TTL for facts, with automatic expiration and cleanup.
 - **Webhook real-time ingest** — Push-based ingestion for live data sources (vs. nightly batch).
 - **Multimodal support** — Video, audio, and code AST ingestion.
