@@ -25,6 +25,8 @@ from scripts.lib.config_runtime import (  # noqa: E402
     ConfigSaveError,
     check_blacklist,
     create_backup,
+    parse_incoming,
+    read_current,
     save_config,
     soft_reload,
     validate_loadable,
@@ -337,3 +339,191 @@ def test_soft_reload_preserves_i18n_cache_when_language_unchanged(
     assert i18n._disk_loaded is True
     # Provider mirror did update.
     assert i18n._LLM_PROVIDER == "openai"
+
+
+# ── dry_run ─────────────────────────────────────────────────────
+
+
+def test_dry_run_does_not_touch_disk(config_path):
+    before = open(config_path).read()
+    bdir = config_runtime.backup_dir_for(config_path)
+
+    result = save_config({"llm": {"temperature": 0.9}}, config_path, dry_run=True)
+
+    assert result["ok"] is True
+    assert result["dry_run"] is True
+    assert result["backup"] == ""
+    assert result["reloaded"] == {}
+    # File unchanged.
+    assert open(config_path).read() == before
+    # No backup dir created — the whole point of dry-run.
+    assert not os.path.exists(bdir)
+
+
+def test_dry_run_does_not_reload_singletons(config_path, fake_singleton_modules):
+    llm = fake_singleton_modules["llm"]
+    brain_before = llm._brain
+    classifier_before = llm._classifier
+
+    save_config({"llm": {"temperature": 0.5}}, config_path, dry_run=True)
+
+    # Singletons must be untouched — /validate must not invalidate brains.
+    assert llm._brain is brain_before
+    assert llm._classifier is classifier_before
+
+
+def test_dry_run_still_raises_on_blacklist(config_path):
+    before = open(config_path).read()
+    with pytest.raises(ConfigSaveError) as exc:
+        save_config({"auth": {"token": "x"}}, config_path, dry_run=True)
+    assert exc.value.status == 403
+    assert open(config_path).read() == before
+
+
+def test_dry_run_still_raises_on_validation_failure(config_path):
+    before = open(config_path).read()
+    with pytest.raises(ConfigSaveError) as exc:
+        save_config({"llm": {"provider": object()}}, config_path, dry_run=True)
+    assert exc.value.status == 400
+    assert open(config_path).read() == before
+
+
+def test_dry_run_and_real_save_share_validation(config_path):
+    # Structural guarantee: /validate cannot accept something /save would
+    # reject, nor the reverse. If this test ever starts failing, the two
+    # flows have diverged — walk back and collapse them.
+    bad = {"auth": {"token": "x"}}
+    with pytest.raises(ConfigSaveError) as dry:
+        save_config(bad, config_path, dry_run=True)
+    with pytest.raises(ConfigSaveError) as real:
+        save_config(bad, config_path, dry_run=False)
+    assert dry.value.status == real.value.status
+    assert dry.value.message == real.value.message
+
+
+# ── parse_incoming ──────────────────────────────────────────────
+
+
+def test_parse_incoming_accepts_bare_dict():
+    # Preserves Setup Wizard's existing contract — it posts sections at the
+    # top level, not wrapped in {"config": ...}.
+    assert parse_incoming({"llm": {"provider": "anthropic"}}) == {
+        "llm": {"provider": "anthropic"}
+    }
+
+
+def test_parse_incoming_accepts_config_wrapper():
+    body = {"config": {"llm": {"provider": "openai"}}}
+    assert parse_incoming(body) == {"llm": {"provider": "openai"}}
+
+
+def test_parse_incoming_accepts_yaml_string():
+    body = {"yaml": "llm:\n  provider: google\n  model: gemini-2.5-flash\n"}
+    parsed = parse_incoming(body)
+    assert parsed == {"llm": {"provider": "google", "model": "gemini-2.5-flash"}}
+
+
+def test_parse_incoming_rejects_malformed_yaml():
+    body = {"yaml": "llm:\n  provider: [unclosed"}
+    with pytest.raises(ConfigSaveError) as exc:
+        parse_incoming(body)
+    assert exc.value.status == 400
+    assert "yaml" in exc.value.message.lower()
+
+
+def test_parse_incoming_rejects_yaml_scalar_root():
+    # A bare scalar like "just a string" parses but isn't a mapping — boot
+    # would crash trying to index into sections.
+    body = {"yaml": "just a string"}
+    with pytest.raises(ConfigSaveError):
+        parse_incoming(body)
+
+
+def test_parse_incoming_rejects_empty_yaml():
+    with pytest.raises(ConfigSaveError) as exc:
+        parse_incoming({"yaml": ""})
+    assert exc.value.status == 400
+
+
+def test_parse_incoming_rejects_non_dict_body():
+    with pytest.raises(ConfigSaveError) as exc:
+        parse_incoming("not a dict")  # type: ignore[arg-type]
+    assert exc.value.status == 400
+
+
+# ── read_current ────────────────────────────────────────────────
+
+
+def test_read_current_returns_yaml_and_parsed(config_path):
+    result = read_current(config_path)
+    assert result["exists"] is True
+    assert result["path"] == config_path
+    assert "llm:" in result["yaml"]
+    assert result["config"]["llm"]["provider"] == "anthropic"
+    assert result["config"]["user"]["name"] == "Test"
+
+
+def test_read_current_missing_file(tmp_path):
+    missing = str(tmp_path / "none.yaml")
+    result = read_current(missing)
+    assert result["exists"] is False
+    assert result["yaml"] == ""
+    assert result["config"] == {}
+    assert result["path"] == missing
+
+
+def test_read_current_does_not_resolve_env_vars(tmp_path, monkeypatch):
+    # If the UI displayed resolved values, the user would re-save the
+    # resolved secret back into the file, silently breaking ${VAR} indirection.
+    monkeypatch.setenv("MY_TOKEN", "super-secret-value")
+    cfg_path = tmp_path / "tailor.yaml"
+    cfg_path.write_text("auth:\n  token: ${MY_TOKEN}\n")
+
+    result = read_current(str(cfg_path))
+
+    assert "${MY_TOKEN}" in result["yaml"]
+    assert result["config"]["auth"]["token"] == "${MY_TOKEN}"
+    assert "super-secret-value" not in result["yaml"]
+
+
+def test_read_current_tolerates_malformed_yaml(tmp_path):
+    # If the file is broken, we still want to return the raw text so the UI
+    # can show it in the editor (that's how the user fixes it).
+    cfg_path = tmp_path / "tailor.yaml"
+    cfg_path.write_text("llm:\n  provider: [unclosed\n")
+
+    result = read_current(str(cfg_path))
+
+    assert result["exists"] is True
+    assert "unclosed" in result["yaml"]
+    assert result["config"] == {}  # couldn't parse
+
+
+# ── end-to-end: validate via the same pipeline the endpoint uses ─
+
+
+def test_endpoint_shaped_validate_happy(config_path):
+    # Mimics what the /validate endpoint does internally.
+    body = {"yaml": "llm:\n  temperature: 0.7\n"}
+    incoming = parse_incoming(body)
+    result = save_config(incoming, config_path, dry_run=True)
+    assert result["ok"] and result["dry_run"]
+    # Real config untouched.
+    assert yaml.safe_load(open(config_path).read())["llm"]["temperature"] == 0.3
+
+
+def test_endpoint_shaped_validate_surfaces_blacklist(config_path):
+    body = {"config": {"auth": {"token": "x"}}}
+    incoming = parse_incoming(body)
+    with pytest.raises(ConfigSaveError) as exc:
+        save_config(incoming, config_path, dry_run=True)
+    assert exc.value.status == 403
+
+
+def test_endpoint_shaped_validate_surfaces_yaml_parse_error():
+    # YAML parse happens in parse_incoming, BEFORE save_config — the
+    # endpoint converts the exception into {valid: false}.
+    body = {"yaml": "llm: [unclosed"}
+    with pytest.raises(ConfigSaveError) as exc:
+        parse_incoming(body)
+    assert exc.value.status == 400

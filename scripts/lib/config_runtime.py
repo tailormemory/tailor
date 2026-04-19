@@ -149,6 +149,12 @@ def _iter_modules_by_basename(basename: str):
 def soft_reload() -> dict[str, list[str]]:
     """Reset all config-derived singletons so the next access reads fresh.
 
+    We scan sys.modules by *basename* (not by canonical import path) because
+    this codebase imports the same file under multiple names — `embedding`
+    and `scripts.lib.embedding` produce two distinct module objects, and
+    patching only one leaves the other with stale cached values. Same for
+    `llm_client` / `lib.llm_client` and `config` / `scripts.lib.config`.
+
     Returns a {category: [module_name, ...]} map of what was reset, for
     logging and tests. Categories: "config", "llm_client", "embedding",
     "i18n". A module can appear once per category it matches.
@@ -233,7 +239,9 @@ class ConfigSaveError(Exception):
         self.message = message
 
 
-def save_config(incoming: dict, config_path: str) -> dict[str, Any]:
+def save_config(
+    incoming: dict, config_path: str, *, dry_run: bool = False
+) -> dict[str, Any]:
     """Validate + backup + write + soft-reload. Returns a summary dict
     describing what happened; raises ConfigSaveError on rejection.
 
@@ -241,12 +249,17 @@ def save_config(incoming: dict, config_path: str) -> dict[str, Any]:
       1. Blacklist check on incoming sections         → 403
       2. Load current file (if any), shallow-merge    → 500 on read failure
       3. Validate merged config is YAML-loadable      → 400
-      4. Back up current file (if it exists)          → best-effort
+      [dry_run=True returns here — no write, no reload]
+      4. Back up current file (if it exists)
       5. Write merged YAML
       6. Soft-reload singletons
 
-    Callers (the dashboard endpoint today, /validate DRY-RUN tomorrow) should
-    translate the ConfigSaveError.status into the matching HTTP response.
+    `dry_run` is what /api/dashboard/config/validate rides on. Same function,
+    same checks: guarantees /validate and /save cannot diverge on what
+    counts as a valid payload. Do not split into two paths.
+
+    Callers should translate ConfigSaveError.status into the matching HTTP
+    response.
     """
     if not isinstance(incoming, dict) or not incoming:
         raise ConfigSaveError(400, "Empty or malformed config body")
@@ -273,6 +286,9 @@ def save_config(incoming: dict, config_path: str) -> dict[str, Any]:
     if not ok:
         raise ConfigSaveError(400, f"Config validation failed: {err}")
 
+    if dry_run:
+        return {"ok": True, "dry_run": True, "backup": "", "reloaded": {}}
+
     backup_path = create_backup(config_path)
 
     try:
@@ -288,6 +304,74 @@ def save_config(incoming: dict, config_path: str) -> dict[str, Any]:
 
     return {
         "ok": True,
+        "dry_run": False,
         "backup": os.path.basename(backup_path) if backup_path else "",
         "reloaded": reloaded,
     }
+
+
+# ── Read helpers (for GET /current, POST /validate) ─────────────
+
+
+def read_current(config_path: str) -> dict[str, Any]:
+    """Return current tailor.yaml as both raw text and parsed dict.
+
+    Raw on purpose: no ${ENV_VAR} resolution. The UI needs to display and
+    round-trip exactly what's on disk — resolving would leak env var values
+    into the browser and re-saving would then bake them in, silently
+    breaking the indirection.
+
+    Returns {exists, path, yaml, config}. If the file is missing, returns
+    empty strings/dicts so the UI can still render.
+    """
+    result: dict[str, Any] = {
+        "exists": False,
+        "path": config_path,
+        "yaml": "",
+        "config": {},
+    }
+    if not os.path.exists(config_path):
+        return result
+    result["exists"] = True
+    with open(config_path) as f:
+        raw = f.read()
+    result["yaml"] = raw
+    try:
+        parsed = yaml.safe_load(raw)
+    except yaml.YAMLError:
+        parsed = None
+    result["config"] = parsed if isinstance(parsed, dict) else {}
+    return result
+
+
+def parse_incoming(body: Any) -> dict:
+    """Coerce a request body into a config dict.
+
+    Accepted shapes (validate/save both ride on this so the UI can send
+    either form without asking which endpoint accepts what):
+      - a parsed dict (already decoded from JSON)
+      - {"config": {...dict...}} wrapper — explicit
+      - {"yaml": "..."} wrapper — raw YAML string to parse
+
+    Raises ConfigSaveError(400, ...) on malformed input.
+    """
+    if not isinstance(body, dict):
+        raise ConfigSaveError(400, "Body must be a JSON object")
+
+    if isinstance(body.get("yaml"), str):
+        try:
+            parsed = yaml.safe_load(body["yaml"])
+        except yaml.YAMLError as e:
+            raise ConfigSaveError(400, f"YAML parse failed: {e}")
+        if parsed is None:
+            raise ConfigSaveError(400, "Empty YAML")
+        if not isinstance(parsed, dict):
+            raise ConfigSaveError(400, "YAML root must be a mapping")
+        return parsed
+
+    if isinstance(body.get("config"), dict):
+        return body["config"]
+
+    # Bare dict — treat the whole body as the config (preserves Setup
+    # Wizard's existing contract, which posts sections at the top level).
+    return body

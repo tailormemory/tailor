@@ -478,10 +478,13 @@ class BearerAuthMiddleware:
                     data = _jcfg.loads(body) if body else {}
                 except Exception:
                     return _json_response({"error": "Invalid JSON body"}, 400)
-                from scripts.lib.config_runtime import save_config, ConfigSaveError
+                from scripts.lib.config_runtime import (
+                    save_config, parse_incoming, ConfigSaveError,
+                )
                 config_path = os.path.join(BASE_DIR, "config", "tailor.yaml")
                 try:
-                    result = save_config(data, config_path)
+                    incoming = parse_incoming(data)
+                    result = save_config(incoming, config_path)
                 except ConfigSaveError as e:
                     return _json_response({"error": e.message}, e.status)
                 return _json_response({
@@ -490,6 +493,41 @@ class BearerAuthMiddleware:
                     "backup": result["backup"],
                     "reloaded": result["reloaded"],
                 })
+
+            elif path == "/api/dashboard/config/validate":
+                # Dry-run variant of /save. Runs the exact same pipeline
+                # (blacklist + merge + validate_loadable) but stops before
+                # any disk write or singleton reset — so the UI can give
+                # instant feedback on the YAML editor without side effects.
+                body = await _receive_body(scope, receive)
+                import json as _jcfg
+                try:
+                    data = _jcfg.loads(body) if body else {}
+                except Exception:
+                    return _json_response(
+                        {"valid": False, "error": "Invalid JSON body"}
+                    )
+                from scripts.lib.config_runtime import (
+                    save_config, parse_incoming, ConfigSaveError,
+                )
+                config_path = os.path.join(BASE_DIR, "config", "tailor.yaml")
+                try:
+                    incoming = parse_incoming(data)
+                    save_config(incoming, config_path, dry_run=True)
+                except ConfigSaveError as e:
+                    return _json_response(
+                        {"valid": False, "error": e.message, "status": e.status}
+                    )
+                return _json_response({"valid": True, "error": None})
+
+            elif path == "/api/dashboard/config/current":
+                # Raw read of tailor.yaml (no env var resolution — see
+                # read_current() for the reasoning). Returns both the
+                # source text and the parsed dict so the UI can populate
+                # both the form view and the raw YAML editor.
+                from scripts.lib.config_runtime import read_current
+                config_path = os.path.join(BASE_DIR, "config", "tailor.yaml")
+                return _json_response(read_current(config_path))
 
             # ── Upload conversation files ──
             elif path == "/api/dashboard/upload":
