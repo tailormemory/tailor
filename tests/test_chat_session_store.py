@@ -183,3 +183,72 @@ def test_store_survives_reopen(tmp_path):
     s2 = ChatSessionStore(path)
     assert s2.get_session(sid)["message_count"] == 1
     assert s2.get_messages(sid)[0]["content"] == "persisted"
+
+
+# ── per-session provider/model (migration 003) ─────────────────
+
+def test_create_session_without_provider_stores_null(store):
+    sid = store.create_session()
+    s = store.get_session(sid)
+    assert s["provider"] is None
+    assert s["model"] is None
+
+
+def test_create_session_with_provider_and_model_persists(store):
+    sid = store.create_session(provider="ollama", model="qwen3.5:9b")
+    s = store.get_session(sid)
+    assert s["provider"] == "ollama"
+    assert s["model"] == "qwen3.5:9b"
+
+
+def test_list_sessions_includes_provider_and_model(store):
+    sid_a = store.create_session(provider="anthropic", model="claude-haiku-4-5-20251001")
+    sid_b = store.create_session()
+    listed = {s["id"]: s for s in store.list_sessions()}
+    assert listed[sid_a]["provider"] == "anthropic"
+    assert listed[sid_a]["model"] == "claude-haiku-4-5-20251001"
+    assert listed[sid_b]["provider"] is None
+    assert listed[sid_b]["model"] is None
+
+
+def test_store_upgrades_legacy_schema_without_provider_columns(tmp_path):
+    """Simulates the pre-migration-003 DB: open an sqlite file with the older
+    chat_sessions schema, then open it via ChatSessionStore. The in-code
+    migration should add provider/model columns without data loss."""
+    import sqlite3
+    path = str(tmp_path / "legacy.sqlite3")
+    c = sqlite3.connect(path)
+    c.executescript(
+        """
+        CREATE TABLE chat_sessions (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT 'New chat',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            message_count INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE chat_messages (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            tool_calls TEXT,
+            tool_results TEXT,
+            created_at TEXT NOT NULL,
+            tokens INTEGER,
+            duration_ms INTEGER
+        );
+        INSERT INTO chat_sessions (id, title, created_at, updated_at, message_count)
+        VALUES ('sess_legacy0001', 'Existing chat', '2026-04-01T00:00:00.000Z', '2026-04-01T00:00:00.000Z', 3);
+        """
+    )
+    c.commit()
+    c.close()
+
+    s = ChatSessionStore(path)
+    row = s.get_session("sess_legacy0001")
+    assert row is not None
+    assert row["title"] == "Existing chat"
+    assert row["message_count"] == 3
+    assert row["provider"] is None
+    assert row["model"] is None

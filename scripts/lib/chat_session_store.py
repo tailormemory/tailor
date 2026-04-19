@@ -25,7 +25,9 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
     title TEXT NOT NULL DEFAULT 'New chat',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    message_count INTEGER NOT NULL DEFAULT 0
+    message_count INTEGER NOT NULL DEFAULT 0,
+    provider TEXT,
+    model TEXT
 );
 CREATE TABLE IF NOT EXISTS chat_messages (
     id TEXT PRIMARY KEY,
@@ -41,6 +43,17 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 CREATE INDEX IF NOT EXISTS idx_messages_session ON chat_messages(session_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_updated ON chat_sessions(updated_at DESC);
 """
+
+
+def _ensure_provider_columns(conn) -> None:
+    """Idempotent: add provider/model columns to chat_sessions if an older
+    schema (pre-migration 003) is present. No-op on fresh DBs where the
+    columns are already in the CREATE TABLE above."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(chat_sessions)").fetchall()}
+    if "provider" not in cols:
+        conn.execute("ALTER TABLE chat_sessions ADD COLUMN provider TEXT")
+    if "model" not in cols:
+        conn.execute("ALTER TABLE chat_sessions ADD COLUMN model TEXT")
 
 _DEFAULT_TITLE = "New chat"
 
@@ -96,23 +109,30 @@ class ChatSessionStore:
     def _ensure_schema(self) -> None:
         with self._lock, self._conn() as c:
             c.executescript(_MIGRATION)
+            _ensure_provider_columns(c)
 
     # ── sessions ───────────────────────────────────────────────
 
-    def create_session(self) -> str:
+    def create_session(self, provider: str | None = None, model: str | None = None) -> str:
+        """Create a session. When provider/model are both None the session
+        inherits the default brain at call time; otherwise the pair is
+        persisted and the same brain is used for every turn of this session."""
         sid = _new_session_id()
         ts = _now()
         with self._lock, self._conn() as c:
             c.execute(
-                "INSERT INTO chat_sessions (id, title, created_at, updated_at, message_count) VALUES (?, ?, ?, ?, 0)",
-                (sid, _DEFAULT_TITLE, ts, ts),
+                "INSERT INTO chat_sessions "
+                "(id, title, created_at, updated_at, message_count, provider, model) "
+                "VALUES (?, ?, ?, ?, 0, ?, ?)",
+                (sid, _DEFAULT_TITLE, ts, ts, provider, model),
             )
         return sid
 
     def get_session(self, session_id: str) -> dict | None:
         with self._conn() as c:
             row = c.execute(
-                "SELECT id, title, created_at, updated_at, message_count FROM chat_sessions WHERE id = ?",
+                "SELECT id, title, created_at, updated_at, message_count, provider, model "
+                "FROM chat_sessions WHERE id = ?",
                 (session_id,),
             ).fetchone()
         return dict(row) if row else None
@@ -120,7 +140,7 @@ class ChatSessionStore:
     def list_sessions(self, limit: int = 50) -> list[dict]:
         with self._conn() as c:
             rows = c.execute(
-                "SELECT id, title, created_at, updated_at, message_count "
+                "SELECT id, title, created_at, updated_at, message_count, provider, model "
                 "FROM chat_sessions ORDER BY updated_at DESC LIMIT ?",
                 (int(limit),),
             ).fetchall()
