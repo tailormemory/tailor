@@ -416,7 +416,19 @@ def _revert_after_reload_failure(
 
 class ConfigSaveError(Exception):
     """Structured failure from save_config(). `status` is the HTTP code the
-    caller should return; `message` is UI-safe."""
+    caller should return; `message` is UI-safe.
+
+    TODO(when-cross-field-validation-added): today `message` is a single
+    human string, which the form-mode UI renders as a banner at the top
+    ("Some fields need attention…"). The moment we grow a check that
+    spans multiple fields (e.g. "provider X requires api_key_env") or
+    want to point the UI at exactly one input (instead of a generic
+    scrollIntoView heuristic), evolve this into:
+        {"errors": [{"field": "llm.api_key_env", "message": "..."}, ...]}
+    and teach the /save endpoint to return it alongside the existing
+    `error` string for backward compatibility. Don't preemptively do
+    this — it's waste until we have the first multi-field check.
+    """
 
     def __init__(self, status: int, message: str):
         super().__init__(message)

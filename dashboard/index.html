@@ -11,6 +11,18 @@
   <!-- Markdown rendering for the Chat tab. CDN — vendor locally if offline-first needed. -->
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.7/dist/purify.min.js"></script>
+  <!-- CodeMirror 5 + YAML mode for the config editor's "Advanced (YAML)" view.
+       CM5 because: single-file, no build step, rock-solid. CM6 would need
+       importmaps + type="module" gymnastics that conflict with the rest of
+       this file's top-level scripts. See the commit body for the trade-off. -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/material-darker.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/yaml/yaml.min.js"></script>
+  <!-- Browser YAML parser: needed for client-side syntax checks + the
+       form↔YAML view sync. Every keystroke re-parses; if the result
+       is a dict, we update the shared draft state. -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/js-yaml/4.1.0/js-yaml.min.js"></script>
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -1282,17 +1294,97 @@
     // Compute which top-level sections differ from `loaded`. We send only
     // those to /save — backend does shallow merge within each section, so
     // sending a full section is a safe overwrite even if only one key changed.
+    //
+    // We compare ALL top-level keys (not just RUNTIME_EDITABLE_SECTIONS):
+    // the YAML editor can write to any key, and silently dropping changes
+    // to non-whitelisted sections would confuse the user. Better to send
+    // them and let the backend blacklist reject with a clear 403 message
+    // — "Section 'nightly' cannot be edited via UI" is honest.
     const computeSavePayload = (draft, loaded) => {
       const out = {};
-      for (const key of RUNTIME_EDITABLE_SECTIONS) {
-        const a = draft[key];
-        const b = loaded[key];
+      const keys = new Set([...Object.keys(draft || {}), ...Object.keys(loaded || {})]);
+      for (const key of keys) {
+        const a = (draft || {})[key];
+        const b = (loaded || {})[key];
         if (JSON.stringify(a) !== JSON.stringify(b)) {
           out[key] = a;
         }
       }
       return out;
     };
+
+    // ── YAML editor (CodeMirror 5 wrapper) ─────────────────────────
+    //
+    // Mounts a CM5 instance into a <div> on first render and keeps it
+    // alive across React renders via useRef. Destroys on unmount. Theme
+    // toggles propagate via setOption (cheap). External value changes
+    // (e.g. Form → YAML switch regenerating the YAML text from draft)
+    // are pushed in via setValue, but only when the incoming value
+    // actually differs from the editor's current buffer — otherwise
+    // every keystroke round-trips and trashes the cursor.
+    function YamlEditor({ value, onChange, themeName }) {
+      const hostRef = React.useRef(null);
+      const cmRef = React.useRef(null);
+
+      useEffect(() => {
+        if (!hostRef.current || cmRef.current) return;
+        if (!window.CodeMirror) return;  // CDN didn't load — render fallback
+        const cm = window.CodeMirror(hostRef.current, {
+          value: value || "",
+          mode: "yaml",
+          lineNumbers: true,
+          theme: themeName === "dark" ? "material-darker" : "default",
+          indentUnit: 2,
+          tabSize: 2,
+          lineWrapping: false,
+          viewportMargin: Infinity,  // render full content; avoids weird virtualization
+        });
+        cm.on("change", () => onChange(cm.getValue()));
+        cmRef.current = cm;
+        return () => {
+          // eslint-disable-next-line no-unused-expressions
+          cm.toTextArea && cm.toTextArea();
+          cmRef.current = null;
+        };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, []);
+
+      // External value sync. Guarded by the string equality check so
+      // onChange events don't chase their own tail.
+      useEffect(() => {
+        if (cmRef.current && cmRef.current.getValue() !== value) {
+          const prevCursor = cmRef.current.getCursor();
+          cmRef.current.setValue(value || "");
+          // Best-effort cursor restore. If the new value is shorter,
+          // CM clamps automatically.
+          try { cmRef.current.setCursor(prevCursor); } catch {}
+        }
+      }, [value]);
+
+      useEffect(() => {
+        if (cmRef.current) {
+          cmRef.current.setOption("theme", themeName === "dark" ? "material-darker" : "default");
+        }
+      }, [themeName]);
+
+      // Fallback for the (unlikely) case where the CDN is blocked: degrade
+      // to a plain textarea so the editor is still usable.
+      if (!window.CodeMirror) {
+        return React.createElement("textarea", {
+          value: value || "",
+          onChange: (e) => onChange(e.target.value),
+          rows: 20,
+          className: "w-full font-mono text-sm p-3 border rounded-lg",
+          spellCheck: false,
+        });
+      }
+
+      return React.createElement("div", {
+        ref: hostRef,
+        className: "border rounded-lg overflow-hidden",
+        style: { minHeight: "400px" },
+      });
+    }
 
     function RuntimeConfigEditor({ mode, onDirtyChange, onSaved }) {
       const t = themes[mode];
@@ -1305,6 +1397,29 @@
       const [serverError, setServerError] = useState("");
       const [saveMsg, setSaveMsg] = useState("");
       const [fieldErrors, setFieldErrors] = useState({}); // {"llm.model": "Required"}
+
+      // ── YAML view state ────────────────────────────────────────
+      // viewMode is the visible panel: "form" or "yaml". yamlText is the
+      // local buffer for the YAML editor — NOT the source of truth. The
+      // source of truth is `draft`; yamlText is what the user is typing
+      // right now, which becomes `draft` once it parses.
+      //
+      // Sync model between views:
+      //   Form → YAML: yamlText = yaml.dump(draft) on switch. Form edits
+      //                always update draft, so YAML always rebuilds fresh.
+      //   YAML → Form: keystrokes → debounced parse → if valid, replace
+      //                draft. Switch to form at any time; form renders
+      //                from whatever draft currently holds.
+      //   Switch out of YAML with unparseable text: confirm, discard
+      //                YAML changes (revert yamlText from current draft).
+      const [viewMode, setViewMode] = useState("form");
+      const [yamlText, setYamlText] = useState("");
+      const [yamlParseError, setYamlParseError] = useState("");       // syntax
+      const [yamlValidateStatus, setYamlValidateStatus] = useState("idle");  // idle|validating|ok|error
+      const [yamlValidateError, setYamlValidateError] = useState(""); // server-side
+      // Revision counter so the debounced validator knows whether the
+      // response it's about to apply is still the freshest request.
+      const yamlSeqRef = React.useRef(0);
 
       // Fetch current config on mount.
       const reload = useCallback(async () => {
@@ -1346,6 +1461,143 @@
 
       const toggle = (key) => setExpanded(s => ({ ...s, [key]: !s[key] }));
 
+      // ── YAML ↔ draft sync ────────────────────────────────────
+      //
+      // serializeDraftToYaml runs on every Form → YAML switch, and on
+      // reload. We dump via js-yaml with flow styling off and insertion
+      // order preserved so the user sees a shape close to what's on disk.
+      const serializeDraftToYaml = React.useCallback((d) => {
+        if (!d) return "";
+        try {
+          return window.jsyaml ? window.jsyaml.dump(d, { lineWidth: 120, noRefs: true, sortKeys: false }) : JSON.stringify(d, null, 2);
+        } catch (e) {
+          return `# YAML serialization failed: ${e.message}\n`;
+        }
+      }, []);
+
+      // parseYamlText: client-only. Returns {ok, data} or {ok:false, err}.
+      const parseYamlText = React.useCallback((text) => {
+        if (!window.jsyaml) return { ok: false, err: "YAML parser not loaded" };
+        try {
+          const parsed = window.jsyaml.load(text || "");
+          if (parsed === null || parsed === undefined) {
+            return { ok: false, err: "Empty document" };
+          }
+          if (typeof parsed !== "object" || Array.isArray(parsed)) {
+            return { ok: false, err: "YAML root must be a mapping (key: value pairs)" };
+          }
+          return { ok: true, data: parsed };
+        } catch (e) {
+          // js-yaml gives us line numbers in e.mark.line (0-indexed).
+          const where = e.mark ? ` (line ${e.mark.line + 1})` : "";
+          return { ok: false, err: `${e.reason || e.message}${where}` };
+        }
+      }, []);
+
+      // On entry to YAML view, regenerate the buffer from current draft.
+      // We do NOT regenerate on every draft change — that would clobber
+      // user edits mid-typing. Only on explicit switch.
+      useEffect(() => {
+        if (viewMode === "yaml" && draft) {
+          setYamlText(prev => {
+            // Only overwrite if buffer is stale (e.g. just entered YAML view).
+            // The marker is: prev === "" after switch, or the parse of prev
+            // no longer matches draft (meaning Form changed something while
+            // we weren't looking).
+            if (prev === "") return serializeDraftToYaml(draft);
+            const parsed = parseYamlText(prev);
+            if (parsed.ok && JSON.stringify(parsed.data) === JSON.stringify(draft)) {
+              return prev;  // buffer still matches draft — keep cursor
+            }
+            return serializeDraftToYaml(draft);
+          });
+          // Reset validate status on view entry.
+          setYamlValidateStatus("idle");
+          setYamlValidateError("");
+          setYamlParseError("");
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [viewMode]);
+
+      // Keystroke path: parse locally, if good update draft, kick off
+      // server /validate with a 500ms debounce.
+      //
+      // Why 500ms: fast enough to feel responsive, slow enough that a
+      // word's worth of typing doesn't trigger multiple requests. Too
+      // short (e.g. 200ms) makes devtools look like a DDoS; too long
+      // (e.g. 1s) and the user has already forgotten what they typed
+      // when the feedback arrives. 500ms is the search-as-you-type
+      // industry default for the same reason.
+      useEffect(() => {
+        if (viewMode !== "yaml") return;
+        const parsed = parseYamlText(yamlText);
+        if (!parsed.ok) {
+          setYamlParseError(parsed.err);
+          setYamlValidateStatus("idle");
+          return;
+        }
+        setYamlParseError("");
+        // Update the shared draft — this is what makes Form view see the
+        // YAML edits when the user switches back.
+        setDraft(parsed.data);
+
+        // Debounced server-side /validate. seq guards against a late
+        // response overwriting a later one.
+        const mySeq = ++yamlSeqRef.current;
+        setYamlValidateStatus("validating");
+        const timer = setTimeout(async () => {
+          const r = await apiCall("/api/dashboard/config/validate", {
+            method: "POST", body: { yaml: yamlText },
+          });
+          if (mySeq !== yamlSeqRef.current) return;  // stale
+          if (r.ok) {
+            setYamlValidateStatus("ok");
+            setYamlValidateError("");
+          } else {
+            setYamlValidateStatus("error");
+            setYamlValidateError(r.error || "Validation failed");
+          }
+        }, 500);
+        return () => clearTimeout(timer);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [yamlText, viewMode]);
+
+      // View toggle with sync + confirm-on-unparseable.
+      const switchViewMode = (next) => {
+        if (next === viewMode) return;
+        if (viewMode === "yaml" && yamlParseError) {
+          const ok = window.confirm(
+            "The YAML editor has unsaved syntax errors. " +
+            "Switching to Form view will discard those edits. Continue?"
+          );
+          if (!ok) return;
+          // Revert yamlText to match current draft.
+          setYamlText(serializeDraftToYaml(draft));
+          setYamlParseError("");
+        }
+        setViewMode(next);
+      };
+
+      const triggerYamlValidateNow = async () => {
+        const parsed = parseYamlText(yamlText);
+        if (!parsed.ok) {
+          setYamlParseError(parsed.err);
+          setYamlValidateStatus("idle");
+          return;
+        }
+        setYamlValidateStatus("validating");
+        const r = await apiCall("/api/dashboard/config/validate", {
+          method: "POST", body: { yaml: yamlText },
+        });
+        if (r.ok) {
+          setYamlValidateStatus("ok");
+          setYamlValidateError("");
+        } else {
+          setYamlValidateStatus("error");
+          setYamlValidateError(r.error || "Validation failed");
+        }
+      };
+
       // Basic client-side validation run on Save click. Returns map of
       // fieldId → error message; empty map = valid. Intentionally narrow:
       // required + type checks only. Semantic validity (is this a real
@@ -1378,11 +1630,32 @@
 
       const handleSave = async () => {
         setServerError(""); setSaveMsg("");
-        const errs = runClientValidation();
-        setFieldErrors(errs);
-        if (Object.keys(errs).length > 0) {
-          setServerError("Some fields need attention — see highlighted entries below.");
+        // In YAML view, a save with a broken buffer is a hard no —
+        // we don't know what the user meant.
+        if (viewMode === "yaml" && yamlParseError) {
+          setServerError(`Fix YAML errors before saving: ${yamlParseError}`);
           return;
+        }
+        // Form-view-only client validation (required/numeric checks).
+        // YAML view bypasses this because the YAML text can legitimately
+        // drop sections or change the shape beyond what the form knows.
+        if (viewMode === "form") {
+          const errs = runClientValidation();
+          setFieldErrors(errs);
+          if (Object.keys(errs).length > 0) {
+            setServerError("Some fields need attention — see highlighted entries below.");
+            // Scroll the first offending field into view. Sections may be
+            // collapsed or off-viewport; "see below" would otherwise lie.
+            // scrollIntoView on a non-visible element is a silent no-op —
+            // rare edge (no expanded section has a matching field) and not
+            // worth extra logic to handle.
+            setTimeout(() => {
+              const firstId = Object.keys(errs)[0];
+              const el = document.querySelector(`[data-field-id="${firstId}"]`);
+              if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+            }, 0);
+            return;
+          }
         }
         const payload = computeSavePayload(draft, loaded);
         if (Object.keys(payload).length === 0) return;
@@ -1392,6 +1665,10 @@
           setSaveMsg(`Saved. Backup: ${r.data.backup || "(none — first save)"}`);
           setTimeout(() => setSaveMsg(""), 4000);
           await reload();
+          // After reload, re-serialize YAML so the editor reflects the
+          // post-save state (e.g. backend reformatted or soft-reload
+          // adjusted something). Harmless if user is in form view.
+          setYamlText("");
           if (onSaved) onSaved();
         } else {
           setServerError(r.error || "Save failed");
@@ -1401,6 +1678,10 @@
 
       const handleDiscard = () => {
         setDraft(cloneConfigForEdit(loaded));
+        setYamlText("");  // force regeneration from loaded on next YAML entry
+        setYamlParseError("");
+        setYamlValidateStatus("idle");
+        setYamlValidateError("");
         setFieldErrors({});
         setServerError("");
         setSaveMsg("");
@@ -1423,7 +1704,10 @@
       const d = draft || {};
 
       // ── Shared field components ────────────────────────────
-      const Field = ({ id, label, help, children }) => React.createElement("div", { className: "mb-4" },
+      const Field = ({ id, label, help, children }) => React.createElement("div", {
+          className: "mb-4",
+          "data-field-id": id,  // used by scrollIntoView when validation fails
+        },
         React.createElement("label", { className: cl("text-sm font-medium block mb-1.5", t.textLabel) }, label),
         children,
         fieldErrors[id] && React.createElement("p", { className: "text-xs text-red-400 mt-1" }, fieldErrors[id]),
@@ -1794,26 +2078,77 @@
             }, saving ? "Saving..." : (dirty ? "Save" : "Saved")),
           ),
         ),
+        // View mode toggle: Form / Advanced (YAML). Sits right above the
+        // body so it reads as a section-header control, not a tab-bar.
+        React.createElement("div", { className: "flex items-center gap-1 mb-3 p-1 rounded-lg inline-flex",
+          style: { background: mode === "dark" ? "rgba(255,255,255,0.04)" : "rgba(0,0,0,0.04)" } },
+          ["form", "yaml"].map(m => React.createElement("button", {
+            key: m, onClick: () => switchViewMode(m),
+            className: cl("px-3 py-1.5 rounded-md text-xs font-semibold transition-all",
+              viewMode === m ? (mode === "dark" ? "bg-zinc-800 text-zinc-100" : "bg-white text-zinc-900 shadow-sm") : t.textFaint + " hover:" + t.text),
+          }, m === "form" ? "Form" : "Advanced (YAML)")),
+        ),
         serverError && React.createElement("div", {
           className: cl("mb-3 px-3 py-2 rounded-lg border text-sm",
             mode === "dark" ? "bg-red-900/20 border-red-800/40 text-red-300" : "bg-red-50 border-red-200 text-red-700"),
         }, "\u26A0\uFE0F ", serverError),
-        React.createElement("div", { className: "space-y-2" },
-          React.createElement(AccSection, { id: "chat_interface", title: "Chat interface", icon: "\u{1F4AC}",
-            subtitle: "System prompt, available providers, suggested prompts, limits" }, chatInterfaceFields),
-          React.createElement(AccSection, { id: "llm", title: "Default LLM", icon: "\u{1F9E0}",
-            subtitle: "Provider, model, temperature, tool use" }, llmFields),
-          React.createElement(AccSection, { id: "classifier", title: "Intent classifier", icon: "\u{1F500}",
-            subtitle: "Provider and model for intent routing" }, classifierFields),
-          React.createElement(AccSection, { id: "embedding", title: "Embedding", icon: "\u{1F52E}",
-            subtitle: "Vector model — changing this requires re-embedding" }, embFields),
-          React.createElement(AccSection, { id: "persona", title: "Telegram persona", icon: "\u{1F4F1}",
-            subtitle: "System prompt for the Telegram bot" }, personaFields),
-          React.createElement(AccSection, { id: "branding", title: "Branding", icon: "\u{1F3F7}\uFE0F",
-            subtitle: "App name" }, brandingFields),
-          React.createElement(AccSection, { id: "user", title: "About you", icon: "\u{1F464}",
-            subtitle: "Name, bio, language" }, userFields),
-        ),
+        // Body: form accordion OR YAML editor depending on viewMode.
+        viewMode === "form"
+          ? React.createElement("div", { className: "space-y-2" },
+              React.createElement(AccSection, { id: "chat_interface", title: "Chat interface", icon: "\u{1F4AC}",
+                subtitle: "System prompt, available providers, suggested prompts, limits" }, chatInterfaceFields),
+              React.createElement(AccSection, { id: "llm", title: "Default LLM", icon: "\u{1F9E0}",
+                subtitle: "Provider, model, temperature, tool use" }, llmFields),
+              React.createElement(AccSection, { id: "classifier", title: "Intent classifier", icon: "\u{1F500}",
+                subtitle: "Provider and model for intent routing" }, classifierFields),
+              React.createElement(AccSection, { id: "embedding", title: "Embedding", icon: "\u{1F52E}",
+                subtitle: "Vector model — changing this requires re-embedding" }, embFields),
+              React.createElement(AccSection, { id: "persona", title: "Telegram persona", icon: "\u{1F4F1}",
+                subtitle: "System prompt for the Telegram bot" }, personaFields),
+              React.createElement(AccSection, { id: "branding", title: "Branding", icon: "\u{1F3F7}\uFE0F",
+                subtitle: "App name" }, brandingFields),
+              React.createElement(AccSection, { id: "user", title: "About you", icon: "\u{1F464}",
+                subtitle: "Name, bio, language" }, userFields),
+            )
+          : React.createElement("div", null,
+              // Mobile hint: CM5 is usable but cramped on small screens.
+              React.createElement("div", { className: "md:hidden mb-2 text-xs px-3 py-2 rounded-lg border",
+                style: { background: mode === "dark" ? "rgba(251,191,36,0.08)" : "rgba(251,191,36,0.12)",
+                  borderColor: mode === "dark" ? "rgba(251,191,36,0.2)" : "rgba(251,191,36,0.3)",
+                  color: mode === "dark" ? "#fbbf24" : "#b45309" } },
+                "\u2139\uFE0F YAML editor works best on desktop. Consider using Form view on mobile."),
+              React.createElement("div", { className: "flex items-center justify-between mb-2" },
+                // Left: live status of the YAML buffer (parse + /validate result).
+                React.createElement("div", { className: cl("text-xs flex items-center gap-2", t.textFaint) },
+                  yamlParseError
+                    ? React.createElement("span", { className: "text-red-400" }, "\u2718 ", yamlParseError)
+                    : yamlValidateStatus === "validating"
+                      ? React.createElement("span", null, "\u2026 validating")
+                      : yamlValidateStatus === "ok"
+                        ? React.createElement("span", { className: "text-emerald-400" }, "\u2713 Validates")
+                        : yamlValidateStatus === "error"
+                          ? React.createElement("span", { className: "text-amber-400" },
+                              "\u26A0\uFE0F ", yamlValidateError)
+                          : React.createElement("span", null, "Ready"),
+                ),
+                React.createElement("button", {
+                  onClick: triggerYamlValidateNow,
+                  className: cl("text-xs px-3 py-1 rounded-md font-semibold",
+                    mode === "dark" ? "bg-zinc-800 hover:bg-zinc-700 text-zinc-300" : "bg-zinc-100 hover:bg-zinc-200 text-zinc-700"),
+                }, "Validate now"),
+              ),
+              React.createElement(YamlEditor, {
+                value: yamlText,
+                onChange: setYamlText,
+                themeName: mode,
+              }),
+              // Below-editor hint about the protected sections. The backend
+              // blacklist will reject these with 403 on save; we warn here
+              // so the user doesn't spend time editing them.
+              React.createElement("div", { className: cl("text-xs mt-2", t.textFaint) },
+                "Protected sections (auth, paths, database, nightly) are shown here but cannot be saved via the UI — the backend returns 403 if you try.",
+              ),
+            ),
       );
     }
 
