@@ -1441,6 +1441,138 @@
       });
     }
 
+    // Helper components for the runtime editor's form view.
+    //
+    // CRITICAL: these MUST live at module scope, not inside
+    // RuntimeConfigEditor. Defining them in the render body produced a
+    // fresh function reference on every render, which React treated as
+    // a new component type and responded by unmounting + remounting the
+    // underlying DOM <input>. Focus was dropped after every keystroke
+    // (user could only type one character at a time) and dirty/Discard
+    // state oscillated because draft edits barely landed between
+    // remounts. Do NOT inline them back into the parent.
+    //
+    // Closed-over state (themeName, fieldErrors, expanded, toggle) is
+    // passed via RuntimeEditorCtx so callsites stay byte-identical —
+    // `React.createElement(Field, { id, label }, children)` resolves to
+    // the module-level component, picks up context, and reconciles in
+    // place instead of remounting.
+    const RuntimeEditorCtx = React.createContext({
+      themeName: "dark",
+      fieldErrors: {},
+      expanded: {},
+      toggle: () => {},
+    });
+
+    function _rcInputCls(themeName, extra = "") {
+      return cl(
+        "w-full px-4 py-2.5 rounded-xl border text-sm outline-none transition-all",
+        "focus:ring-2 focus:ring-teal-500/30 focus:border-teal-500",
+        themes[themeName].input,
+        extra,
+      );
+    }
+
+    function Field({ id, label, help, children }) {
+      const { themeName, fieldErrors } = React.useContext(RuntimeEditorCtx);
+      const t = themes[themeName];
+      const err = fieldErrors && fieldErrors[id];
+      return React.createElement("div", {
+          className: "mb-4",
+          "data-field-id": id,  // used by scrollIntoView when validation fails
+        },
+        React.createElement("label", { className: cl("text-sm font-medium block mb-1.5", t.textLabel) }, label),
+        children,
+        err && React.createElement("p", { className: "text-xs text-red-400 mt-1" }, err),
+        help && !err && React.createElement("p", { className: cl("text-xs mt-1", t.textFaint) }, help),
+      );
+    }
+
+    function TextInput({ id, value, onChange, placeholder, type = "text", mono = false }) {
+      const { themeName, fieldErrors } = React.useContext(RuntimeEditorCtx);
+      const err = fieldErrors && fieldErrors[id];
+      return React.createElement("input", {
+        type, value: value ?? "", placeholder,
+        onChange: (e) => onChange(e.target.value),
+        className: _rcInputCls(themeName, cl(mono ? "font-mono" : "", err ? "border-red-500/60" : "")),
+      });
+    }
+
+    function NumberInput({ id, value, onChange, step = 1, min, max, placeholder }) {
+      const { themeName, fieldErrors } = React.useContext(RuntimeEditorCtx);
+      const err = fieldErrors && fieldErrors[id];
+      return React.createElement("input", {
+        type: "number", value: value ?? "", placeholder, step, min, max,
+        onChange: (e) => {
+          const v = e.target.value;
+          onChange(v === "" ? undefined : Number(v));
+        },
+        className: _rcInputCls(themeName, cl("font-mono", err ? "border-red-500/60" : "")),
+      });
+    }
+
+    function TextArea({ value, onChange, rows = 4, placeholder, mono = false }) {
+      const { themeName } = React.useContext(RuntimeEditorCtx);
+      return React.createElement("textarea", {
+        value: value ?? "", placeholder, rows,
+        onChange: (e) => onChange(e.target.value),
+        className: _rcInputCls(themeName, cl("resize-y", mono ? "font-mono" : "")),
+        style: { minHeight: `${rows * 1.5}em` },
+      });
+    }
+
+    function SelectInput({ id, value, onChange, options, allowEmpty = false }) {
+      const { themeName, fieldErrors } = React.useContext(RuntimeEditorCtx);
+      const err = fieldErrors && fieldErrors[id];
+      return React.createElement("select", {
+        value: value ?? "",
+        onChange: (e) => onChange(e.target.value),
+        className: _rcInputCls(themeName, err ? "border-red-500/60" : ""),
+      },
+        allowEmpty && React.createElement("option", { value: "" }, "— select —"),
+        options.map(o => React.createElement("option", { key: o.value, value: o.value }, o.label)),
+      );
+    }
+
+    function Checkbox({ value, onChange, label }) {
+      const { themeName } = React.useContext(RuntimeEditorCtx);
+      const t = themes[themeName];
+      return React.createElement("label", { className: cl("flex items-center gap-2 text-sm cursor-pointer", t.text) },
+        React.createElement("input", {
+          type: "checkbox", checked: !!value,
+          onChange: (e) => onChange(e.target.checked),
+          className: "w-4 h-4 rounded accent-teal-500",
+        }),
+        label,
+      );
+    }
+
+    function AccSection({ id, title, icon, subtitle, children }) {
+      const { themeName, expanded, toggle } = React.useContext(RuntimeEditorCtx);
+      const t = themes[themeName];
+      const open = !!(expanded && expanded[id]);
+      return React.createElement("div", { className: cl("rounded-xl border overflow-hidden", t.borderLight) },
+        React.createElement("button", {
+          onClick: () => toggle(id),
+          className: cl("w-full flex items-center justify-between px-4 py-3 text-left transition-colors",
+            themeName === "dark" ? "bg-zinc-900/50 hover:bg-zinc-900/70" : "bg-zinc-50 hover:bg-zinc-100"),
+        },
+          React.createElement("div", { className: "flex items-center gap-3" },
+            React.createElement("span", { className: "text-lg" }, icon),
+            React.createElement("div", null,
+              React.createElement("div", { className: cl("text-sm font-semibold", t.text) }, title),
+              subtitle && React.createElement("div", { className: cl("text-xs", t.textFaint) }, subtitle),
+            ),
+          ),
+          React.createElement("span", { className: cl("text-sm", t.textFaint) }, open ? "\u25BC" : "\u25B8"),
+        ),
+        open && React.createElement("div", { className: cl("px-4 py-4 border-t", t.borderLight, themeName === "dark" ? "bg-zinc-950/40" : "bg-white") },
+          children,
+        ),
+      );
+    }
+
+
     function RuntimeConfigEditor({ mode, onDirtyChange, onSaved }) {
       const t = themes[mode];
       const [loaded, setLoaded] = useState(null);
@@ -1800,92 +1932,11 @@
 
       const d = draft || {};
 
-      // ── Shared field components ────────────────────────────
-      const Field = ({ id, label, help, children }) => React.createElement("div", {
-          className: "mb-4",
-          "data-field-id": id,  // used by scrollIntoView when validation fails
-        },
-        React.createElement("label", { className: cl("text-sm font-medium block mb-1.5", t.textLabel) }, label),
-        children,
-        fieldErrors[id] && React.createElement("p", { className: "text-xs text-red-400 mt-1" }, fieldErrors[id]),
-        help && !fieldErrors[id] && React.createElement("p", { className: cl("text-xs mt-1", t.textFaint) }, help),
-      );
-
-      const inputCls = cl(
-        "w-full px-4 py-2.5 rounded-xl border text-sm outline-none transition-all",
-        "focus:ring-2 focus:ring-teal-500/30 focus:border-teal-500",
-        t.input,
-      );
-
-      const TextInput = ({ id, value, onChange, placeholder, type = "text", mono = false }) =>
-        React.createElement("input", {
-          type, value: value ?? "", placeholder,
-          onChange: (e) => onChange(e.target.value),
-          className: cl(inputCls, mono ? "font-mono" : "",
-            fieldErrors[id] ? "border-red-500/60" : ""),
-        });
-
-      const NumberInput = ({ id, value, onChange, step = 1, min, max, placeholder }) =>
-        React.createElement("input", {
-          type: "number", value: value ?? "", placeholder, step, min, max,
-          onChange: (e) => {
-            const v = e.target.value;
-            onChange(v === "" ? undefined : Number(v));
-          },
-          className: cl(inputCls, "font-mono", fieldErrors[id] ? "border-red-500/60" : ""),
-        });
-
-      const TextArea = ({ value, onChange, rows = 4, placeholder, mono = false }) =>
-        React.createElement("textarea", {
-          value: value ?? "", placeholder, rows,
-          onChange: (e) => onChange(e.target.value),
-          className: cl(inputCls, "resize-y", mono ? "font-mono" : ""),
-          style: { minHeight: `${rows * 1.5}em` },
-        });
-
-      const SelectInput = ({ id, value, onChange, options, allowEmpty = false }) =>
-        React.createElement("select", {
-          value: value ?? "",
-          onChange: (e) => onChange(e.target.value),
-          className: cl(inputCls, fieldErrors[id] ? "border-red-500/60" : ""),
-        },
-          allowEmpty && React.createElement("option", { value: "" }, "— select —"),
-          options.map(o => React.createElement("option", { key: o.value, value: o.value }, o.label)),
-        );
-
-      const Checkbox = ({ value, onChange, label }) =>
-        React.createElement("label", { className: cl("flex items-center gap-2 text-sm cursor-pointer", t.text) },
-          React.createElement("input", {
-            type: "checkbox", checked: !!value,
-            onChange: (e) => onChange(e.target.checked),
-            className: "w-4 h-4 rounded accent-teal-500",
-          }),
-          label,
-        );
-
-      // ── Accordion row ──────────────────────────────────────
-      const AccSection = ({ id, title, icon, subtitle, children }) => {
-        const open = !!expanded[id];
-        return React.createElement("div", { className: cl("rounded-xl border overflow-hidden", t.borderLight) },
-          React.createElement("button", {
-            onClick: () => toggle(id),
-            className: cl("w-full flex items-center justify-between px-4 py-3 text-left transition-colors",
-              mode === "dark" ? "bg-zinc-900/50 hover:bg-zinc-900/70" : "bg-zinc-50 hover:bg-zinc-100")
-          },
-            React.createElement("div", { className: "flex items-center gap-3" },
-              React.createElement("span", { className: "text-lg" }, icon),
-              React.createElement("div", null,
-                React.createElement("div", { className: cl("text-sm font-semibold", t.text) }, title),
-                subtitle && React.createElement("div", { className: cl("text-xs", t.textFaint) }, subtitle),
-              ),
-            ),
-            React.createElement("span", { className: cl("text-sm", t.textFaint) }, open ? "\u25BC" : "\u25B8"),
-          ),
-          open && React.createElement("div", { className: cl("px-4 py-4 border-t", t.borderLight, mode === "dark" ? "bg-zinc-950/40" : "bg-white") },
-            children,
-          ),
-        );
-      };
+      // Field / TextInput / NumberInput / TextArea / SelectInput /
+      // Checkbox / AccSection are hoisted to module scope — see the
+      // block above RuntimeConfigEditor for why. They read themeName /
+      // fieldErrors / expanded / toggle from RuntimeEditorCtx, which we
+      // wrap the render in at the bottom.
 
       // ── Chat Interface ─────────────────────────────────────
       const ci = d.chat_interface || {};
@@ -2154,7 +2205,16 @@
       );
 
       // ── Outer render ───────────────────────────────────────
-      return React.createElement(Tile, null,
+      //
+      // Wrap in RuntimeEditorCtx.Provider so the hoisted helpers
+      // (Field, TextInput, etc. — defined at module scope above) read
+      // themeName / fieldErrors / expanded / toggle from context
+      // instead of closing over our locals. Without the Provider the
+      // hoisted components get the default ctx values (dark theme,
+      // empty errors) and nothing about the fix works.
+      return React.createElement(RuntimeEditorCtx.Provider,
+        { value: { themeName: mode, fieldErrors, expanded, toggle } },
+        React.createElement(Tile, null,
         React.createElement("div", { className: "flex items-center justify-between mb-4" },
           React.createElement("div", null,
             React.createElement("h3", { className: cl("text-sm font-semibold uppercase tracking-widest", t.textLabel) }, "Runtime Configuration"),
@@ -2304,7 +2364,8 @@
             }, "Reload dashboard anyway"),
           ),
         ),
-      );
+        ),   // close Tile
+      );     // close RuntimeEditorCtx.Provider
     }
 
     // ── Backups panel (list + restore + download) ────────────────
