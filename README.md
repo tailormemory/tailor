@@ -168,7 +168,7 @@ Without it, the server runs open (suitable for local-only use).
 
 - Real-time KB stats, service health monitoring, pipeline logs
 - **Setup Wizard**: 10-step guided configuration for first-time setup
-- **Config Editor**: edit all settings live from the browser
+- **Config Editor**: edit `tailor.yaml` live from the browser — form view for common sections, raw YAML view for the rest, automatic backups + rollback on bad saves. See [`docs/runtime-config-editor.md`](docs/runtime-config-editor.md)
 - **Upload**: drag-and-drop conversation imports (ChatGPT, Claude, Gemini) with background processing
 - **Zero external dependencies**: React, Tailwind, and all assets served locally — no CDN, no build step
 - Dark/light mode, frosted glass navbar, responsive mobile layout
