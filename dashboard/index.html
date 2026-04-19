@@ -1573,7 +1573,7 @@
     }
 
 
-    function RuntimeConfigEditor({ mode, onDirtyChange, onSaved }) {
+    function RuntimeConfigEditor({ mode, onDirtyChange, onSaved, refreshSignal = 0 }) {
       const t = themes[mode];
       const [loaded, setLoaded] = useState(null);
       const [draft, setDraft] = useState(null);
@@ -1613,10 +1613,17 @@
       const [restartPhase, setRestartPhase] = useState("idle"); // idle|sending|waiting|reconnected|failed
       const [restartCountdown, setRestartCountdown] = useState(0);
 
-      // Fetch current config on mount.
-      const reload = useCallback(async () => {
-        setLoading(true);
+      // Fetch current config. On mount (silent=false) we show the
+      // loading skeleton; on re-fetch after an external change (restore
+      // from backup, which bumps refreshSignal), we stay silent to
+      // avoid blinking the whole editor for half a second when the
+      // restore toast is already telling the user what happened.
+      // Returns the loaded cfg so callers can chain on the fresh state
+      // without racing React's batched state updates.
+      const reload = useCallback(async ({ silent = false } = {}) => {
+        if (!silent) setLoading(true);
         const r = await apiCall("/api/dashboard/config/current");
+        let loadedCfg = null;
         if (r.ok) {
           const cfg = r.data.config || {};
           // Seed empty editable sections so form bindings have something
@@ -1624,16 +1631,50 @@
           for (const key of RUNTIME_EDITABLE_SECTIONS) {
             if (!cfg[key]) cfg[key] = {};
           }
-          setLoaded(cloneConfigForEdit(cfg));
+          loadedCfg = cloneConfigForEdit(cfg);
+          setLoaded(loadedCfg);
           setDraft(cloneConfigForEdit(cfg));
           setLoadError("");
         } else {
           setLoadError(r.error);
         }
-        setLoading(false);
+        if (!silent) setLoading(false);
+        return loadedCfg;
       }, []);
 
       useEffect(() => { reload(); }, [reload]);
+
+      // External refresh trigger: parent bumps `refreshSignal` (e.g.
+      // after a restore from backup) and we re-fetch /current, then
+      // blow away transient editor state that would otherwise mask or
+      // contradict the newly loaded config — stale YAML buffer, field
+      // errors pointing at the now-replaced draft, leftover server
+      // errors from a prior save, the "Saved: …" toast from a prior
+      // successful save. Skip the very first run: the mount effect
+      // above already handles initial load.
+      const refreshSignalSeenRef = React.useRef(0);
+      useEffect(() => {
+        if (refreshSignal === refreshSignalSeenRef.current) return;
+        refreshSignalSeenRef.current = refreshSignal;
+        if (refreshSignal === 0) return;  // initial value; nothing to do
+        (async () => {
+          const newCfg = await reload({ silent: true });
+          if (!newCfg) return;
+          // If user is currently in the YAML view, the textarea buffer
+          // shows the PRE-restore YAML. Regenerate from the freshly
+          // loaded draft so Form and YAML both reflect the restore.
+          // If user is in Form view we just blank the buffer so the
+          // next switch to YAML regenerates from the live draft.
+          setYamlText(viewMode === "yaml" ? serializeDraftToYaml(newCfg) : "");
+          setYamlParseError("");
+          setYamlValidateStatus("idle");
+          setYamlValidateError("");
+          setFieldErrors({});
+          setServerError("");
+          setSaveMsg("");
+        })();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [refreshSignal]);
 
       const dirty = !!(loaded && draft && JSON.stringify(draft) !== JSON.stringify(loaded));
 
@@ -2532,7 +2573,8 @@
               React.createElement("code", { className: "font-mono text-xs" }, "auth, paths, database, nightly"),
               ") that the form editor normally can't touch."),
             React.createElement("p", { className: cl("mb-2", t.textMuted) },
-              "Your current configuration will be saved as a new backup first, so this is reversible."),
+              "Your current configuration will be saved as a new backup first, so this is reversible. ",
+              "Any unsaved changes in the editor will be discarded."),
             React.createElement("div", { className: cl("text-xs font-mono p-2 rounded-md mt-2",
               mode === "dark" ? "bg-zinc-900/60 text-zinc-400" : "bg-zinc-100 text-zinc-600") },
               restoreTarget.filename, " \u00B7 ", formatSize(restoreTarget.size_bytes)),
@@ -2550,6 +2592,12 @@
       const [draft, setDraft] = useState({});
       const [saving, setSaving] = useState(false);
       const [saveMsg, setSaveMsg] = useState("");
+      // Counter bumped by BackupsPanel after a successful restore. The
+      // runtime editor watches it and re-fetches /current so its form/
+      // YAML view reflects the newly restored config without a manual
+      // page refresh. Saves don't need this channel — the editor handles
+      // its own post-save reload via handleSave.
+      const [runtimeRefreshSignal, setRuntimeRefreshSignal] = useState(0);
 
       if (!config) return React.createElement(Tile, null, React.createElement(Skeleton, { className: "h-60 w-full" }));
 
@@ -2849,8 +2897,19 @@
         // Pipeline (not in the whitelist but still editable here).
         React.createElement(RuntimeConfigEditor, {
           mode, onDirtyChange, onSaved: onConfigSaved,
+          refreshSignal: runtimeRefreshSignal,
         }),
-        React.createElement(BackupsPanel, { mode, onRestored: onConfigSaved }),
+        React.createElement(BackupsPanel, {
+          mode,
+          onRestored: () => {
+            // Bump the runtime editor's refresh signal so its internal
+            // loaded/draft state re-syncs from /current. Also call
+            // onConfigSaved so App-level state (legacy config panel,
+            // stats counters) refreshes from its own bulk endpoint.
+            setRuntimeRefreshSignal(n => n + 1);
+            if (onConfigSaved) onConfigSaved();
+          },
+        }),
         React.createElement("div", { className: "flex items-center justify-between pt-4" },
           React.createElement("h3", { className: cl("text-sm font-semibold uppercase tracking-widest", t.textLabel) }, "Other configuration"),
           React.createElement("div", { className: "flex items-center gap-3" },
