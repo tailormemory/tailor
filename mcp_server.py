@@ -566,6 +566,43 @@ class BearerAuthMiddleware:
                 config_path = os.path.join(BASE_DIR, "config", "tailor.yaml")
                 return _json_response({"ok": True, "backups": list_backups(config_path)})
 
+            elif path == "/api/dashboard/config/backups/download":
+                # Serve a named backup file as a download. Uses the same
+                # filename validation as /restore (regex + path traversal
+                # defense) so there's no way to read arbitrary files
+                # outside .backups/.
+                qs = {}
+                try:
+                    from urllib.parse import parse_qs
+                    raw_qs = scope.get("query_string", b"").decode("utf-8", errors="replace")
+                    qs = {k: v[0] for k, v in parse_qs(raw_qs).items() if v}
+                except Exception:
+                    qs = {}
+                filename = (qs.get("filename") or "").strip()
+                from scripts.lib.config_runtime import _resolve_backup_path, ConfigSaveError
+                config_path = os.path.join(BASE_DIR, "config", "tailor.yaml")
+                try:
+                    full = _resolve_backup_path(filename, config_path)
+                except ConfigSaveError as e:
+                    return _json_response(
+                        {"ok": False, "error": e.message, "status": e.status},
+                        e.status,
+                    )
+                try:
+                    with open(full, "rb") as f:
+                        body = f.read()
+                except OSError as e:
+                    return _json_response(
+                        {"ok": False, "error": f"Read failed: {e}", "status": 500}, 500,
+                    )
+                return Response(
+                    content=body, status_code=200, media_type="application/x-yaml",
+                    headers={
+                        **_CORS_HEADERS,
+                        "Content-Disposition": f'attachment; filename="{filename}"',
+                    },
+                )
+
             elif path == "/api/dashboard/config/restore":
                 # Replace tailor.yaml with the contents of the named
                 # backup (full replace, not a merge). Goes through the

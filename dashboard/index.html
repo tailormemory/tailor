@@ -1313,6 +1313,61 @@
       return out;
     };
 
+    // ── Reusable confirm modal ─────────────────────────────────────
+    //
+    // Shared by force-restart and restore. Intentionally minimal: no focus
+    // trap, no portal, no animations. Clicking the backdrop dismisses;
+    // Esc dismisses; the two buttons are "Cancel" (themed neutral) and a
+    // configurable primary action whose color follows `intent`
+    // ("danger" = red, "warn" = amber, anything else = teal).
+    //
+    // The children slot lets callers pour custom body content (bullet
+    // lists, inline status, etc.) without the modal prescribing shape.
+    function ConfirmModal({
+      open, title, body, children, confirmLabel = "Confirm",
+      onConfirm, onClose, intent = "primary", busy = false, themeName = "dark",
+    }) {
+      useEffect(() => {
+        if (!open) return;
+        const onKey = (e) => { if (e.key === "Escape") onClose(); };
+        window.addEventListener("keydown", onKey);
+        return () => window.removeEventListener("keydown", onKey);
+      }, [open, onClose]);
+      if (!open) return null;
+      const t = themes[themeName];
+      const primaryCls = intent === "danger"
+        ? "bg-red-600 hover:bg-red-500 text-white"
+        : intent === "warn"
+          ? "bg-amber-600 hover:bg-amber-500 text-white"
+          : "bg-teal-600 hover:bg-teal-500 text-white";
+      return React.createElement("div", {
+        className: "fixed inset-0 z-[1000] flex items-center justify-center p-4",
+        style: { background: "rgba(0,0,0,0.55)" },
+        onClick: onClose,
+      },
+        React.createElement("div", {
+          className: cl("max-w-md w-full rounded-2xl border p-5 shadow-2xl", t.tile, t.border),
+          onClick: (e) => e.stopPropagation(),
+        },
+          React.createElement("h3", { className: cl("text-sm font-semibold uppercase tracking-widest mb-2", t.text) }, title),
+          body && React.createElement("p", { className: cl("text-sm mb-3", t.textMuted) }, body),
+          children,
+          React.createElement("div", { className: "flex items-center justify-end gap-2 mt-4" },
+            React.createElement("button", {
+              onClick: onClose, disabled: busy,
+              className: cl("px-4 py-2 rounded-lg text-sm font-semibold transition-all",
+                themeName === "dark" ? "bg-zinc-800 hover:bg-zinc-700 text-zinc-200" : "bg-zinc-100 hover:bg-zinc-200 text-zinc-700",
+                busy && "opacity-50 cursor-not-allowed"),
+            }, "Cancel"),
+            React.createElement("button", {
+              onClick: onConfirm, disabled: busy,
+              className: cl("px-4 py-2 rounded-lg text-sm font-semibold transition-all", primaryCls, busy && "opacity-50 cursor-not-allowed"),
+            }, busy ? "Working..." : confirmLabel),
+          ),
+        ),
+      );
+    }
+
     // ── YAML editor (CodeMirror 5 wrapper) ─────────────────────────
     //
     // Mounts a CM5 instance into a <div> on first render and keeps it
@@ -1420,6 +1475,11 @@
       // Revision counter so the debounced validator knows whether the
       // response it's about to apply is still the freshest request.
       const yamlSeqRef = React.useRef(0);
+
+      // Force-restart modal state.
+      const [restartOpen, setRestartOpen] = useState(false);
+      const [restartPhase, setRestartPhase] = useState("idle"); // idle|sending|waiting|reconnected|failed
+      const [restartCountdown, setRestartCountdown] = useState(0);
 
       // Fetch current config on mount.
       const reload = useCallback(async () => {
@@ -1596,6 +1656,43 @@
           setYamlValidateStatus("error");
           setYamlValidateError(r.error || "Validation failed");
         }
+      };
+
+      // Force restart flow:
+      //   1. User confirms modal → POST /restart.
+      //   2. Show "Waiting for server" with a countdown while we poll
+      //      /api/dashboard/setup (unauthenticated — works even if our
+      //      session cookie died in the restart).
+      //   3. When setup responds, location.reload() to get a clean app
+      //      state. If after 30s we still can't reach it, show "Still
+      //      waiting" and let the user refresh manually.
+      const runForceRestart = async () => {
+        setRestartPhase("sending");
+        const r = await apiCall("/api/dashboard/config/restart", { method: "POST" });
+        if (!r.ok) {
+          setRestartPhase("failed");
+          return;
+        }
+        setRestartPhase("waiting");
+        const startedAt = Date.now();
+        const tick = async () => {
+          const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+          setRestartCountdown(elapsed);
+          if (elapsed > 30) { setRestartPhase("failed"); return; }
+          try {
+            const probe = await fetch(`${API_BASE}/api/dashboard/setup`, { cache: "no-store" });
+            if (probe.ok) {
+              setRestartPhase("reconnected");
+              setTimeout(() => window.location.reload(), 600);
+              return;
+            }
+          } catch {}
+          setTimeout(tick, 1000);
+        };
+        // Give the process time to actually SIGTERM + KeepAlive-relaunch
+        // before we start knocking. Starting immediately just piles 5-8
+        // failed fetches into devtools for no reason.
+        setTimeout(tick, 2000);
       };
 
       // Basic client-side validation run on Save click. Returns map of
@@ -2067,26 +2164,41 @@
           React.createElement("div", { className: "flex items-center gap-2" },
             saveMsg && React.createElement("span", { className: cl("text-xs", t.accent) }, saveMsg),
             React.createElement("button", {
+              onClick: () => { setRestartPhase("idle"); setRestartOpen(true); },
+              title: "Force the MCP server to restart (rare; use after out-of-UI config changes)",
+              className: cl("px-3 py-1.5 rounded-lg text-sm font-semibold transition-all",
+                mode === "dark" ? "bg-red-900/30 hover:bg-red-900/50 text-red-300" : "bg-red-50 hover:bg-red-100 text-red-700"),
+            }, "Force Restart"),
+            React.createElement("button", {
               onClick: handleDiscard, disabled: !dirty,
               className: cl("px-3 py-1.5 rounded-lg text-sm font-semibold transition-all",
                 !dirty ? "opacity-40 cursor-not-allowed" : (mode === "dark" ? "bg-zinc-800 hover:bg-zinc-700 text-zinc-300" : "bg-zinc-100 hover:bg-zinc-200 text-zinc-700")),
             }, "Discard"),
             React.createElement("button", {
-              onClick: handleSave, disabled: !dirty || saving,
+              onClick: handleSave, disabled: !dirty || saving || (viewMode === "yaml" && yamlParseError),
               className: cl("px-4 py-1.5 rounded-lg text-sm font-semibold transition-all",
-                (!dirty || saving) ? "opacity-40 cursor-not-allowed bg-teal-600/40 text-white" : "bg-teal-600 hover:bg-teal-500 text-white"),
+                (!dirty || saving || (viewMode === "yaml" && yamlParseError)) ? "opacity-40 cursor-not-allowed bg-teal-600/40 text-white" : "bg-teal-600 hover:bg-teal-500 text-white"),
             }, saving ? "Saving..." : (dirty ? "Save" : "Saved")),
           ),
         ),
         // View mode toggle: Form / Advanced (YAML). Sits right above the
         // body so it reads as a section-header control, not a tab-bar.
-        React.createElement("div", { className: "flex items-center gap-1 mb-3 p-1 rounded-lg inline-flex",
-          style: { background: mode === "dark" ? "rgba(255,255,255,0.04)" : "rgba(0,0,0,0.04)" } },
-          ["form", "yaml"].map(m => React.createElement("button", {
-            key: m, onClick: () => switchViewMode(m),
-            className: cl("px-3 py-1.5 rounded-md text-xs font-semibold transition-all",
-              viewMode === m ? (mode === "dark" ? "bg-zinc-800 text-zinc-100" : "bg-white text-zinc-900 shadow-sm") : t.textFaint + " hover:" + t.text),
-          }, m === "form" ? "Form" : "Advanced (YAML)")),
+        React.createElement("div", { className: "mb-3" },
+          React.createElement("div", { className: "flex items-center gap-1 p-1 rounded-lg inline-flex",
+            style: { background: mode === "dark" ? "rgba(255,255,255,0.04)" : "rgba(0,0,0,0.04)" } },
+            ["form", "yaml"].map(m => React.createElement("button", {
+              key: m, onClick: () => switchViewMode(m),
+              className: cl("px-3 py-1.5 rounded-md text-xs font-semibold transition-all",
+                viewMode === m ? (mode === "dark" ? "bg-zinc-800 text-zinc-100" : "bg-white text-zinc-900 shadow-sm") : t.textFaint + " hover:" + t.text),
+            }, m === "form" ? "Form" : "Advanced (YAML)")),
+          ),
+          // Zero-cost transparency: tell the user what switching views does
+          // to YAML formatting *before* they lose their comments, not after.
+          // Round-tripping through js-yaml drops comments — preserving them
+          // would need an AST-level parser (yaml.eemeli with CST options)
+          // or a raw-text buffer with diff logic, both out of scope.
+          React.createElement("div", { className: cl("text-xs mt-1.5", t.textFaint) },
+            "Switching views reformats YAML. Comments are preserved only while you stay in the YAML view."),
         ),
         serverError && React.createElement("div", {
           className: cl("mb-3 px-3 py-2 rounded-lg border text-sm",
@@ -2149,8 +2261,226 @@
                 "Protected sections (auth, paths, database, nightly) are shown here but cannot be saved via the UI — the backend returns 403 if you try.",
               ),
             ),
+        // Force-restart modal. Two phases of body content: a pre-confirm
+        // warning describing what will happen, and a post-confirm status
+        // with countdown while we poll /api/dashboard/setup for the
+        // relaunched server.
+        React.createElement(ConfirmModal, {
+          open: restartOpen,
+          title: "Force Restart MCP Server",
+          themeName: mode,
+          intent: "danger",
+          confirmLabel: restartPhase === "idle" ? "Restart now" : "Close",
+          busy: restartPhase === "sending" || restartPhase === "waiting",
+          onClose: () => {
+            if (restartPhase === "sending" || restartPhase === "waiting") return;
+            setRestartOpen(false); setRestartPhase("idle");
+          },
+          onConfirm: () => {
+            if (restartPhase === "idle") { runForceRestart(); return; }
+            if (restartPhase === "failed" || restartPhase === "reconnected") {
+              setRestartOpen(false); setRestartPhase("idle");
+            }
+          },
+        },
+          restartPhase === "idle" && React.createElement("ul", { className: cl("text-sm mb-2 space-y-1 list-disc pl-5", t.textMuted) },
+            React.createElement("li", null, "Dashboard will disconnect for ~5\u201310 s while the MCP server restarts."),
+            React.createElement("li", null, "Any in-flight chat streams or requests will drop."),
+            React.createElement("li", null, "Unsaved configuration changes in this editor will be kept (draft is in-memory)."),
+          ),
+          restartPhase === "sending" && React.createElement("div", { className: cl("text-sm", t.textMuted) },
+            "\u2026 Sending SIGTERM to MCP"),
+          restartPhase === "waiting" && React.createElement("div", { className: cl("text-sm", t.textMuted) },
+            `\u2026 Reconnecting (${restartCountdown}s)`),
+          restartPhase === "reconnected" && React.createElement("div", { className: "text-sm text-emerald-400" },
+            "\u2713 Server back online \u2014 reloading dashboard"),
+          restartPhase === "failed" && React.createElement("div", null,
+            React.createElement("div", { className: "text-sm text-red-400 mb-2" },
+              "Server did not respond within 30s. Check logs: ",
+              React.createElement("code", { className: "font-mono text-xs" }, "launchctl list | grep com.tailor.mcp")),
+            React.createElement("button", {
+              onClick: () => window.location.reload(),
+              className: "text-xs px-3 py-1.5 rounded-md font-semibold bg-teal-600 hover:bg-teal-500 text-white",
+            }, "Reload dashboard anyway"),
+          ),
+        ),
       );
     }
+
+    // ── Backups panel (list + restore + download) ────────────────
+    //
+    // Separate tile from the runtime editor so it reads as "history"
+    // rather than "more editor controls". Lists the rolling snapshots
+    // newest-first (backend already sorts; we trust that).
+    //
+    // Restore is full-replace — the backup file IS the target state,
+    // protected sections and all. The modal says so explicitly because
+    // the write-side UI *does* reject those; a user who's only ever
+    // used the form view would reasonably expect the same protection
+    // here and we don't want to surprise them.
+    function BackupsPanel({ mode, onRestored }) {
+      const t = themes[mode];
+      const [backups, setBackups] = useState(null);
+      const [error, setError] = useState("");
+      const [refreshing, setRefreshing] = useState(false);
+      const [expanded, setExpanded] = useState(false);
+      const [restoreTarget, setRestoreTarget] = useState(null);
+      const [restoring, setRestoring] = useState(false);
+      const [restoreError, setRestoreError] = useState("");
+      const [statusMsg, setStatusMsg] = useState("");
+
+      const load = React.useCallback(async () => {
+        setRefreshing(true);
+        const r = await apiCall("/api/dashboard/config/backups");
+        if (r.ok) {
+          setBackups(r.data.backups || []);
+          setError("");
+        } else {
+          setError(r.error || "Failed to load backups");
+        }
+        setRefreshing(false);
+      }, []);
+
+      // Lazy-load: only fetch when the section is expanded for the first
+      // time. Backups are cheap, but no reason to burn a request on every
+      // Config-tab visit.
+      useEffect(() => { if (expanded && backups === null) load(); }, [expanded, backups, load]);
+
+      const formatSize = (bytes) => {
+        if (!Number.isFinite(bytes)) return "?";
+        const kb = bytes / 1024;
+        return `${kb.toFixed(1)} KB`;
+      };
+      const formatWhen = (iso) => {
+        if (!iso) return "unknown";
+        try {
+          const d = new Date(iso);
+          if (isNaN(d.getTime())) return iso;
+          return d.toLocaleString(undefined, {
+            year: "numeric", month: "short", day: "2-digit",
+            hour: "2-digit", minute: "2-digit", second: "2-digit",
+          });
+        } catch { return iso; }
+      };
+
+      const startRestore = (row) => {
+        setRestoreError("");
+        setRestoreTarget(row);
+      };
+
+      const confirmRestore = async () => {
+        if (!restoreTarget) return;
+        setRestoring(true);
+        setRestoreError("");
+        const r = await apiCall("/api/dashboard/config/restore", {
+          method: "POST", body: { filename: restoreTarget.filename },
+        });
+        setRestoring(false);
+        if (r.ok) {
+          setStatusMsg(`Restored from ${restoreTarget.filename}. New safety backup: ${r.data.backup}`);
+          setTimeout(() => setStatusMsg(""), 5000);
+          setRestoreTarget(null);
+          await load();
+          if (onRestored) onRestored();
+        } else {
+          setRestoreError(r.error || "Restore failed");
+        }
+      };
+
+      // Same-origin link with token query string; the browser sends the
+      // session cookie automatically so this works under normal auth.
+      const downloadHref = (fname) => {
+        const tok = API_TOKEN ? `&token=${encodeURIComponent(API_TOKEN)}` : "";
+        return `${API_BASE}/api/dashboard/config/backups/download?filename=${encodeURIComponent(fname)}${tok}`;
+      };
+
+      const rows = (backups || []).map(b =>
+        React.createElement("div", { key: b.filename,
+          className: cl("flex items-center gap-3 px-3 py-2 rounded-lg border", t.borderLight,
+            mode === "dark" ? "bg-zinc-900/30" : "bg-zinc-50"),
+        },
+          React.createElement("div", { className: "flex-1 min-w-0" },
+            React.createElement("div", { className: cl("text-sm", t.text) }, formatWhen(b.saved_at)),
+            React.createElement("div", { className: cl("text-xs font-mono truncate", t.textFaint) }, b.filename),
+          ),
+          React.createElement("div", { className: cl("text-xs font-mono", t.textMuted) }, formatSize(b.size_bytes)),
+          React.createElement("a", {
+            href: downloadHref(b.filename), download: b.filename,
+            className: cl("text-xs px-2.5 py-1 rounded-md font-semibold",
+              mode === "dark" ? "bg-zinc-800 hover:bg-zinc-700 text-zinc-300" : "bg-zinc-100 hover:bg-zinc-200 text-zinc-700"),
+          }, "Download"),
+          React.createElement("button", {
+            onClick: () => startRestore(b),
+            className: cl("text-xs px-2.5 py-1 rounded-md font-semibold",
+              mode === "dark" ? "bg-amber-900/30 hover:bg-amber-900/50 text-amber-300" : "bg-amber-50 hover:bg-amber-100 text-amber-700"),
+          }, "Restore"),
+        ),
+      );
+
+      return React.createElement(Tile, null,
+        React.createElement("div", {
+          className: "flex items-center justify-between cursor-pointer",
+          onClick: () => setExpanded(v => !v),
+        },
+          React.createElement("div", null,
+            React.createElement("h3", { className: cl("text-sm font-semibold uppercase tracking-widest", t.textLabel) },
+              "Configuration Backups"),
+            React.createElement("div", { className: cl("text-xs mt-0.5", t.textFaint) },
+              "Automatic snapshots before every save. Kept rolling (last 20)."),
+          ),
+          React.createElement("div", { className: "flex items-center gap-2" },
+            statusMsg && React.createElement("span", { className: cl("text-xs", t.accent) }, statusMsg),
+            backups && React.createElement("span", { className: cl("text-xs font-mono", t.textFaint) }, `${backups.length} snapshot${backups.length === 1 ? "" : "s"}`),
+            React.createElement("span", { className: cl("text-sm", t.textFaint) }, expanded ? "\u25BC" : "\u25B8"),
+          ),
+        ),
+        expanded && React.createElement("div", { className: "mt-4" },
+          error && React.createElement("div", { className: "text-sm text-red-400 mb-2" }, "\u26A0\uFE0F ", error),
+          refreshing && !backups && React.createElement(Skeleton, { className: "h-20 w-full" }),
+          backups && backups.length === 0 && React.createElement("div", { className: cl("text-sm", t.textFaint) },
+            "No backups yet. A snapshot is created automatically the first time you save."),
+          backups && backups.length > 0 && React.createElement("div", { className: "space-y-2" }, rows),
+          backups && React.createElement("button", {
+            onClick: (e) => { e.stopPropagation(); load(); },
+            disabled: refreshing,
+            className: cl("mt-3 text-xs px-2 py-1 rounded",
+              mode === "dark" ? "text-zinc-500 hover:text-zinc-300" : "text-zinc-500 hover:text-zinc-700"),
+          }, refreshing ? "Refreshing\u2026" : "\u21BB Refresh"),
+        ),
+        // Restore confirmation. Full-replace is the key word — users who
+        // know the write-side blacklist protects auth/paths/database/nightly
+        // might assume restore does too. Spelling it out here prevents
+        // lock-out surprises.
+        React.createElement(ConfirmModal, {
+          open: !!restoreTarget,
+          title: "Restore Configuration",
+          themeName: mode,
+          intent: "warn",
+          confirmLabel: "Restore",
+          busy: restoring,
+          onClose: () => { if (!restoring) setRestoreTarget(null); },
+          onConfirm: confirmRestore,
+        },
+          restoreTarget && React.createElement("div", { className: "text-sm" },
+            React.createElement("p", { className: cl("mb-2", t.textMuted) },
+              "This will replace your ",
+              React.createElement("strong", null, "entire configuration"),
+              " with the snapshot from ",
+              React.createElement("strong", null, formatWhen(restoreTarget.saved_at)),
+              ", including protected sections (",
+              React.createElement("code", { className: "font-mono text-xs" }, "auth, paths, database, nightly"),
+              ") that the form editor normally can't touch."),
+            React.createElement("p", { className: cl("mb-2", t.textMuted) },
+              "Your current configuration will be saved as a new backup first, so this is reversible."),
+            React.createElement("div", { className: cl("text-xs font-mono p-2 rounded-md mt-2",
+              mode === "dark" ? "bg-zinc-900/60 text-zinc-400" : "bg-zinc-100 text-zinc-600") },
+              restoreTarget.filename, " \u00B7 ", formatSize(restoreTarget.size_bytes)),
+            restoreError && React.createElement("div", { className: "text-sm text-red-400 mt-3" }, "\u26A0\uFE0F ", restoreError),
+          ),
+        ),
+      );
+    }
+
 
     function ConfigPage({ config, onConfigSaved, onDirtyChange }) {
       const t = useTheme();
@@ -2459,6 +2789,7 @@
         React.createElement(RuntimeConfigEditor, {
           mode, onDirtyChange, onSaved: onConfigSaved,
         }),
+        React.createElement(BackupsPanel, { mode, onRestored: onConfigSaved }),
         React.createElement("div", { className: "flex items-center justify-between pt-4" },
           React.createElement("h3", { className: cl("text-sm font-semibold uppercase tracking-widest", t.textLabel) }, "Other configuration"),
           React.createElement("div", { className: "flex items-center gap-3" },
