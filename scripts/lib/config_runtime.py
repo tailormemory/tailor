@@ -7,9 +7,11 @@ endpoint and the new runtime editor both go through save_config() here.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
+import time
 from datetime import datetime
 from typing import Any
 
@@ -25,6 +27,18 @@ BLACKLIST_SECTIONS: frozenset[str] = frozenset({"auth", "paths", "database", "ni
 # Rolling backup retention. Twenty saves is roughly "a few days of active
 # tweaking" — enough to roll back from a mistake without cluttering the dir.
 BACKUP_KEEP: int = 20
+
+# Marker file written next to tailor.yaml after a save. If the process dies
+# within SAFETY_WINDOW_SECONDS the next boot rolls back to the backup named
+# inside. See apply_pending_rollback() for the full contract.
+PENDING_SAVE_FILENAME: str = ".pending-save"
+
+# How long a save is "on probation". Must be long enough to cover import-time
+# crashes + first-request lazy-init failures + KeepAlive relaunch delay;
+# short enough that an unrelated crash hours later (OOM, disk full, runtime
+# bug) is clearly outside the window. 180s is the sweet spot — at 600s an
+# OOM five minutes post-save would false-positive.
+SAFETY_WINDOW_SECONDS: int = 180
 
 
 def backup_dir_for(config_path: str) -> str:
@@ -226,6 +240,176 @@ def soft_reload() -> dict[str, list[str]]:
     return reset
 
 
+# ── Pending-save marker + boot-time rollback ────────────────────
+#
+# Safety net for "user saved a config that breaks boot." We mark every save
+# as "on probation" by dropping a .pending-save JSON file next to tailor.yaml.
+# If the process dies inside SAFETY_WINDOW_SECONDS, the next boot restores
+# the backup pointed at by the marker. Older marker → save has survived the
+# window, process died for unrelated reasons, no rollback.
+
+
+def _pending_save_path(config_path: str) -> str:
+    return os.path.join(
+        os.path.dirname(os.path.abspath(config_path)), PENDING_SAVE_FILENAME
+    )
+
+
+def _log_rollback(msg: str) -> None:
+    """Single log channel for rollback-relevant events. Grep for
+    '[config-rollback]' in launchd stderr logs — if the dashboard says "saved"
+    but the live config disagrees, this tells you why in one search."""
+    print(f"[config-rollback] {msg}", file=sys.stderr, flush=True)
+
+
+def _atomic_replace(src: str, dst: str) -> None:
+    """Copy src over dst via tmp+rename. shutil.copy2 alone can leave a
+    half-written file if interrupted; an atomic rename can't."""
+    tmp = dst + ".rollback.tmp"
+    shutil.copy2(src, tmp)
+    os.replace(tmp, dst)
+
+
+def write_pending_save(config_path: str, backup_name: str) -> str:
+    """Drop a marker recording that a save just completed. `backup_name` is
+    the basename of the pre-save snapshot inside .backups/ (empty string if
+    this was the very first save — nothing to roll back to).
+    """
+    marker = _pending_save_path(config_path)
+    payload = {
+        "saved_at": time.time(),
+        "backup": backup_name,
+    }
+    tmp = marker + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f)
+    os.replace(tmp, marker)
+    return marker
+
+
+def _clear_pending_save(config_path: str) -> None:
+    try:
+        os.remove(_pending_save_path(config_path))
+    except FileNotFoundError:
+        pass
+
+
+def apply_pending_rollback(config_path: str) -> dict | None:
+    """Called once at boot, BEFORE any module that reads tailor.yaml.
+
+    If a .pending-save marker exists AND the save is still inside the
+    safety window, restore the backup it names over tailor.yaml — otherwise
+    the current boot will crash the same way the previous one did and
+    KeepAlive will loop forever.
+
+    Always clears the marker on exit (rolled back, stale, or unrecoverable)
+    so that whatever happens, the marker isn't still sitting there influencing
+    the boot after next. Returns a summary dict for tests/logs, or None if
+    there was no marker.
+
+    IMPORTANT: do not import anything that reads tailor.yaml at module load
+    (embedding, i18n, llm_client) above the call site. Reordering those
+    imports is exactly the regression this function exists to prevent.
+    """
+    marker = _pending_save_path(config_path)
+    if not os.path.exists(marker):
+        return None
+
+    try:
+        with open(marker) as f:
+            payload = json.load(f)
+    except Exception as e:
+        _log_rollback(f"corrupt .pending-save ({e}), clearing without rollback")
+        _clear_pending_save(config_path)
+        return {"action": "cleared_corrupt"}
+
+    saved_at = float(payload.get("saved_at", 0))
+    backup_name = payload.get("backup", "") or ""
+    age = time.time() - saved_at
+
+    if age >= SAFETY_WINDOW_SECONDS:
+        # Save survived the window; any death since then is on something else.
+        _clear_pending_save(config_path)
+        return {"action": "stale", "age": age}
+
+    # Inside the window → previous process probably died from this save.
+    if not backup_name:
+        # First-ever save: nothing to roll back to. Don't clobber the user's
+        # work — best we can do is clear the marker and let them recover.
+        _log_rollback(
+            f"pending save aged {age:.0f}s (<{SAFETY_WINDOW_SECONDS}s window) "
+            f"but no backup recorded (first save?), cannot roll back, "
+            f"clearing marker"
+        )
+        _clear_pending_save(config_path)
+        return {"action": "no_backup", "age": age}
+
+    backup_path = os.path.join(backup_dir_for(config_path), backup_name)
+    if not os.path.exists(backup_path):
+        _log_rollback(
+            f"pending save aged {age:.0f}s but backup file {backup_path} is "
+            f"missing (rotated out?), cannot roll back, clearing marker"
+        )
+        _clear_pending_save(config_path)
+        return {"action": "backup_missing", "age": age, "backup": backup_name}
+
+    try:
+        _atomic_replace(backup_path, config_path)
+    except Exception as e:
+        _log_rollback(
+            f"restore from {backup_path} FAILED: {e} — manual intervention "
+            f"required. Clearing marker to avoid retry crashloop."
+        )
+        _clear_pending_save(config_path)
+        return {"action": "restore_failed", "age": age, "error": str(e)}
+
+    _log_rollback(
+        f"pending save aged {age:.0f}s (<{SAFETY_WINDOW_SECONDS}s window), "
+        f"restored backup from {backup_path}"
+    )
+    _clear_pending_save(config_path)
+    return {"action": "rolled_back", "age": age, "backup": backup_name}
+
+
+def _revert_after_reload_failure(
+    config_path: str, backup_path: str, reason: Exception
+) -> None:
+    """In-process revert when soft_reload() raises.
+
+    Context: the new yaml passed validate_loadable() (structural check) but
+    _reassigning singletons from it crashed — e.g. a nested value is the
+    wrong type so `.lower()` blows up. The yaml on disk is the user's
+    broken input; restore the backup so the NEXT save attempt (or next
+    boot via pending-save) sees a working file, and try to resync
+    singletons to that restored state.
+    """
+    _log_rollback(f"soft_reload failed ({reason}), reverting in-process")
+
+    if backup_path and os.path.exists(backup_path):
+        try:
+            _atomic_replace(backup_path, config_path)
+        except Exception as e:
+            _log_rollback(f"in-process restore FAILED: {e}, yaml left as-is")
+    else:
+        _log_rollback(
+            "no backup to restore (first save); yaml on disk is broken, "
+            "next boot will use pending-save or fail"
+        )
+
+    # Best-effort resync to whatever yaml is now on disk. If THIS also
+    # raises, process is in a weird state — log and move on; the caller
+    # will raise ConfigSaveError so the user knows something went wrong.
+    try:
+        soft_reload()
+    except Exception as e:
+        _log_rollback(
+            f"post-revert soft_reload ALSO failed: {e} — singletons may be "
+            f"inconsistent until next process restart"
+        )
+
+    _clear_pending_save(config_path)
+
+
 # ── Top-level: the save pipeline the endpoint delegates to ──────
 
 
@@ -300,12 +484,32 @@ def save_config(
     except Exception as e:
         raise ConfigSaveError(500, f"Failed to write config: {e}")
 
-    reloaded = soft_reload()
+    # Write the pending-save marker BEFORE reloading singletons. If the
+    # process dies during soft_reload — or the reload succeeds but a later
+    # request crashes hard within SAFETY_WINDOW_SECONDS — the next boot
+    # rolls back to `backup_path`.
+    backup_name = os.path.basename(backup_path) if backup_path else ""
+    write_pending_save(config_path, backup_name)
+
+    try:
+        reloaded = soft_reload()
+    except Exception as e:
+        # Reload crashed unexpectedly. Revert in-process so the live file
+        # matches the live (old) singletons; marker is cleared inside
+        # _revert_after_reload_failure so the next boot doesn't double-revert.
+        _revert_after_reload_failure(config_path, backup_path, e)
+        raise ConfigSaveError(
+            500, f"Soft-reload failed, config reverted: {e}"
+        )
+
+    # Leave .pending-save on disk — it's the safety net for crashes that
+    # happen AFTER this call returns (e.g. first API request hits a lazy
+    # init that the new config breaks). It'll be cleared by the next boot.
 
     return {
         "ok": True,
         "dry_run": False,
-        "backup": os.path.basename(backup_path) if backup_path else "",
+        "backup": backup_name,
         "reloaded": reloaded,
     }
 

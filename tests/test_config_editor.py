@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import types
 
 import pytest
@@ -22,7 +23,9 @@ from scripts.lib import config_runtime  # noqa: E402
 from scripts.lib.config_runtime import (  # noqa: E402
     BACKUP_KEEP,
     BLACKLIST_SECTIONS,
+    SAFETY_WINDOW_SECONDS,
     ConfigSaveError,
+    apply_pending_rollback,
     check_blacklist,
     create_backup,
     parse_incoming,
@@ -30,6 +33,7 @@ from scripts.lib.config_runtime import (  # noqa: E402
     save_config,
     soft_reload,
     validate_loadable,
+    write_pending_save,
 )
 
 
@@ -527,3 +531,242 @@ def test_endpoint_shaped_validate_surfaces_yaml_parse_error():
     with pytest.raises(ConfigSaveError) as exc:
         parse_incoming(body)
     assert exc.value.status == 400
+
+
+# ── Pending-save marker + boot-time rollback ────────────────────
+
+
+def _marker_path(config_path):
+    return os.path.join(os.path.dirname(config_path), ".pending-save")
+
+
+def test_save_writes_pending_save_marker(config_path):
+    assert not os.path.exists(_marker_path(config_path))
+    result = save_config({"llm": {"temperature": 0.5}}, config_path)
+    assert os.path.exists(_marker_path(config_path))
+    import json as _j
+    payload = _j.loads(open(_marker_path(config_path)).read())
+    assert payload["backup"] == result["backup"]
+    # saved_at must be recent (within the last few seconds).
+    import time as _t
+    assert abs(_t.time() - payload["saved_at"]) < 5
+
+
+def test_dry_run_does_not_write_pending_marker(config_path):
+    save_config({"llm": {"temperature": 0.5}}, config_path, dry_run=True)
+    assert not os.path.exists(_marker_path(config_path))
+
+
+def test_write_pending_save_atomically_overwrites(config_path):
+    write_pending_save(config_path, "first.yaml")
+    write_pending_save(config_path, "second.yaml")
+    import json as _j
+    payload = _j.loads(open(_marker_path(config_path)).read())
+    assert payload["backup"] == "second.yaml"
+
+
+def test_rollback_noop_when_no_marker(config_path):
+    assert apply_pending_rollback(config_path) is None
+
+
+def test_rollback_restores_backup_when_within_window(tmp_path):
+    """A recent pending-save → boot must restore the backup over yaml."""
+    cfg_path = tmp_path / "config" / "tailor.yaml"
+    cfg_path.parent.mkdir()
+    # Pretend the live yaml is broken (the crashed save wrote this).
+    cfg_path.write_text("broken: yaml: [unclosed\n")
+
+    # Seed a valid backup.
+    bdir = cfg_path.parent / ".backups"
+    bdir.mkdir()
+    backup = bdir / "tailor-20260101-120000.yaml"
+    backup.write_text("llm:\n  provider: anthropic\n  model: claude-haiku-4-5\n")
+
+    # Marker says "this save is 10s old, rollback to the backup above."
+    write_pending_save(str(cfg_path), backup.name)
+    # Override saved_at to be 10s ago (fresh enough to be within window).
+    import json as _j
+    with open(_marker_path(str(cfg_path))) as f:
+        payload = _j.load(f)
+    payload["saved_at"] = time.time() - 10
+    with open(_marker_path(str(cfg_path)), "w") as f:
+        _j.dump(payload, f)
+
+    result = apply_pending_rollback(str(cfg_path))
+
+    assert result["action"] == "rolled_back"
+    # Live yaml must now contain the backup contents, not the broken input.
+    restored = cfg_path.read_text()
+    assert "provider: anthropic" in restored
+    assert "[unclosed" not in restored
+    # Marker cleared so next boot doesn't double-rollback.
+    assert not os.path.exists(_marker_path(str(cfg_path)))
+
+
+def test_rollback_skips_when_outside_window(tmp_path):
+    """Save aged 300s — process lived past the window, crash is unrelated."""
+    cfg_path = tmp_path / "config" / "tailor.yaml"
+    cfg_path.parent.mkdir()
+    original = "llm:\n  provider: openai\n"
+    cfg_path.write_text(original)
+
+    bdir = cfg_path.parent / ".backups"
+    bdir.mkdir()
+    backup = bdir / "tailor-20260101-120000.yaml"
+    backup.write_text("llm:\n  provider: anthropic\n")
+
+    write_pending_save(str(cfg_path), backup.name)
+    import json as _j
+    with open(_marker_path(str(cfg_path))) as f:
+        payload = _j.load(f)
+    payload["saved_at"] = time.time() - (SAFETY_WINDOW_SECONDS + 60)
+    with open(_marker_path(str(cfg_path)), "w") as f:
+        _j.dump(payload, f)
+
+    result = apply_pending_rollback(str(cfg_path))
+
+    assert result["action"] == "stale"
+    # Live yaml UNCHANGED — no false-positive rollback for an old save.
+    assert cfg_path.read_text() == original
+    # Marker cleared.
+    assert not os.path.exists(_marker_path(str(cfg_path)))
+
+
+def test_rollback_clears_corrupt_marker(tmp_path):
+    cfg_path = tmp_path / "config" / "tailor.yaml"
+    cfg_path.parent.mkdir()
+    cfg_path.write_text("llm:\n  provider: anthropic\n")
+
+    # Write a garbage marker (not valid JSON).
+    with open(_marker_path(str(cfg_path)), "w") as f:
+        f.write("{not json")
+
+    result = apply_pending_rollback(str(cfg_path))
+
+    assert result["action"] == "cleared_corrupt"
+    assert not os.path.exists(_marker_path(str(cfg_path)))
+    # Config untouched — we don't know what to roll back to.
+    assert "anthropic" in cfg_path.read_text()
+
+
+def test_rollback_handles_missing_backup(tmp_path):
+    """Backup got rotated out. Log, clear marker, don't crash."""
+    cfg_path = tmp_path / "config" / "tailor.yaml"
+    cfg_path.parent.mkdir()
+    original = "llm:\n  provider: anthropic\n"
+    cfg_path.write_text(original)
+
+    # Marker points at a backup that doesn't exist.
+    write_pending_save(str(cfg_path), "tailor-19990101-000000.yaml")
+    import json as _j
+    with open(_marker_path(str(cfg_path))) as f:
+        payload = _j.load(f)
+    payload["saved_at"] = time.time() - 5
+    with open(_marker_path(str(cfg_path)), "w") as f:
+        _j.dump(payload, f)
+
+    result = apply_pending_rollback(str(cfg_path))
+
+    assert result["action"] == "backup_missing"
+    assert not os.path.exists(_marker_path(str(cfg_path)))
+    # Live yaml untouched — we have nothing to restore to.
+    assert cfg_path.read_text() == original
+
+
+def test_rollback_first_save_no_backup(tmp_path):
+    """First-ever save edge: marker has backup='', nothing to restore."""
+    cfg_path = tmp_path / "config" / "tailor.yaml"
+    cfg_path.parent.mkdir()
+    cfg_path.write_text("llm:\n  provider: anthropic\n")
+
+    write_pending_save(str(cfg_path), "")  # first-save, empty backup name
+    import json as _j
+    with open(_marker_path(str(cfg_path))) as f:
+        payload = _j.load(f)
+    payload["saved_at"] = time.time() - 5
+    with open(_marker_path(str(cfg_path)), "w") as f:
+        _j.dump(payload, f)
+
+    result = apply_pending_rollback(str(cfg_path))
+
+    assert result["action"] == "no_backup"
+    assert not os.path.exists(_marker_path(str(cfg_path)))
+    # Config untouched — we don't clobber user work when we can't roll back.
+    assert "anthropic" in cfg_path.read_text()
+
+
+def test_save_plus_boot_rollback_end_to_end(config_path):
+    """Full cycle: save (writes marker) → simulate crash → boot → rollback."""
+    original = open(config_path).read()
+
+    save_config({"user": {"name": "Changed"}}, config_path)
+    # New yaml has the change.
+    assert "Changed" in open(config_path).read()
+    marker = _marker_path(config_path)
+    assert os.path.exists(marker)
+
+    # Simulate "process crashed within window" — marker is fresh.
+    result = apply_pending_rollback(config_path)
+    assert result["action"] == "rolled_back"
+    # Yaml reverted to its pre-save state.
+    assert open(config_path).read() == original
+
+
+# ── Revert on soft_reload failure ───────────────────────────────
+
+
+def test_soft_reload_failure_triggers_in_process_revert(config_path, monkeypatch):
+    """If soft_reload raises, save_config must restore the backup + raise."""
+    original = open(config_path).read()
+
+    # Make soft_reload raise the first time (mimicking a nested type bug
+    # that slipped past validate_loadable); subsequent call inside
+    # _revert_after_reload_failure succeeds so the resync path works.
+    call_count = {"n": 0}
+    original_soft_reload = config_runtime.soft_reload
+
+    def flaky_soft_reload():
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise RuntimeError("simulated reload crash")
+        return original_soft_reload()
+
+    monkeypatch.setattr(config_runtime, "soft_reload", flaky_soft_reload)
+
+    with pytest.raises(ConfigSaveError) as exc:
+        save_config({"llm": {"temperature": 0.9}}, config_path)
+
+    assert exc.value.status == 500
+    assert "reverted" in exc.value.message.lower()
+
+    # Yaml on disk must be the PRE-save content, not the new (broken) one.
+    assert open(config_path).read() == original
+    # Pending-save marker cleared so the next boot doesn't double-revert.
+    assert not os.path.exists(_marker_path(config_path))
+    # soft_reload was called at least twice (once from save, once from revert).
+    assert call_count["n"] >= 2
+
+
+def test_soft_reload_failure_with_no_backup_logs_and_raises(tmp_path, monkeypatch):
+    """First-ever save + reload crash: nothing to revert to. Must raise, and
+    must not leave a zombie marker that would trigger a boot-time rollback
+    to a non-existent backup."""
+    cfg_path = tmp_path / "config" / "tailor.yaml"
+    cfg_path.parent.mkdir()
+    # No file exists yet — this is a first save.
+    assert not cfg_path.exists()
+
+    monkeypatch.setattr(
+        config_runtime, "soft_reload",
+        lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+
+    with pytest.raises(ConfigSaveError) as exc:
+        save_config({"llm": {"provider": "anthropic"}}, str(cfg_path))
+
+    assert exc.value.status == 500
+    # The new yaml ended up on disk (no backup to roll back to). That's
+    # acceptable — a boot after this will fail validate_loadable or crash
+    # loudly, and the user can recover manually. What we must NOT have is
+    # a leftover marker pointing at an empty backup.
+    assert not os.path.exists(_marker_path(str(cfg_path)))

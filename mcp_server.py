@@ -110,6 +110,20 @@ if __name__ == "__main__":
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(BASE_DIR, "scripts", "lib"))
 sys.path.insert(0, os.path.join(BASE_DIR, "scripts"))  # enables `from lib.X import ...` used in some modules
+
+# ── Auto-rollback: MUST run before any module that reads tailor.yaml ──
+# embedding.py, i18n.py, and llm_client.py all touch config at import time.
+# If the previous boot died within SAFETY_WINDOW_SECONDS of a config save,
+# the pending-save marker tells us to restore the backup BEFORE Python
+# tries to import those modules — otherwise this boot crashes the same way
+# the last one did, KeepAlive relaunches us, crashloop.
+#
+# If you reorder the imports below, keep this call above the first
+# config-touching import. Grep '[config-rollback]' in launchd stderr logs
+# to see when it fires.
+from scripts.lib.config_runtime import apply_pending_rollback
+apply_pending_rollback(os.path.join(BASE_DIR, "config", "tailor.yaml"))
+
 DB_DIR = os.path.join(BASE_DIR, "db")
 # Embedding: loaded from lib.embedding (config-driven)
 from embedding import get_embedding, get_embeddings, info as embedding_info
@@ -528,6 +542,24 @@ class BearerAuthMiddleware:
                 from scripts.lib.config_runtime import read_current
                 config_path = os.path.join(BASE_DIR, "config", "tailor.yaml")
                 return _json_response(read_current(config_path))
+
+            elif path == "/api/dashboard/config/restart":
+                # Force restart: SIGTERM to self, LaunchDaemon KeepAlive
+                # relaunches us in ~5s. We schedule the kill on a background
+                # thread so this response flushes before the process dies —
+                # otherwise the client sees a dropped socket instead of a 200.
+                #
+                # Does NOT write .pending-save: no config changed, so the
+                # next boot shouldn't even think about rolling back.
+                # Confirmation is the UI's job (modal with warnings).
+                import threading as _th
+                def _seppuku():
+                    time.sleep(0.5)
+                    os.kill(os.getpid(), signal.SIGTERM)
+                _th.Thread(target=_seppuku, daemon=True).start()
+                return _json_response({
+                    "ok": True, "message": "Restart initiated; expect ~5-10s of unavailability"
+                })
 
             # ── Upload conversation files ──
             elif path == "/api/dashboard/upload":
