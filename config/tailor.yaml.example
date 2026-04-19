@@ -169,6 +169,29 @@ chat_interface:
   # system_prompt: |
   #   Sei TAILOR, l'assistente AI personale...
 
+  # Providers/models selectable from the "New chat" dropdown in the dashboard.
+  # Each entry is {provider, model, label}. The pair is validated on session
+  # creation; unknown pairs are rejected with 400. The choice is persisted on
+  # the chat session row and is immutable for that session's lifetime.
+  # If this list is omitted or empty, the dashboard only exposes the default
+  # brain (from llm.* above) and the dropdown is hidden.
+  # `label` is free-form; omit it to fall back to "<provider>/<model>".
+  # Cloud providers need their API key in the corresponding env var
+  # (ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY). Ollama needs none.
+  # available_providers:
+  #   - provider: anthropic
+  #     model: claude-haiku-4-5-20251001
+  #     label: "Claude Haiku 4.5 (default)"
+  #   - provider: ollama
+  #     model: qwen3.5:9b
+  #     label: "Qwen 3.5 9B (local)"
+  #   - provider: openai
+  #     model: gpt-4o-mini
+  #     label: "GPT-4o mini"
+  #   - provider: google
+  #     model: gemini-2.5-flash
+  #     label: "Gemini 2.5 Flash"
+
 # ── Cloud Sync ────────────────────────────────────────────────
 # Cloud storage providers to sync before document ingest.
 # Each entry maps to an rclone remote. Set up rclone first: rclone config
