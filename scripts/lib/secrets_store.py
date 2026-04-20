@@ -261,21 +261,25 @@ def _resolve_backup_path(filename: str, backup_dir: str) -> str:
     return full
 
 
-def restore_db(backup_filename: str, backup_dir: str) -> None:
+def restore_db(backup_filename: str, backup_dir: str) -> str | None:
     """Replace the live DB with the contents of ``backup_dir/backup_filename``.
 
     Takes an auto-backup of the current DB into ``backup_dir`` before
     overwriting so the operation is reversible. Uses SQLite's online backup
     API to write into the live DB — safer than a file copy because any
     in-flight WAL/SHM state on the destination is superseded cleanly.
+
+    Returns the pre-restore backup filename (basename inside ``backup_dir``)
+    when one was taken, or ``None`` if there was no live DB to snapshot.
     """
     src_path = _resolve_backup_path(backup_filename, backup_dir)
 
     # Safety snapshot of the current state — if the restore turns out to be
     # the wrong file, the user's last-known-good state is still on disk.
     live_path = get_secrets_db_path()
+    pre_backup: str | None = None
     if os.path.isfile(live_path):
-        backup_db(backup_dir)
+        pre_backup = os.path.basename(backup_db(backup_dir))
 
     live_dir = os.path.dirname(os.path.abspath(live_path)) or "."
     os.makedirs(live_dir, exist_ok=True)
@@ -311,6 +315,8 @@ def restore_db(backup_filename: str, backup_dir: str) -> None:
         except OSError:
             pass
         raise
+
+    return pre_backup
 
 
 def _parse_backup_iso(filename: str) -> str:

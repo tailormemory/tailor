@@ -1059,6 +1059,63 @@ class BearerAuthMiddleware:
             elif path == "/api/dashboard/rate-limit":
                 return _json_response(_rate_limiter.get_stats())
 
+            # ── Secrets API ──
+            # Encrypted provider API-key management. All handlers are thin
+            # JSON-in/JSON-out wrappers around scripts.lib.secrets_api, which
+            # owns the real logic and is exercised directly in tests. Response
+            # shape is the same {ok, error, status} contract as the config
+            # editor endpoints above.
+            elif path.startswith("/api/secrets/"):
+                from scripts.lib.secrets_api import (
+                    SecretsApiError as _SAE,
+                    handle_list as _h_list,
+                    handle_set as _h_set,
+                    handle_delete as _h_delete,
+                    handle_verify as _h_verify,
+                    handle_backups as _h_backups,
+                    handle_restore as _h_restore,
+                    handle_master_key_setup as _h_mkey,
+                )
+                import json as _jsec
+
+                method = scope.get("method", "GET")
+
+                async def _body_json() -> dict:
+                    raw = await _receive_body(scope, receive)
+                    if not raw:
+                        return {}
+                    try:
+                        parsed = _jsec.loads(raw)
+                    except Exception:
+                        raise _SAE(400, "Invalid JSON body")
+                    if not isinstance(parsed, dict):
+                        raise _SAE(400, "Body must be a JSON object")
+                    return parsed
+
+                try:
+                    if path == "/api/secrets/list" and method == "GET":
+                        return _json_response({"ok": True, **_h_list()})
+                    if path == "/api/secrets/set" and method == "POST":
+                        return _json_response({"ok": True, **_h_set(await _body_json())})
+                    if path == "/api/secrets/delete" and method == "DELETE":
+                        return _json_response({"ok": True, **_h_delete(await _body_json())})
+                    if path == "/api/secrets/verify" and method == "POST":
+                        return _json_response({"ok": True, **_h_verify(await _body_json())})
+                    if path == "/api/secrets/backups" and method == "GET":
+                        return _json_response({"ok": True, **_h_backups()})
+                    if path == "/api/secrets/restore" and method == "POST":
+                        return _json_response({"ok": True, **_h_restore(await _body_json())})
+                    if path == "/api/secrets/master-key/setup" and method == "POST":
+                        return _json_response({"ok": True, **_h_mkey()})
+                    return _json_response(
+                        {"ok": False, "error": f"Unknown secrets path: {path}", "status": 404},
+                        404,
+                    )
+                except _SAE as e:
+                    return _json_response(
+                        {"ok": False, "error": e.message, "status": e.status}, e.status,
+                    )
+
             else:
                 return _json_response({"error": f"Unknown API path: {path}"}, 404)
         except Exception as e:
@@ -1114,14 +1171,15 @@ class BearerAuthMiddleware:
             client_host = client[0] if client else ""
             is_localhost = client_host in ("127.0.0.1", "::1", "localhost")
             is_dashboard = path.startswith("/api/dashboard/")
+            is_secrets = path.startswith("/api/secrets/")
             is_auth_api = path.startswith("/api/auth/")
             is_ingest_api = path == "/api/ingest-live"
             is_chat = path == "/api/chat" or path.startswith("/api/chat/")
 
             # Localhost: allow all API calls without auth
-            # Remote: allow dashboard + auth API + ingest-live + native chat with cookie/token auth
+            # Remote: allow dashboard + secrets + auth API + ingest-live + native chat with cookie/token auth
             _resolved_token = ""
-            if is_localhost or is_dashboard or is_auth_api or is_ingest_api or is_chat:
+            if is_localhost or is_dashboard or is_secrets or is_auth_api or is_ingest_api or is_chat:
                 # Remote calls need auth (except /api/auth/login which verifies itself)
                 if not is_localhost and path not in ("/api/auth/login", "/api/dashboard/setup"):
                     token_ok = False
