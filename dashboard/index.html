@@ -3326,6 +3326,249 @@
       );
     }
 
+    // Valid dropdown options per diff state. Mirrors the backend's
+    // action-vs-state validation in secrets_api.handle_env_import; anything
+    // the UI offers here must be accepted server-side without a 400.
+    const IMPORT_ACTIONS_BY_STATE = {
+      new:       [{ value: "import", label: "Import" },         { value: "skip",   label: "Skip" }],
+      conflict:  [{ value: "replace", label: "Replace" },        { value: "keep",   label: "Keep current" }],
+      identical: [{ value: "skip",   label: "Skip (identical)" }],
+      db_only:   [{ value: "keep",   label: "Keep current" }],
+    };
+
+    function shortKey(last4) {
+      return last4 ? `sk-***${last4}` : "";
+    }
+
+    function ImportEnvModal({ onClose, onApplied }) {
+      const t = useTheme();
+      const [phase, setPhase] = useState("input"); // 'input' | 'preview' | 'result'
+      const [envPath, setEnvPath] = useState("");
+      const [resolvedPath, setResolvedPath] = useState("");
+      const [diff, setDiff] = useState([]);
+      const [actions, setActions] = useState({});
+      const [loading, setLoading] = useState(false);
+      const [error, setError] = useState("");
+      const [result, setResult] = useState(null);
+
+      const providerLabel = (id) =>
+        SECRET_PROVIDERS.find(p => p.id === id)?.label || id;
+
+      const loadPreview = async () => {
+        setError("");
+        setLoading(true);
+        const body = envPath.trim() ? { path: envPath.trim() } : {};
+        const r = await apiCall("/api/secrets/env/preview", { method: "POST", body });
+        setLoading(false);
+        if (!r.ok) {
+          setError(r.error || "Failed to load preview");
+          return;
+        }
+        const rows = r.data.diff || [];
+        setDiff(rows);
+        setResolvedPath(r.data.env_path || "");
+        setActions(Object.fromEntries(
+          rows.map(row => [row.provider, row.suggested_action || "skip"])
+        ));
+        setPhase("preview");
+      };
+
+      const apply = async () => {
+        setError("");
+        setLoading(true);
+        const body = {
+          path: resolvedPath,
+          actions,
+        };
+        const r = await apiCall("/api/secrets/env/import", { method: "POST", body });
+        setLoading(false);
+        if (!r.ok) {
+          setError(r.error || "Import failed");
+          return;
+        }
+        setResult(r.data);
+        setPhase("result");
+      };
+
+      const goBack = () => { setError(""); setPhase("input"); };
+      const handleClose = () => {
+        // If we already wrote to the DB, make sure the parent refreshes its
+        // list on close. Otherwise the caller just dismisses — no refresh
+        // needed since nothing changed.
+        if (result) onApplied();
+        onClose();
+      };
+
+      // ── Phase renderers ─────────────────────────────────────────
+      const renderInput = () => React.createElement(React.Fragment, null,
+        React.createElement("label", { className: cl("text-sm font-medium block mb-1.5", t.textLabel) }, ".env file path"),
+        React.createElement("input", {
+          type: "text",
+          value: envPath,
+          onChange: (e) => setEnvPath(e.target.value),
+          placeholder: "/path/to/.env",
+          autoComplete: "off",
+          spellCheck: false,
+          className: cl("w-full px-4 py-3 rounded-xl border text-sm font-mono outline-none transition-all",
+            "focus:ring-2 focus:ring-teal-500/30 focus:border-teal-500", t.input),
+        }),
+        React.createElement("p", { className: cl("text-xs mt-1.5", t.textFaint) },
+          "Leave empty to use TAILOR_ROOT/.env on the server."),
+        error && React.createElement("div", { className: "text-sm text-red-400 mt-3 flex items-center gap-2" },
+          React.createElement("span", null, error),
+          React.createElement("button", {
+            onClick: loadPreview, disabled: loading,
+            className: "text-sm font-medium px-2 py-0.5 rounded-lg border border-red-500/30 hover:bg-red-500/10",
+          }, "Retry")
+        ),
+        React.createElement("div", { className: "flex justify-end gap-2 mt-5" },
+          React.createElement("button", {
+            onClick: handleClose, disabled: loading,
+            className: cl("px-4 py-2 rounded-xl text-sm font-medium transition-all border",
+              t.border, t.textMuted, "hover:text-zinc-200"),
+          }, "Cancel"),
+          React.createElement("button", {
+            onClick: loadPreview, disabled: loading,
+            className: cl("px-4 py-2 rounded-xl text-sm font-semibold transition-all",
+              "bg-teal-600 hover:bg-teal-500 text-white",
+              loading && "opacity-50 cursor-not-allowed"),
+          }, loading ? "Loading..." : "Load preview")
+        )
+      );
+
+      const renderRow = (row) => {
+        const options = IMPORT_ACTIONS_BY_STATE[row.state] || [];
+        const single = options.length <= 1;
+        const selected = actions[row.provider] || options[0]?.value || "skip";
+        return React.createElement("div", {
+          key: row.provider,
+          className: cl("grid grid-cols-1 md:grid-cols-[1.2fr_1fr_1fr_auto] gap-2 md:gap-3 items-center py-3 border-b last:border-0", t.borderLight),
+        },
+          React.createElement("div", { className: cl("text-sm font-medium", t.text) },
+            providerLabel(row.provider),
+            React.createElement("span", { className: cl("block md:inline md:ml-2 text-xs", t.textFaint) }, row.env_var)
+          ),
+          React.createElement("div", { className: cl("text-sm font-mono", row.db_last4 ? t.mono : t.textFaint) },
+            React.createElement("span", { className: cl("md:hidden text-xs uppercase tracking-widest mr-2", t.textMuted) }, "DB:"),
+            row.db_last4 ? shortKey(row.db_last4) : "(not set)"
+          ),
+          React.createElement("div", { className: cl("text-sm font-mono", row.env_last4 ? t.mono : t.textFaint) },
+            React.createElement("span", { className: cl("md:hidden text-xs uppercase tracking-widest mr-2", t.textMuted) }, ".env:"),
+            row.env_last4 ? shortKey(row.env_last4) : "(not in .env)"
+          ),
+          React.createElement("select", {
+            value: selected, disabled: single,
+            onChange: (e) => setActions(a => ({ ...a, [row.provider]: e.target.value })),
+            className: cl("px-3 py-2 rounded-lg border text-sm outline-none transition-all",
+              "focus:ring-2 focus:ring-teal-500/30 focus:border-teal-500", t.input,
+              single && "opacity-70 cursor-not-allowed"),
+          }, options.map(o => React.createElement("option", { key: o.value, value: o.value }, o.label)))
+        );
+      };
+
+      const renderPreview = () => {
+        const empty = diff.length === 0;
+        // Only enable Apply when at least one row would actually write.
+        // If every row is skip/keep the request would be a no-op and the
+        // button stays dim so the user doesn't think they did something.
+        const hasPlannedWrite = diff.some(r =>
+          actions[r.provider] === "import" || actions[r.provider] === "replace"
+        );
+        return React.createElement(React.Fragment, null,
+          React.createElement("div", { className: cl("text-sm mb-3 truncate", t.textMuted) },
+            "Source: ",
+            React.createElement("span", { className: cl("font-mono", t.mono) }, resolvedPath)
+          ),
+          empty
+            ? React.createElement("div", { className: cl("text-sm p-4 rounded-xl", t.infoBox) },
+                React.createElement("div", { className: cl("font-medium mb-1", t.text) }, "No supported API keys found in this .env file."),
+                React.createElement("div", { className: cl("text-xs", t.textFaint) },
+                  "Looking for: ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, DEEPSEEK_API_KEY.")
+              )
+            : React.createElement(React.Fragment, null,
+                React.createElement("div", { className: cl("hidden md:grid grid-cols-[1.2fr_1fr_1fr_auto] gap-3 pb-2 text-xs uppercase tracking-widest", t.textMuted) },
+                  React.createElement("div", null, "Provider"),
+                  React.createElement("div", null, "Current (DB)"),
+                  React.createElement("div", null, "From .env"),
+                  React.createElement("div", null, "Action")
+                ),
+                React.createElement("div", { className: cl("border-t", t.borderLight) },
+                  diff.map(renderRow)
+                )
+              ),
+          error && React.createElement("div", { className: "text-sm text-red-400 mt-3 flex items-center gap-2" },
+            React.createElement("span", null, error),
+            React.createElement("button", {
+              onClick: apply, disabled: loading,
+              className: "text-sm font-medium px-2 py-0.5 rounded-lg border border-red-500/30 hover:bg-red-500/10",
+            }, "Retry")
+          ),
+          React.createElement("div", { className: "flex items-center justify-between gap-2 mt-5" },
+            React.createElement("button", {
+              onClick: goBack, disabled: loading,
+              className: cl("px-3 py-2 rounded-xl text-sm font-medium transition-all", t.textMuted, "hover:text-zinc-200"),
+            }, "\u25C0 Back"),
+            React.createElement("div", { className: "flex gap-2" },
+              React.createElement("button", {
+                onClick: handleClose, disabled: loading,
+                className: cl("px-4 py-2 rounded-xl text-sm font-medium transition-all border",
+                  t.border, t.textMuted, "hover:text-zinc-200"),
+              }, "Cancel"),
+              !empty && React.createElement("button", {
+                onClick: apply, disabled: loading || !hasPlannedWrite,
+                className: cl("px-4 py-2 rounded-xl text-sm font-semibold transition-all",
+                  "bg-teal-600 hover:bg-teal-500 text-white",
+                  (loading || !hasPlannedWrite) && "opacity-50 cursor-not-allowed"),
+              }, loading ? "Applying..." : "Apply selected")
+            )
+          )
+        );
+      };
+
+      const renderResult = () => {
+        // Backend returns {applied: [{provider, action, last4}], skipped:
+        // [{provider, action, reason}]}. Merge into one list so the user
+        // sees every provider they considered, not only the changed ones.
+        const applied = result?.applied || [];
+        const skipped = result?.skipped || [];
+        const all = [
+          ...applied.map(a => ({ ...a, outcome: a.action === "replace" ? "replaced" : "imported" })),
+          ...skipped.map(s => ({ ...s, outcome: `skipped${s.reason === "identical" ? " (identical)" : s.reason === "db_only" ? " (not in .env)" : ""}` })),
+        ];
+        return React.createElement(React.Fragment, null,
+          React.createElement("div", { className: "text-emerald-400 text-base font-semibold mb-2 flex items-center gap-2" },
+            React.createElement("span", null, "\u2713"),
+            React.createElement("span", null, "Import complete")
+          ),
+          React.createElement("ul", { className: "space-y-1 mb-4" },
+            all.map(item => React.createElement("li", { key: item.provider, className: cl("text-sm flex items-center gap-2", t.textMuted) },
+              React.createElement("span", { className: cl("font-medium", t.text) }, providerLabel(item.provider) + ":"),
+              React.createElement("span", null, item.outcome)
+            ))
+          ),
+          React.createElement("div", { className: "flex justify-end" },
+            React.createElement("button", {
+              onClick: handleClose,
+              className: cl("px-4 py-2 rounded-xl text-sm font-semibold transition-all",
+                "bg-teal-600 hover:bg-teal-500 text-white"),
+            }, "Close")
+          )
+        );
+      };
+
+      return React.createElement(Modal, { onClose: handleClose },
+        React.createElement("div", {
+          className: cl("w-full max-w-2xl rounded-2xl border p-6 max-h-[90vh] overflow-y-auto", t.tile),
+          style: { background: t.input.includes("zinc-900") ? "#0a0c10" : "#ffffff" },
+        },
+          React.createElement("h3", { className: cl("text-base font-semibold mb-4", t.text) }, "Import API keys from .env"),
+          phase === "input" && renderInput(),
+          phase === "preview" && renderPreview(),
+          phase === "result" && renderResult()
+        )
+      );
+    }
+
     function SecretsPage() {
       const t = useTheme();
       const [loading, setLoading] = useState(true);
@@ -3335,6 +3578,7 @@
       const [modal, setModal] = useState(null); // { type, provider, current? }
       const [verifyStatus, setVerifyStatus] = useState({});
       const [toast, setToast] = useState(null);
+      const [importOpen, setImportOpen] = useState(false);
 
       const refresh = useCallback(async () => {
         setError("");
@@ -3425,9 +3669,16 @@
       }
 
       // Main UI
-      const headerRight = React.createElement("div", { className: "flex items-center gap-2" },
-        React.createElement("span", { className: cl("text-sm", t.textFaint) }, "Master key:"),
-        React.createElement("span", { className: "text-sm text-emerald-400" }, "\u2713 ready")
+      const headerRight = React.createElement("div", { className: "flex items-center gap-3 flex-wrap" },
+        React.createElement("button", {
+          onClick: () => setImportOpen(true),
+          className: cl("px-3 py-1.5 rounded-lg text-sm font-medium transition-all border",
+            t.border, t.textMuted, "hover:text-teal-400 hover:border-teal-500"),
+        }, "Import from .env"),
+        React.createElement("div", { className: "flex items-center gap-2" },
+          React.createElement("span", { className: cl("text-sm", t.textFaint) }, "Master key:"),
+          React.createElement("span", { className: "text-sm text-emerald-400" }, "\u2713 ready")
+        )
       );
 
       return React.createElement("div", { className: "space-y-5" },
@@ -3469,6 +3720,10 @@
           last4: modal.current?.last4,
           onClose: closeModal,
           onConfirm: handleDeleteSuccess,
+        }),
+        importOpen && React.createElement(ImportEnvModal, {
+          onClose: () => setImportOpen(false),
+          onApplied: refresh,
         }),
         React.createElement(Toast, {
           toast,
