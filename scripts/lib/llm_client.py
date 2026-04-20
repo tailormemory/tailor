@@ -9,6 +9,7 @@ Supported providers: anthropic, openai, google, ollama
 
 import os, sys, json, re, time, requests
 from lib.config import get
+from lib.api_keys import resolve_api_key
 
 # ═══════════════════════════════════════════════════════════════
 # Streaming event protocol (shared across providers).
@@ -115,14 +116,28 @@ def _word_chunks(text: str):
 
 class LLMClient:
     """Abstract LLM client interface."""
-    
+
     def __init__(self, cfg: dict):
         self.provider = cfg.get("provider", "anthropic")
         self.model = cfg.get("model", "")
-        self.api_key = cfg.get("api_key", "")
+        # Stored, not copied to self.api_key: the property below re-resolves
+        # on every access so dashboard-initiated key changes take effect
+        # without a process restart. The explicit value only "wins" when
+        # it's a hard-coded literal from YAML (see api_keys.resolve_api_key).
+        self._explicit_api_key = cfg.get("api_key", "") or ""
         self.max_tokens = cfg.get("max_tokens", 1000)
         self.temperature = cfg.get("temperature", 0.3)
         self.tool_use = cfg.get("tool_use", True)
+
+    @property
+    def api_key(self) -> str:
+        """Current API key: DB > env var, with explicit literal override.
+
+        Re-resolved on every access; there's intentionally no cache at
+        this layer. ``secrets_store`` caches the master key, so the cost
+        is one SQLite read + AES-GCM decrypt per request.
+        """
+        return resolve_api_key(self.provider, self._explicit_api_key)
     
     def chat(self, system: str, messages: list[dict], max_tokens: int = 0) -> str:
         """Simple chat without tools. Returns text response."""
@@ -692,19 +707,6 @@ def get_brain() -> LLMClient:
     return _brain
 
 
-# Per-provider env-var names for API keys. Same precedence as the existing
-# config-file paths: if llm.api_key is left as ${ANTHROPIC_API_KEY} etc. the
-# env var wins. `build_brain` uses these directly to avoid depending on the
-# default llm config when the caller explicitly picks a different provider.
-_PROVIDER_API_KEY_ENV = {
-    "anthropic": "ANTHROPIC_API_KEY",
-    "openai": "OPENAI_API_KEY",
-    "google": "GOOGLE_API_KEY",
-    "ollama": None,  # no key — local endpoint
-    "deepseek": "DEEPSEEK_API_KEY",
-}
-
-
 def build_brain(provider: str, model: str) -> LLMClient:
     """Build an LLM client ad-hoc for a specific provider/model.
 
@@ -715,10 +717,14 @@ def build_brain(provider: str, model: str) -> LLMClient:
     Behaviour:
       * `provider` must be a key of `_PROVIDERS`; otherwise ValueError.
       * `model` is passed through to the provider constructor as-is.
-      * For cloud providers (anthropic, openai, google), the API key is
-        read from the corresponding env var. If missing, raise ValueError
-        with a clear message so the caller can surface a 400 rather than
-        letting an opaque 500 escape at first HTTP call.
+      * For cloud providers (anthropic, openai, google, deepseek), the
+        API key is resolved via :func:`api_keys.resolve_api_key` (DB →
+        env var). If neither has a key we raise ValueError with the env
+        var names so the caller can surface a 400 rather than letting an
+        opaque 500 escape at first HTTP call. We don't pin the resolved
+        key into ``cfg`` — the LLMClient.api_key property re-resolves on
+        every request so dashboard-initiated rotations take effect
+        without a process restart.
       * For ollama, the `base_url` and `keep_alive` settings are inherited
         from the default llm config if present (otherwise the defaults
         baked into `OllamaClient.__init__` apply).
@@ -731,6 +737,8 @@ def build_brain(provider: str, model: str) -> LLMClient:
     for cloud providers (stateless HTTP) and for ollama (requests
     wrapper); no hidden resources to tear down.
     """
+    from lib.api_keys import PROVIDER_API_KEY_ENVS
+
     cls = _PROVIDERS.get(provider)
     if not cls:
         raise ValueError(
@@ -750,14 +758,16 @@ def build_brain(provider: str, model: str) -> LLMClient:
         "tool_use": default_cfg.get("tool_use", True),
     }
 
-    env_name = _PROVIDER_API_KEY_ENV.get(provider)
-    if env_name:
-        key = os.environ.get(env_name, "")
-        if not key:
+    envs = PROVIDER_API_KEY_ENVS.get(provider, ())
+    if envs:
+        # Probe up-front so missing-key failures surface as a clean
+        # ValueError at build time, not an opaque 401 on first request.
+        if not resolve_api_key(provider):
+            names = " or ".join(envs)
             raise ValueError(
-                f"Missing API key: set {env_name} to use provider {provider!r}."
+                f"Missing API key for provider {provider!r}: "
+                f"add it in the dashboard (API Keys tab) or set {names}."
             )
-        cfg["api_key"] = key
     if provider == "ollama":
         # Preserve user-configured ollama endpoint / keep_alive if any.
         if default_cfg.get("provider") == "ollama":

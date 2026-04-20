@@ -25,13 +25,18 @@ if _keep_alive is None:
     _keep_alive = -1  # Keep model hot by default (avoids cold start)
 
 def _get_api_key() -> str:
+    # Dashboard-managed encrypted DB first (via the shared resolver that
+    # also covers the canonical env vars for each provider). We fall
+    # through to the user-specified api_key_env only if both the DB and
+    # the canonical env var are empty — that setting is for exotic setups
+    # where the key lives under a custom var name, and the default path
+    # must not steal the resolution from it when actually configured.
+    from lib.api_keys import resolve_api_key  # local import: keep embedding cheap to load
+    key = resolve_api_key(_provider)
+    if key:
+        return key
     if _api_key_env:
         return os.environ.get(_api_key_env, "")
-    # Fallback: try common env var names based on provider
-    if _provider == "openai":
-        return os.environ.get("OPENAI_API_KEY", "")
-    if _provider == "google":
-        return os.environ.get("GOOGLE_API_KEY", "")
     return ""
 
 
