@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import sys
 import time
 from datetime import datetime
@@ -250,7 +251,14 @@ def soft_reload() -> dict[str, list[str]]:
 # window, process died for unrelated reasons, no rollback.
 
 
-def _pending_save_path(config_path: str) -> str:
+def get_pending_save_path(config_path: str) -> str:
+    """Absolute path of the .pending-save marker next to `config_path`.
+
+    Single source of truth — don't reconstruct this string elsewhere. Both
+    the save/restore pipeline (that writes and clears it) and the restart
+    endpoint (that clears it before an explicit SIGTERM) need to agree on
+    where the file lives.
+    """
     return os.path.join(
         os.path.dirname(os.path.abspath(config_path)), PENDING_SAVE_FILENAME
     )
@@ -276,7 +284,7 @@ def write_pending_save(config_path: str, backup_name: str) -> str:
     the basename of the pre-save snapshot inside .backups/ (empty string if
     this was the very first save — nothing to roll back to).
     """
-    marker = _pending_save_path(config_path)
+    marker = get_pending_save_path(config_path)
     payload = {
         "saved_at": time.time(),
         "backup": backup_name,
@@ -290,7 +298,7 @@ def write_pending_save(config_path: str, backup_name: str) -> str:
 
 def _clear_pending_save(config_path: str) -> None:
     try:
-        os.remove(_pending_save_path(config_path))
+        os.remove(get_pending_save_path(config_path))
     except FileNotFoundError:
         pass
 
@@ -312,7 +320,7 @@ def apply_pending_rollback(config_path: str) -> dict | None:
     (embedding, i18n, llm_client) above the call site. Reordering those
     imports is exactly the regression this function exists to prevent.
     """
-    marker = _pending_save_path(config_path)
+    marker = get_pending_save_path(config_path)
     if not os.path.exists(marker):
         return None
 
@@ -370,6 +378,39 @@ def apply_pending_rollback(config_path: str) -> dict | None:
     )
     _clear_pending_save(config_path)
     return {"action": "rolled_back", "age": age, "backup": backup_name}
+
+
+def trigger_self_restart(config_path: str) -> None:
+    """Clear the .pending-save marker, then SIGTERM ourselves.
+
+    Called by the dashboard Force Restart endpoint. A restart clicked by
+    the user in the UI is an informed, explicit action — not a crash —
+    so the next boot must NOT run apply_pending_rollback() over a marker
+    that's still sitting inside SAFETY_WINDOW_SECONDS (e.g. from a Save
+    or Restore the user made 10 seconds before clicking Restart). That
+    would silently undo the change the user just committed.
+
+    Order is load-bearing: clear BEFORE signaling. Once SIGTERM lands
+    we don't get another chance to touch the filesystem — whatever the
+    marker looks like on disk is what the next boot reacts to.
+
+    Exception policy mirrors the spec: FileNotFoundError → nothing to
+    clear, proceed silently. Any other OS error (EACCES, EIO, …) is a
+    real disk problem; we log it and re-raise instead of suppressing,
+    because sending the process to its death with a stale marker would
+    just reintroduce the very bug this function exists to fix.
+    """
+    marker = get_pending_save_path(config_path)
+    try:
+        os.remove(marker)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        _log_rollback(f"failed to clear pending-save during restart: {e}")
+        raise
+    else:
+        _log_rollback("pending-save cleared by explicit restart, not a crash")
+    os.kill(os.getpid(), signal.SIGTERM)
 
 
 def _revert_after_reload_failure(

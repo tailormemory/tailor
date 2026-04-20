@@ -28,12 +28,14 @@ from scripts.lib.config_runtime import (  # noqa: E402
     apply_pending_rollback,
     check_blacklist,
     create_backup,
+    get_pending_save_path,
     list_backups,
     parse_incoming,
     read_current,
     restore_backup,
     save_config,
     soft_reload,
+    trigger_self_restart,
     validate_loadable,
     write_pending_save,
 )
@@ -1042,3 +1044,67 @@ def test_restore_does_not_honour_blacklist(config_path):
     assert result["ok"] is True
     restored = yaml.safe_load(open(config_path).read())
     assert restored["auth"]["token"] == "previous_token"
+
+
+# ── Dashboard Force Restart: pending-save must be cleared first ──
+#
+# Regression guard for the bug where clicking Force Restart within the
+# SAFETY_WINDOW_SECONDS of a save/restore caused the next boot's
+# apply_pending_rollback to undo the user's change. An explicit restart
+# is not a crash — the marker must be gone BEFORE the SIGTERM fires.
+
+
+def test_restart_endpoint_clears_pending_save(config_path, monkeypatch):
+    """Marker is cleared and SIGTERM is sent, in that order."""
+    import signal as _sig
+    import unittest.mock as _mock
+
+    # Fresh marker as if a save just completed.
+    write_pending_save(config_path, "tailor-20260420-120000.yaml")
+    marker = get_pending_save_path(config_path)
+    assert os.path.exists(marker)
+
+    # Attach both os.remove and os.kill to a single parent mock so
+    # mock_calls preserves their global invocation order.
+    parent = _mock.Mock()
+    real_remove = os.remove
+
+    def tracking_remove(path, *a, **kw):
+        parent.remove(path)
+        return real_remove(path, *a, **kw)
+
+    monkeypatch.setattr(os, "remove", tracking_remove)
+    monkeypatch.setattr(os, "kill", parent.kill)
+
+    trigger_self_restart(config_path)
+
+    # Marker gone from disk.
+    assert not os.path.exists(marker)
+    # SIGTERM was dispatched to our own PID.
+    assert parent.kill.called
+    pid_arg, sig_arg = parent.kill.call_args[0]
+    assert pid_arg == os.getpid()
+    assert sig_arg == _sig.SIGTERM
+
+    # Order guarantee: the marker deletion happened before the signal.
+    # If this ever flips, the next boot sees a stale marker and rolls
+    # back the user's change — exactly the bug this fix prevents.
+    names = [c[0] for c in parent.mock_calls]
+    assert "remove" in names and "kill" in names
+    assert names.index("remove") < names.index("kill")
+
+
+def test_restart_endpoint_handles_missing_pending_save(config_path, monkeypatch):
+    """No marker on disk: restart is still issued, no exception raised."""
+    import unittest.mock as _mock
+
+    marker = get_pending_save_path(config_path)
+    assert not os.path.exists(marker)
+
+    kill_mock = _mock.MagicMock()
+    monkeypatch.setattr(os, "kill", kill_mock)
+
+    # Must not raise — FileNotFoundError is the expected, silent case.
+    trigger_self_restart(config_path)
+
+    assert kill_mock.called

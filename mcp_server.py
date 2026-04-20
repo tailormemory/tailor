@@ -641,13 +641,16 @@ class BearerAuthMiddleware:
                 # thread so this response flushes before the process dies —
                 # otherwise the client sees a dropped socket instead of a 200.
                 #
-                # Does NOT write .pending-save: no config changed, so the
-                # next boot shouldn't even think about rolling back.
-                # Confirmation is the UI's job (modal with warnings).
+                # trigger_self_restart() also clears .pending-save before
+                # signaling: an explicit user restart is not a crash, so the
+                # next boot must not auto-rollback a Save/Restore the user
+                # just made within the safety window.
+                from scripts.lib.config_runtime import trigger_self_restart
                 import threading as _th
+                config_path = os.path.join(BASE_DIR, "config", "tailor.yaml")
                 def _seppuku():
                     time.sleep(0.5)
-                    os.kill(os.getpid(), signal.SIGTERM)
+                    trigger_self_restart(config_path)
                 _th.Thread(target=_seppuku, daemon=True).start()
                 return _json_response({
                     "ok": True, "message": "Restart initiated; expect ~5-10s of unavailability"
