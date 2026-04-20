@@ -247,7 +247,7 @@
       { id: "kb", label: "Knowledge Base", icon: "\u25C6" },
       { id: "pipeline", label: "Pipeline", icon: "\u25B8" },
       { id: "config", label: "Configuration", icon: "\u2699" },
-      { id: "secrets", label: "API Keys", icon: "\u{1F511}" },
+      { id: "secrets", label: "API Keys", icon: "\u26BF" },
       { id: "profile", label: "Profile", icon: "\u25CE" },
     ];
 
@@ -3035,6 +3035,42 @@
       { id: "deepseek", label: "DeepSeek" },
     ];
 
+    // Abstract color-plus-initial marks rather than real provider logos —
+    // official brand logos carry licensing constraints we don't want in
+    // an open-source repo. Colors are a nod to each vendor's accent.
+    const PROVIDER_ICONS = {
+      anthropic: { bg: "#D97758", fg: "#FFFFFF", initial: "A" },
+      openai:    { bg: "#10A37F", fg: "#FFFFFF", initial: "O" },
+      google:    { bg: "#4285F4", fg: "#FFFFFF", initial: "G" },
+      deepseek:  { bg: "#4D6BFE", fg: "#FFFFFF", initial: "D" },
+    };
+
+    function ProviderIcon({ provider, size = 36 }) {
+      const spec = PROVIDER_ICONS[provider] || { bg: "#52525b", fg: "#fff", initial: "?" };
+      return React.createElement("div", {
+        className: "rounded-lg flex items-center justify-center font-bold flex-shrink-0 shadow-sm",
+        style: {
+          width: `${size}px`, height: `${size}px`,
+          background: spec.bg, color: spec.fg,
+          fontSize: `${Math.round(size * 0.45)}px`,
+          letterSpacing: "0",
+        },
+      }, spec.initial);
+    }
+
+    // Client-side file download without round-tripping the bytes through a
+    // base64 data URI — keeps large backup files fast.
+    function downloadBlob(filename, blob) {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
     function formatRelativeTime(ts) {
       if (!ts) return "";
       const now = Math.floor(Date.now() / 1000);
@@ -3150,8 +3186,14 @@
               onChange: (e) => setVerify(e.target.checked),
               className: "w-4 h-4 accent-teal-500",
             }),
-            "Verify before saving (recommended)"
+            "Test key with provider before saving (recommended)"
           ),
+          // Heads-up (non-blocking) when the last 4 characters of the new
+          // key match the current one — likely a paste mistake, but could
+          // also be legitimate if the user regenerated the same key.
+          isRotate && current?.last4 && trimmed.length >= 4 && trimmed.slice(-4) === current.last4 && React.createElement("div", {
+            className: cl("text-sm mb-3 p-3 rounded-xl", t.warnBox),
+          }, "This key's last 4 characters match the current key. Continue anyway?"),
           error && React.createElement("div", { className: "text-sm text-red-400 mb-3" }, error),
           React.createElement("div", { className: "flex justify-end gap-2" },
             React.createElement("button", {
@@ -3263,8 +3305,9 @@
 
       return React.createElement(Tile, null,
         React.createElement("div", { className: "flex items-start gap-3" },
-          React.createElement("div", { className: cl("w-2 h-2 rounded-full mt-2 flex-shrink-0",
-            configured ? "bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.5)]" : "bg-zinc-600") }),
+          React.createElement("div", { className: cl(!configured && "opacity-40 saturate-50") },
+            React.createElement(ProviderIcon, { provider })
+          ),
           React.createElement("div", { className: "flex-1 min-w-0" },
             React.createElement("div", { className: cl("text-base font-semibold", t.text) }, label),
             configured
@@ -3569,6 +3612,302 @@
       );
     }
 
+    // Format a YYYYMMDD date for filenames (local time — matches how users
+    // label files on their own machine).
+    function ymdToday() {
+      const d = new Date();
+      const pad = (n) => String(n).padStart(2, "0");
+      return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}`;
+    }
+
+    function MasterKeyReplaceModal({ onClose, onReplaced }) {
+      const t = useTheme();
+      const [text, setText] = useState("");
+      const [busy, setBusy] = useState(false);
+      const [error, setError] = useState("");
+
+      const handleReplace = async () => {
+        setError("");
+        // Accept either the raw base64 line or a pasted backup file (the
+        // file starts with '#'-prefixed metadata lines — strip them so the
+        // user doesn't have to hand-edit).
+        const b64 = text
+          .split(/\r?\n/)
+          .map(l => l.trim())
+          .filter(l => l && !l.startsWith("#"))
+          .join("");
+        if (!b64) { setError("Paste the base64 master key"); return; }
+        setBusy(true);
+        const r = await apiCall("/api/secrets/master-key/import", {
+          method: "POST", body: { key_b64: b64 },
+        });
+        setBusy(false);
+        if (!r.ok) { setError(r.error || "Import failed"); return; }
+        onReplaced(r.data);
+      };
+
+      return React.createElement(Modal, { onClose },
+        React.createElement("div", {
+          className: cl("w-full max-w-lg rounded-2xl border p-6", t.tile),
+          style: { background: t.input.includes("zinc-900") ? "#0a0c10" : "#ffffff" },
+        },
+          React.createElement("h3", { className: cl("text-base font-semibold mb-3", t.text) }, "Replace master key from backup"),
+          React.createElement("div", { className: cl("text-sm mb-3 p-3 rounded-xl", t.warnBox) },
+            React.createElement("div", { className: "font-semibold mb-1" }, "\u26A0 This replaces your current master key."),
+            React.createElement("div", null,
+              "API keys encrypted with the old key will become unreadable. Only do this ",
+              "if you're restoring from a backup that matches your current DB. Your current ",
+              "key will be auto-saved as ",
+              React.createElement("code", { className: "font-mono text-xs" }, "master.key.backup-...")
+            )
+          ),
+          React.createElement("label", { className: cl("text-sm font-medium block mb-1.5", t.textLabel) },
+            "Paste the base64 master key (or the full backup file contents)"),
+          React.createElement("textarea", {
+            value: text,
+            onChange: (e) => setText(e.target.value),
+            placeholder: "base64==",
+            rows: 6,
+            spellCheck: false,
+            className: cl("w-full px-4 py-3 rounded-xl border text-sm font-mono outline-none transition-all resize-none",
+              "focus:ring-2 focus:ring-teal-500/30 focus:border-teal-500", t.input),
+          }),
+          error && React.createElement("div", { className: "text-sm text-red-400 mt-3" }, error),
+          React.createElement("div", { className: "flex justify-end gap-2 mt-5" },
+            React.createElement("button", {
+              onClick: onClose, disabled: busy,
+              className: cl("px-4 py-2 rounded-xl text-sm font-medium transition-all border",
+                t.border, t.textMuted, "hover:text-zinc-200"),
+            }, "Cancel"),
+            React.createElement("button", {
+              onClick: handleReplace, disabled: busy || !text.trim(),
+              className: cl("px-4 py-2 rounded-xl text-sm font-semibold transition-all",
+                "bg-red-600 hover:bg-red-500 text-white",
+                (busy || !text.trim()) && "opacity-50 cursor-not-allowed"),
+            }, busy ? "Replacing..." : "Replace master key")
+          )
+        )
+      );
+    }
+
+    function MasterKeyCard({ onReplaced, onToast }) {
+      const t = useTheme();
+      const [replaceOpen, setReplaceOpen] = useState(false);
+      const [downloading, setDownloading] = useState(false);
+      const [error, setError] = useState("");
+
+      const handleDownload = async () => {
+        setError("");
+        setDownloading(true);
+        try {
+          const r = await apiCall("/api/secrets/master-key/export");
+          if (!r.ok) { setError(r.error || "Download failed"); return; }
+          const meta = [
+            "# TAILOR master key backup",
+            `# Generated: ${new Date().toISOString().replace("T", " ").slice(0, 19)}`,
+            `# Host: ${window.location.host}`,
+            "#",
+            "# KEEP THIS FILE SAFE. Loss of this key = loss of all stored API keys.",
+            "# To restore, use \"Replace from backup\" in the API Keys tab.",
+            "",
+            r.data.key_b64,
+            "",
+          ].join("\n");
+          const blob = new Blob([meta], { type: "text/plain" });
+          downloadBlob(`tailor-master-key-${ymdToday()}.txt`, blob);
+          onToast && onToast({ title: "Master key backup downloaded" });
+        } finally {
+          setDownloading(false);
+        }
+      };
+
+      return React.createElement(React.Fragment, null,
+        React.createElement(Tile, null,
+          React.createElement("div", { className: "flex items-start gap-3" },
+            React.createElement("div", {
+              className: "w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0 text-lg",
+              style: { background: "rgba(20,184,166,0.15)", color: "#5eead4" },
+            }, "\u{1F510}"),
+            React.createElement("div", { className: "flex-1 min-w-0" },
+              React.createElement("div", { className: cl("text-sm font-semibold", t.text) }, "Master key"),
+              React.createElement("div", { className: cl("text-xs mt-0.5 font-mono", t.textFaint) }, "Stored at ~/.tailor/master.key"),
+              React.createElement("div", { className: "text-xs text-amber-400 mt-1.5" },
+                "\u26A0 Back this up — losing it means losing all stored keys."),
+              error && React.createElement("div", { className: "text-sm text-red-400 mt-2" }, error),
+              React.createElement("div", { className: "flex flex-wrap gap-2 mt-3" },
+                React.createElement("button", {
+                  onClick: handleDownload, disabled: downloading,
+                  className: cl("px-3 py-1.5 rounded-lg text-sm font-medium transition-all border",
+                    t.border, t.textMuted, "hover:text-teal-400 hover:border-teal-500",
+                    downloading && "opacity-50 cursor-not-allowed"),
+                }, downloading ? "Downloading..." : "Download backup"),
+                React.createElement("button", {
+                  onClick: () => setReplaceOpen(true),
+                  className: cl("px-3 py-1.5 rounded-lg text-sm font-medium transition-all border",
+                    t.border, "text-amber-400 hover:border-amber-500"),
+                }, "Replace from backup")
+              )
+            )
+          )
+        ),
+        replaceOpen && React.createElement(MasterKeyReplaceModal, {
+          onClose: () => setReplaceOpen(false),
+          onReplaced: (payload) => {
+            setReplaceOpen(false);
+            onReplaced(payload);
+          },
+        })
+      );
+    }
+
+    function BackupRestoreModal({ filename, createdAt, onClose, onRestored }) {
+      const t = useTheme();
+      const [busy, setBusy] = useState(false);
+      const [error, setError] = useState("");
+
+      const handleRestore = async () => {
+        setError("");
+        setBusy(true);
+        const r = await apiCall("/api/secrets/restore", {
+          method: "POST", body: { filename },
+        });
+        setBusy(false);
+        if (!r.ok) { setError(r.error || "Restore failed"); return; }
+        onRestored(r.data);
+      };
+
+      return React.createElement(Modal, { onClose },
+        React.createElement("div", {
+          className: cl("w-full max-w-md rounded-2xl border p-6", t.tile),
+          style: { background: t.input.includes("zinc-900") ? "#0a0c10" : "#ffffff" },
+        },
+          React.createElement("h3", { className: cl("text-base font-semibold mb-3", t.text) },
+            `Restore backup from ${createdAt || filename}?`),
+          React.createElement("p", { className: cl("text-sm mb-2", t.textMuted) },
+            "This replaces your current encrypted key database with the snapshot. ",
+            "All provider keys currently stored will be replaced with what was in this backup."),
+          React.createElement("p", { className: cl("text-sm mb-4", t.textFaint) },
+            "A backup of the current state will be created automatically first."),
+          error && React.createElement("div", { className: "text-sm text-red-400 mb-3" }, error),
+          React.createElement("div", { className: "flex justify-end gap-2" },
+            React.createElement("button", {
+              onClick: onClose, disabled: busy,
+              className: cl("px-4 py-2 rounded-xl text-sm font-medium transition-all border",
+                t.border, t.textMuted, "hover:text-zinc-200"),
+            }, "Cancel"),
+            React.createElement("button", {
+              onClick: handleRestore, disabled: busy,
+              className: cl("px-4 py-2 rounded-xl text-sm font-semibold transition-all",
+                "bg-amber-600 hover:bg-amber-500 text-white",
+                busy && "opacity-50 cursor-not-allowed"),
+            }, busy ? "Restoring..." : "Restore")
+          )
+        )
+      );
+    }
+
+    function BackupsPanel({ refreshKey, onRestored, onToast }) {
+      const t = useTheme();
+      const [expanded, setExpanded] = useState(false);
+      const [backups, setBackups] = useState(null);
+      const [error, setError] = useState("");
+      const [restoreTarget, setRestoreTarget] = useState(null);
+
+      const load = useCallback(async () => {
+        setError("");
+        const r = await apiCall("/api/secrets/backups");
+        if (!r.ok) { setError(r.error || "Failed to load backups"); return; }
+        setBackups(r.data.backups || []);
+      }, []);
+
+      useEffect(() => { load(); }, [load, refreshKey]);
+
+      const count = backups === null ? "…" : backups.length;
+
+      const handleDownload = async (filename) => {
+        const sep = "?";
+        const url = `${API_BASE}/api/secrets/backups/download${sep}filename=${encodeURIComponent(filename)}${API_TOKEN ? `&token=${API_TOKEN}` : ""}`;
+        try {
+          const r = await fetch(url, { credentials: "include" });
+          if (!r.ok) {
+            onToast && onToast({ title: `Download failed (HTTP ${r.status})` });
+            return;
+          }
+          const blob = await r.blob();
+          downloadBlob(filename, blob);
+        } catch (e) {
+          onToast && onToast({ title: "Download failed — network error" });
+        }
+      };
+
+      const prettyDate = (iso) => {
+        if (!iso) return "";
+        const d = new Date(iso);
+        if (isNaN(d)) return iso;
+        return d.toLocaleString(undefined, {
+          year: "numeric", month: "short", day: "2-digit",
+          hour: "2-digit", minute: "2-digit",
+        });
+      };
+
+      return React.createElement(React.Fragment, null,
+        React.createElement(Tile, null,
+          React.createElement("button", {
+            onClick: () => setExpanded(x => !x),
+            className: cl("w-full flex items-center justify-between text-left", t.text),
+          },
+            React.createElement("div", { className: "flex items-center gap-2" },
+              React.createElement("span", { className: "text-lg" }, "\u{1F4E6}"),
+              React.createElement("span", { className: "text-sm font-semibold" }, `Backups (${count})`)
+            ),
+            React.createElement("span", { className: cl("text-sm", t.textFaint) }, expanded ? "\u25B2" : "\u25BC")
+          ),
+          expanded && React.createElement("div", { className: cl("mt-4 pt-4 border-t", t.borderLight) },
+            error && React.createElement("div", { className: "text-sm text-red-400 mb-3" }, error),
+            backups === null
+              ? React.createElement(Skeleton, { className: "h-6 w-48" })
+              : backups.length === 0
+                ? React.createElement("div", { className: cl("text-sm", t.textFaint) },
+                    "No backups yet. Backups are created automatically when you add, rotate, or delete keys.")
+                : React.createElement("div", { className: "space-y-2" },
+                    backups.map(b => React.createElement("div", {
+                      key: b.filename,
+                      className: cl("flex flex-wrap items-center justify-between gap-3 py-2 px-3 rounded-lg border", t.borderLight),
+                    },
+                      React.createElement("div", { className: "flex-1 min-w-0" },
+                        React.createElement("div", { className: cl("text-sm", t.text) }, prettyDate(b.created_at)),
+                        React.createElement("div", { className: cl("text-xs font-mono truncate", t.textFaint) },
+                          `${b.filename} \u00B7 ${(b.size_bytes / 1024).toFixed(1)} KB`)
+                      ),
+                      React.createElement("div", { className: "flex gap-2" },
+                        React.createElement("button", {
+                          onClick: () => setRestoreTarget({ filename: b.filename, createdAt: prettyDate(b.created_at) }),
+                          className: cl("px-3 py-1 rounded-lg text-sm font-medium transition-all border",
+                            t.border, "text-amber-400 hover:border-amber-500"),
+                        }, "Restore"),
+                        React.createElement("button", {
+                          onClick: () => handleDownload(b.filename),
+                          className: cl("px-3 py-1 rounded-lg text-sm font-medium transition-all border",
+                            t.border, t.textMuted, "hover:text-teal-400 hover:border-teal-500"),
+                        }, "Download")
+                      )
+                    ))
+                  )
+          )
+        ),
+        restoreTarget && React.createElement(BackupRestoreModal, {
+          filename: restoreTarget.filename,
+          createdAt: restoreTarget.createdAt,
+          onClose: () => setRestoreTarget(null),
+          onRestored: (data) => {
+            setRestoreTarget(null);
+            load();
+            onRestored && onRestored(data);
+          },
+        })
+      );
+    }
+
     function SecretsPage() {
       const t = useTheme();
       const [loading, setLoading] = useState(true);
@@ -3579,6 +3918,9 @@
       const [verifyStatus, setVerifyStatus] = useState({});
       const [toast, setToast] = useState(null);
       const [importOpen, setImportOpen] = useState(false);
+      // Bumped whenever we mutate the DB — BackupsPanel reloads its list.
+      const [backupsRefreshKey, setBackupsRefreshKey] = useState(0);
+      const bumpBackups = () => setBackupsRefreshKey(k => k + 1);
 
       const refresh = useCallback(async () => {
         setError("");
@@ -3634,6 +3976,7 @@
       const handleSaveSuccess = ({ provider, isRotate, backup }) => {
         closeModal();
         refresh();
+        bumpBackups();
         if (isRotate && backup) {
           const label = SECRET_PROVIDERS.find(p => p.id === provider)?.label || provider;
           setToast({
@@ -3645,7 +3988,7 @@
         }
       };
 
-      const handleDeleteSuccess = () => { closeModal(); refresh(); };
+      const handleDeleteSuccess = () => { closeModal(); refresh(); bumpBackups(); };
 
       // Loading skeleton
       if (loading || masterKeyExists === null) {
@@ -3674,11 +4017,7 @@
           onClick: () => setImportOpen(true),
           className: cl("px-3 py-1.5 rounded-lg text-sm font-medium transition-all border",
             t.border, t.textMuted, "hover:text-teal-400 hover:border-teal-500"),
-        }, "Import from .env"),
-        React.createElement("div", { className: "flex items-center gap-2" },
-          React.createElement("span", { className: cl("text-sm", t.textFaint) }, "Master key:"),
-          React.createElement("span", { className: "text-sm text-emerald-400" }, "\u2713 ready")
-        )
+        }, "Import from .env")
       );
 
       return React.createElement("div", { className: "space-y-5" },
@@ -3696,6 +4035,17 @@
             className: "text-sm font-medium px-3 py-1 rounded-lg border border-red-500/30 hover:bg-red-500/10",
           }, "Retry")
         ),
+        React.createElement(MasterKeyCard, {
+          onToast: (payload) => setToast(payload),
+          onReplaced: () => {
+            // Imported key = existing rows are now unreadable; surface the
+            // state change but don't hide the panel — the user needs to
+            // re-add keys or restore a matching DB backup.
+            setToast({ title: "Master key replaced. Stored API keys may need to be re-added." });
+            bumpBackups();
+            refresh();
+          },
+        }),
         React.createElement("div", { className: "space-y-3" },
           SECRET_PROVIDERS.map(p => React.createElement(ProviderCard, {
             key: p.id,
@@ -3723,7 +4073,12 @@
         }),
         importOpen && React.createElement(ImportEnvModal, {
           onClose: () => setImportOpen(false),
-          onApplied: refresh,
+          onApplied: () => { refresh(); bumpBackups(); },
+        }),
+        React.createElement(BackupsPanel, {
+          refreshKey: backupsRefreshKey,
+          onRestored: () => { refresh(); setToast({ title: "Backup restored" }); },
+          onToast: (payload) => setToast(payload),
         }),
         React.createElement(Toast, {
           toast,

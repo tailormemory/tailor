@@ -24,9 +24,12 @@ from scripts.lib import secrets_api, secrets_crypto, secrets_store  # noqa: E402
 from scripts.lib.secrets_api import (  # noqa: E402
     SecretsApiError,
     default_backups_dir,
+    handle_backup_download,
     handle_backups,
     handle_delete,
     handle_list,
+    handle_master_key_export,
+    handle_master_key_import,
     handle_master_key_setup,
     handle_restore,
     handle_set,
@@ -262,3 +265,117 @@ def test_master_key_setup_creates_file():
     assert secrets_crypto.master_key_exists() is False
     handle_master_key_setup()
     assert secrets_crypto.master_key_exists() is True
+
+
+# ── master key export / import ────────────────────────────────────────
+
+
+def test_master_key_export_returns_base64():
+    import base64
+    handle_master_key_setup()
+    out = handle_master_key_export()
+    assert "key_b64" in out
+    decoded = base64.b64decode(out["key_b64"])
+    assert len(decoded) == 32
+
+
+def test_master_key_export_404_when_missing():
+    # Fixture hasn't created a key, and we never call setup.
+    assert secrets_crypto.master_key_exists() is False
+    with pytest.raises(SecretsApiError) as exc:
+        handle_master_key_export()
+    assert exc.value.status == 404
+
+
+def test_master_key_import_backs_up_current_first():
+    import base64, glob
+    handle_master_key_setup()
+    original_b64 = handle_master_key_export()["key_b64"]
+
+    # Replace with a different 32-byte key.
+    replacement = base64.b64encode(os.urandom(32)).decode("ascii")
+    assert replacement != original_b64
+    out = handle_master_key_import({"key_b64": replacement})
+
+    # A backup sibling of the master.key file must exist.
+    mkey_path = secrets_crypto.get_master_key_path()
+    siblings = sorted(glob.glob(mkey_path + ".backup-*"))
+    assert siblings, "expected a master.key.backup-* file"
+    assert out["backup_path"] == siblings[-1]
+    # The backup must contain the ORIGINAL 32 bytes (pre-replacement).
+    with open(out["backup_path"], "rb") as f:
+        assert base64.b64encode(f.read()).decode("ascii") == original_b64
+    # And the live key is now the replacement.
+    assert handle_master_key_export()["key_b64"] == replacement
+
+
+def test_master_key_import_rejects_invalid_length():
+    import base64
+    handle_master_key_setup()
+    # 16 bytes, not 32.
+    short = base64.b64encode(os.urandom(16)).decode("ascii")
+    with pytest.raises(SecretsApiError) as exc:
+        handle_master_key_import({"key_b64": short})
+    assert exc.value.status == 400
+
+    # Garbage base64 also rejected.
+    with pytest.raises(SecretsApiError) as exc:
+        handle_master_key_import({"key_b64": "!!!not-base64!!!"})
+    assert exc.value.status == 400
+
+    # Missing / wrong-type field.
+    with pytest.raises(SecretsApiError):
+        handle_master_key_import({})
+    with pytest.raises(SecretsApiError):
+        handle_master_key_import({"key_b64": None})
+
+
+def test_master_key_import_resets_cache():
+    import base64
+    handle_master_key_setup()
+    # Prime the cache.
+    secrets_store.set_secret("anthropic", "sk-ant-pre-import")
+    assert secrets_store.get_secret("anthropic") == "sk-ant-pre-import"
+
+    replacement = base64.b64encode(os.urandom(32)).decode("ascii")
+    with patch.object(
+        secrets_store,
+        "reset_master_key_cache",
+        wraps=secrets_store.reset_master_key_cache,
+    ) as spy:
+        handle_master_key_import({"key_b64": replacement})
+    assert spy.called, "reset_master_key_cache must be called after import"
+
+
+# ── backup download ───────────────────────────────────────────────────
+
+
+def test_backup_download_streams_bytes():
+    handle_master_key_setup()
+    secrets_store.set_secret("anthropic", "sk-ant-for-download")
+    snap = os.path.basename(secrets_store.backup_db(default_backups_dir()))
+
+    data, ctype = handle_backup_download(snap)
+    assert ctype == "application/octet-stream"
+    # SQLite files start with the fixed "SQLite format 3" header.
+    assert data.startswith(b"SQLite format 3")
+    # And the on-disk file matches what we got back.
+    with open(os.path.join(default_backups_dir(), snap), "rb") as f:
+        assert f.read() == data
+
+
+def test_backup_download_rejects_path_traversal():
+    bdir = default_backups_dir()
+    os.makedirs(bdir, exist_ok=True)
+    for bad in ("../etc/passwd", "subdir/secrets-20260101-010101.sqlite3",
+                "secrets-bad.sqlite3", "", "secrets-20260101-010101.txt"):
+        with pytest.raises(SecretsApiError) as exc:
+            handle_backup_download(bad)
+        assert exc.value.status == 400
+
+
+def test_backup_download_missing_file_404():
+    # Valid filename format, nothing on disk.
+    with pytest.raises(SecretsApiError) as exc:
+        handle_backup_download("secrets-20260101-010101.sqlite3")
+    assert exc.value.status == 404

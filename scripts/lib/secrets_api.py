@@ -12,6 +12,8 @@ pattern so the contract across dashboard endpoints stays identical.
 from __future__ import annotations
 
 import os
+import shutil
+from datetime import datetime
 from typing import Any
 
 from scripts.lib import secrets_crypto, secrets_env, secrets_store
@@ -188,6 +190,88 @@ def handle_master_key_setup() -> dict[str, Any]:
     return {"created": True}
 
 
+def handle_master_key_export() -> dict[str, Any]:
+    """GET /api/secrets/master-key/export — return base64 of the master key.
+
+    The UI packages this into a .txt file the user can stash offline; losing
+    the key means losing every encrypted row in the DB, so backup is a hard
+    requirement. Emits base64 only — the raw bytes never leave this module.
+    """
+    if not secrets_crypto.master_key_exists():
+        raise SecretsApiError(404, "master key not set up yet")
+    return {"key_b64": secrets_crypto.export_master_key()}
+
+
+def handle_master_key_import(body: dict[str, Any]) -> dict[str, Any]:
+    """POST /api/secrets/master-key/import — replace the master key file.
+
+    Before overwriting we copy the current key to a timestamped sibling
+    (``master.key.backup-YYYYMMDD-HHMMSS``) so a mis-paste is recoverable.
+    Rows encrypted against the *previous* key become unreadable the moment
+    the new key lands on disk — the caller is responsible for knowing this;
+    the UI shows a prominent warning before firing the request.
+
+    The in-process master-key cache is invalidated so the next ``get_secret``
+    picks up the imported key rather than the one we had loaded.
+    """
+    key_b64 = body.get("key_b64")
+    if not isinstance(key_b64, str) or not key_b64:
+        raise SecretsApiError(400, "key_b64 is required")
+
+    backup_path: str | None = None
+    current_path = secrets_crypto.get_master_key_path()
+    if os.path.isfile(current_path):
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        candidate = f"{current_path}.backup-{ts}"
+        suffix = 1
+        # Same-second collision guard mirrors the config backup pattern —
+        # two rapid imports must not silently clobber each other.
+        while os.path.exists(candidate):
+            candidate = f"{current_path}.backup-{ts}-{suffix}"
+            suffix += 1
+        shutil.copy2(current_path, candidate)
+        os.chmod(candidate, 0o600)
+        backup_path = candidate
+
+    try:
+        secrets_crypto.import_master_key(key_b64)
+    except ValueError as e:
+        # The pre-import backup is still on disk — harmless, just unused.
+        raise SecretsApiError(400, str(e)) from e
+
+    secrets_store.reset_master_key_cache()
+    return {"backup_path": backup_path}
+
+
+# ── backup download ───────────────────────────────────────────────────
+
+
+def handle_backup_download(filename: str) -> tuple[bytes, str]:
+    """Return the raw bytes of a named backup + a content-type hint.
+
+    The caller (mcp_server ASGI glue) wraps this in a ``Response`` with the
+    right ``Content-Disposition`` header. Validation is delegated to
+    ``secrets_store._resolve_backup_path`` — same regex + realpath guard
+    the restore path uses, so traversal is blocked consistently.
+    """
+    from scripts.lib import secrets_store as _st  # avoid import cycles
+
+    try:
+        full = _st._resolve_backup_path(filename, default_backups_dir())
+    except FileNotFoundError as e:
+        raise SecretsApiError(404, str(e)) from e
+    except ValueError as e:
+        raise SecretsApiError(400, str(e)) from e
+
+    try:
+        with open(full, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        raise SecretsApiError(500, f"read failed: {e.__class__.__name__}")
+
+    return data, "application/octet-stream"
+
+
 # ── .env import/preview ───────────────────────────────────────────────
 
 
@@ -311,11 +395,14 @@ def handle_env_import(body: dict[str, Any]) -> dict[str, Any]:
 __all__ = [
     "SecretsApiError",
     "default_backups_dir",
+    "handle_backup_download",
     "handle_backups",
     "handle_delete",
     "handle_env_import",
     "handle_env_preview",
     "handle_list",
+    "handle_master_key_export",
+    "handle_master_key_import",
     "handle_master_key_setup",
     "handle_restore",
     "handle_set",

@@ -1075,6 +1075,9 @@ class BearerAuthMiddleware:
                     handle_backups as _h_backups,
                     handle_restore as _h_restore,
                     handle_master_key_setup as _h_mkey,
+                    handle_master_key_export as _h_mkey_export,
+                    handle_master_key_import as _h_mkey_import,
+                    handle_backup_download as _h_bk_download,
                     handle_env_preview as _h_env_preview,
                     handle_env_import as _h_env_import,
                 )
@@ -1109,6 +1112,22 @@ class BearerAuthMiddleware:
                         return _json_response({"ok": True, **_h_restore(await _body_json())})
                     if path == "/api/secrets/master-key/setup" and method == "POST":
                         return _json_response({"ok": True, **_h_mkey()})
+                    if path == "/api/secrets/master-key/export" and method == "GET":
+                        return _json_response({"ok": True, **_h_mkey_export()})
+                    if path == "/api/secrets/master-key/import" and method == "POST":
+                        return _json_response({"ok": True, **_h_mkey_import(await _body_json())})
+                    if path == "/api/secrets/backups/download" and method == "GET":
+                        from urllib.parse import parse_qs
+                        qs = scope.get("query_string", b"").decode("utf-8", errors="replace")
+                        filename = (parse_qs(qs).get("filename", [""])[0] or "").strip()
+                        blob, ctype = _h_bk_download(filename)
+                        return Response(
+                            content=blob, status_code=200, media_type=ctype,
+                            headers={
+                                **_CORS_HEADERS,
+                                "Content-Disposition": f'attachment; filename="{filename}"',
+                            },
+                        )
                     if path == "/api/secrets/env/preview" and method == "POST":
                         return _json_response({"ok": True, **_h_env_preview(await _body_json())})
                     if path == "/api/secrets/env/import" and method == "POST":
