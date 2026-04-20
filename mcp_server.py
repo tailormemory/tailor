@@ -1075,6 +1075,8 @@ class BearerAuthMiddleware:
                     handle_backups as _h_backups,
                     handle_restore as _h_restore,
                     handle_master_key_setup as _h_mkey,
+                    handle_env_preview as _h_env_preview,
+                    handle_env_import as _h_env_import,
                 )
                 import json as _jsec
 
@@ -1107,6 +1109,10 @@ class BearerAuthMiddleware:
                         return _json_response({"ok": True, **_h_restore(await _body_json())})
                     if path == "/api/secrets/master-key/setup" and method == "POST":
                         return _json_response({"ok": True, **_h_mkey()})
+                    if path == "/api/secrets/env/preview" and method == "POST":
+                        return _json_response({"ok": True, **_h_env_preview(await _body_json())})
+                    if path == "/api/secrets/env/import" and method == "POST":
+                        return _json_response({"ok": True, **_h_env_import(await _body_json())})
                     return _json_response(
                         {"ok": False, "error": f"Unknown secrets path: {path}", "status": 404},
                         404,

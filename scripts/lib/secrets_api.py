@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from scripts.lib import secrets_crypto, secrets_store
+from scripts.lib import secrets_crypto, secrets_env, secrets_store
 from scripts.lib.secrets_crypto import DecryptionError
 from scripts.lib.secrets_store import ALLOWED_PROVIDERS
 from scripts.lib.secrets_verify import VERIFIERS
@@ -188,11 +188,133 @@ def handle_master_key_setup() -> dict[str, Any]:
     return {"created": True}
 
 
+# ── .env import/preview ───────────────────────────────────────────────
+
+
+def _resolve_env_path(body: dict[str, Any]) -> str:
+    raw = body.get("path")
+    if raw is None or raw == "":
+        return secrets_env.default_env_path()
+    if not isinstance(raw, str):
+        raise SecretsApiError(400, "path must be a string")
+    return raw
+
+
+def _parse_env_or_raise(path: str) -> dict[str, str]:
+    try:
+        return secrets_env.parse_env_file(path)
+    except FileNotFoundError:
+        raise SecretsApiError(400, f"env file not found: {path}")
+    except (UnicodeDecodeError, OSError) as e:
+        raise SecretsApiError(400, f"could not read env file: {e.__class__.__name__}")
+    except ValueError as e:
+        raise SecretsApiError(400, f"malformed env file: {e}")
+
+
+def handle_env_preview(body: dict[str, Any]) -> dict[str, Any]:
+    """POST /api/secrets/env/preview — diff ``.env`` against the live DB.
+
+    Returns only metadata (``last4``, timestamps, states, suggested actions).
+    The plaintext env values stay inside this process — they are used to
+    compute last4 and then dropped before the response dict is built.
+    """
+    path = _resolve_env_path(body)
+    env_keys = _parse_env_or_raise(path)
+    diff = secrets_env.compute_diff(env_keys, secrets_store.list_secrets())
+    return {"env_path": path, "diff": diff}
+
+
+def handle_env_import(body: dict[str, Any]) -> dict[str, Any]:
+    """POST /api/secrets/env/import — apply per-provider actions.
+
+    Re-parses the env file and re-computes the diff (client state may be
+    stale). Each action is validated against the freshly observed state
+    before any write; if anything is incompatible the whole request 400s
+    with the offending set — never a partial write.
+    """
+    actions = body.get("actions")
+    if not isinstance(actions, dict) or not actions:
+        raise SecretsApiError(400, "actions must be a non-empty object")
+
+    path = _resolve_env_path(body)
+    env_keys = _parse_env_or_raise(path)
+    diff = secrets_env.compute_diff(env_keys, secrets_store.list_secrets())
+    state_by_provider = {row["provider"]: row["state"] for row in diff}
+
+    valid_actions = {"import", "replace", "skip", "keep"}
+    invalid: list[dict[str, str]] = []
+    for provider, action in actions.items():
+        if provider not in secrets_env.ENV_VAR_MAP:
+            invalid.append({"provider": provider, "reason": "unknown provider"})
+            continue
+        if action not in valid_actions:
+            invalid.append({"provider": provider, "action": action, "reason": "unknown action"})
+            continue
+        state = state_by_provider.get(provider, secrets_env.STATE_NEITHER)
+        if action == "import" and state != secrets_env.STATE_NEW:
+            invalid.append({
+                "provider": provider, "action": action,
+                "reason": f"import requires state=new, got {state}",
+            })
+        elif action == "replace" and state != secrets_env.STATE_CONFLICT:
+            invalid.append({
+                "provider": provider, "action": action,
+                "reason": f"replace requires state=conflict, got {state}",
+            })
+
+    if invalid:
+        raise SecretsApiError(400, f"invalid actions: {invalid}")
+
+    # Take a single pre-import snapshot if any replace is in the batch. One
+    # backup per batch is the right grain: the user clicked Import once, and
+    # "undo that one click" should restore everything at once rather than
+    # interleaving N snapshots with N overwrites.
+    pre_import_backup: str | None = None
+    if any(actions.get(p) == "replace" for p in actions):
+        pre_import_backup = os.path.basename(
+            secrets_store.backup_db(default_backups_dir())
+        )
+
+    applied: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for provider, action in actions.items():
+        if action in ("import", "replace"):
+            plaintext = env_keys[provider]
+            try:
+                secrets_store.set_secret(provider, plaintext)
+            except ValueError as e:
+                raise SecretsApiError(400, str(e)) from e
+            entry = next(
+                (e for e in secrets_store.list_secrets() if e["provider"] == provider),
+                None,
+            )
+            applied.append({
+                "provider": provider,
+                "action": action,
+                "last4": entry["last4"] if entry else plaintext[-4:],
+            })
+        else:
+            skipped.append({
+                "provider": provider,
+                "action": action,
+                "reason": state_by_provider.get(provider, secrets_env.STATE_NEITHER),
+            })
+
+    return {
+        "env_path": path,
+        "applied": applied,
+        "skipped": skipped,
+        "pre_import_backup": pre_import_backup,
+    }
+
+
 __all__ = [
     "SecretsApiError",
     "default_backups_dir",
     "handle_backups",
     "handle_delete",
+    "handle_env_import",
+    "handle_env_preview",
     "handle_list",
     "handle_master_key_setup",
     "handle_restore",
