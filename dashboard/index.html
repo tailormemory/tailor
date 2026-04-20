@@ -247,6 +247,7 @@
       { id: "kb", label: "Knowledge Base", icon: "\u25C6" },
       { id: "pipeline", label: "Pipeline", icon: "\u25B8" },
       { id: "config", label: "Configuration", icon: "\u2699" },
+      { id: "secrets", label: "API Keys", icon: "\u{1F511}" },
       { id: "profile", label: "Profile", icon: "\u25CE" },
     ];
 
@@ -3018,6 +3019,468 @@
       );
     }
 
+    // ── Secrets (API Keys tab) ──
+    //
+    // Self-contained page: internal state, no dirty-bit propagation, no
+    // YAML-vs-form duality. Backend is /api/secrets/* (see scripts/lib/
+    // secrets_api.py). Plaintext keys live ONLY in the transient modal
+    // state while the user is typing or the candidate is being verified;
+    // after a successful save they are never read back into the UI —
+    // the list endpoint returns last4 only.
+
+    const SECRET_PROVIDERS = [
+      { id: "anthropic", label: "Anthropic (Claude)" },
+      { id: "openai", label: "OpenAI" },
+      { id: "google", label: "Google (Gemini)" },
+      { id: "deepseek", label: "DeepSeek" },
+    ];
+
+    function formatRelativeTime(ts) {
+      if (!ts) return "";
+      const now = Math.floor(Date.now() / 1000);
+      const diff = Math.max(0, now - ts);
+      if (diff < 45) return "just now";
+      if (diff < 3600) { const n = Math.floor(diff / 60); return `${n} minute${n === 1 ? "" : "s"} ago`; }
+      if (diff < 86400) { const n = Math.floor(diff / 3600); return `${n} hour${n === 1 ? "" : "s"} ago`; }
+      if (diff < 86400 * 30) { const n = Math.floor(diff / 86400); return `${n} day${n === 1 ? "" : "s"} ago`; }
+      if (diff < 86400 * 365) { const n = Math.floor(diff / (86400 * 30)); return `${n} month${n === 1 ? "" : "s"} ago`; }
+      const n = Math.floor(diff / (86400 * 365));
+      return `${n} year${n === 1 ? "" : "s"} ago`;
+    }
+
+    // Small overlay wrapper used by every secrets modal. Centralized so
+    // keyboard dismissal and backdrop behavior stay consistent.
+    function Modal({ onClose, children }) {
+      useEffect(() => {
+        const onKey = (e) => { if (e.key === "Escape") onClose(); };
+        window.addEventListener("keydown", onKey);
+        return () => window.removeEventListener("keydown", onKey);
+      }, [onClose]);
+      return React.createElement("div", {
+        className: "fixed inset-0 z-50 flex items-center justify-center p-4",
+        style: { background: "rgba(0,0,0,0.55)" },
+        onClick: (e) => { if (e.target === e.currentTarget) onClose(); },
+      }, children);
+    }
+
+    function KeyModal({ provider, current, onSubmit, onClose }) {
+      const t = useTheme();
+      const isRotate = !!current;
+      const providerLabel = SECRET_PROVIDERS.find(p => p.id === provider)?.label || provider;
+
+      const [keyValue, setKeyValue] = useState("");
+      const [reveal, setReveal] = useState(false);
+      const [verify, setVerify] = useState(true);
+      const [busy, setBusy] = useState(false);
+      const [status, setStatus] = useState(""); // 'verifying' | 'saving' | ''
+      const [error, setError] = useState("");
+
+      const trimmed = keyValue.trim();
+      const canSave = !busy && trimmed.length >= 8;
+
+      const handleSave = async () => {
+        setError("");
+        if (trimmed.length < 8) { setError("Key must be at least 8 characters"); return; }
+        setBusy(true);
+        try {
+          if (verify) {
+            setStatus("verifying");
+            const vr = await apiCall("/api/secrets/verify", {
+              method: "POST", body: { provider, key: trimmed },
+            });
+            if (!vr.ok) { setError(vr.error || "Verification failed"); return; }
+            if (!vr.data.verified) {
+              setError(`Verification failed: ${vr.data.error || "key rejected by provider"}`);
+              return;
+            }
+          }
+          setStatus("saving");
+          const sr = await apiCall("/api/secrets/set", {
+            method: "POST", body: { provider, key: trimmed },
+          });
+          if (!sr.ok) { setError(sr.error || "Save failed"); return; }
+          onSubmit({ provider, last4: sr.data.last4, backup: sr.data.backup, isRotate });
+        } finally {
+          setBusy(false);
+          setStatus("");
+        }
+      };
+
+      const buttonLabel = busy && status === "verifying" ? "Verifying..."
+        : busy && status === "saving" ? "Saving..."
+        : isRotate ? "Save new key" : "Save";
+
+      return React.createElement(Modal, { onClose },
+        React.createElement("div", {
+          className: cl("w-full max-w-md rounded-2xl border p-6", t.tile),
+          style: { background: t.input.includes("zinc-900") ? "#0a0c10" : "#ffffff" },
+        },
+          React.createElement("h3", { className: cl("text-base font-semibold mb-1", t.text) },
+            isRotate ? `Rotate ${providerLabel} key` : `Add ${providerLabel} key`),
+          isRotate && React.createElement("div", { className: cl("text-sm mb-4 p-3 rounded-xl", t.infoBox) },
+            React.createElement("div", null, `Current key: sk-***${current.last4} (last updated ${formatRelativeTime(current.updated_at)})`),
+            React.createElement("div", { className: cl("text-xs mt-1", t.textFaint) }, "A backup will be created automatically before replacing.")
+          ),
+          React.createElement("label", { className: cl("text-sm font-medium block mb-1.5", t.textLabel) }, "API key"),
+          React.createElement("div", { className: "flex gap-2 mb-3" },
+            React.createElement("input", {
+              type: reveal ? "text" : "password",
+              value: keyValue,
+              onChange: (e) => setKeyValue(e.target.value),
+              placeholder: `Paste ${providerLabel} key`,
+              autoComplete: "off",
+              spellCheck: false,
+              className: cl("flex-1 px-4 py-3 rounded-xl border text-sm font-mono outline-none transition-all",
+                "focus:ring-2 focus:ring-teal-500/30 focus:border-teal-500", t.input),
+              disabled: busy,
+              autoFocus: true,
+            }),
+            React.createElement("button", {
+              type: "button",
+              onClick: () => setReveal(r => !r),
+              disabled: busy,
+              title: reveal ? "Hide" : "Show",
+              className: cl("px-3 rounded-xl border transition-all",
+                t.input, "hover:border-teal-500"),
+            }, reveal ? "\u{1F648}" : "\u{1F441}\uFE0F")
+          ),
+          React.createElement("label", { className: cl("flex items-center gap-2 text-sm mb-4", t.textLabel) },
+            React.createElement("input", {
+              type: "checkbox", checked: verify, disabled: busy,
+              onChange: (e) => setVerify(e.target.checked),
+              className: "w-4 h-4 accent-teal-500",
+            }),
+            "Verify before saving (recommended)"
+          ),
+          error && React.createElement("div", { className: "text-sm text-red-400 mb-3" }, error),
+          React.createElement("div", { className: "flex justify-end gap-2" },
+            React.createElement("button", {
+              onClick: onClose, disabled: busy,
+              className: cl("px-4 py-2 rounded-xl text-sm font-medium transition-all border",
+                t.border, t.textMuted, "hover:text-zinc-200"),
+            }, "Cancel"),
+            React.createElement("button", {
+              onClick: handleSave, disabled: !canSave,
+              className: cl("px-4 py-2 rounded-xl text-sm font-semibold transition-all",
+                "bg-teal-600 hover:bg-teal-500 text-white",
+                !canSave && "opacity-50 cursor-not-allowed"),
+            }, buttonLabel)
+          )
+        )
+      );
+    }
+
+    function DeleteModal({ provider, last4, onConfirm, onClose }) {
+      const t = useTheme();
+      const providerLabel = SECRET_PROVIDERS.find(p => p.id === provider)?.label || provider;
+      const [busy, setBusy] = useState(false);
+      const [error, setError] = useState("");
+
+      const handleDelete = async () => {
+        setError("");
+        setBusy(true);
+        try {
+          const r = await apiCall("/api/secrets/delete", {
+            method: "DELETE", body: { provider },
+          });
+          if (!r.ok) { setError(r.error || "Delete failed"); return; }
+          onConfirm({ provider, backup: r.data.backup });
+        } finally {
+          setBusy(false);
+        }
+      };
+
+      return React.createElement(Modal, { onClose },
+        React.createElement("div", {
+          className: cl("w-full max-w-md rounded-2xl border p-6", t.tile),
+          style: { background: t.input.includes("zinc-900") ? "#0a0c10" : "#ffffff" },
+        },
+          React.createElement("h3", { className: cl("text-base font-semibold mb-3", t.text) }, `Delete ${providerLabel} key?`),
+          React.createElement("p", { className: cl("text-sm mb-2", t.textMuted) },
+            `This will remove the stored key${last4 ? ` (sk-***${last4})` : ""}. TAILOR features using ${providerLabel} will fail until you add a new key.`),
+          React.createElement("p", { className: cl("text-sm mb-4", t.textFaint) }, "A backup will be created automatically."),
+          error && React.createElement("div", { className: "text-sm text-red-400 mb-3" }, error),
+          React.createElement("div", { className: "flex justify-end gap-2" },
+            React.createElement("button", {
+              onClick: onClose, disabled: busy,
+              className: cl("px-4 py-2 rounded-xl text-sm font-medium transition-all", t.navInactive),
+            }, "Cancel"),
+            React.createElement("button", {
+              onClick: handleDelete, disabled: busy,
+              className: cl("px-4 py-2 rounded-xl text-sm font-semibold transition-all",
+                "bg-red-600 hover:bg-red-500 text-white",
+                busy && "opacity-50 cursor-not-allowed"),
+            }, busy ? "Deleting..." : "Delete key")
+          )
+        )
+      );
+    }
+
+    function MasterKeySetupCard({ onGenerated }) {
+      const t = useTheme();
+      const [busy, setBusy] = useState(false);
+      const [error, setError] = useState("");
+
+      const handleGenerate = async () => {
+        setError("");
+        setBusy(true);
+        const r = await apiCall("/api/secrets/master-key/setup", {
+          method: "POST", body: {},
+        });
+        setBusy(false);
+        if (!r.ok) { setError(r.error || "Setup failed"); return; }
+        onGenerated();
+      };
+
+      return React.createElement(Tile, null,
+        React.createElement("h3", { className: cl("text-base font-semibold mb-2", t.text) }, "Setup required"),
+        React.createElement("p", { className: cl("text-sm mb-2", t.textMuted) },
+          "API key management uses a local encryption key stored at ~/.tailor/master.key. ",
+          "This key encrypts your provider API keys in the database."),
+        React.createElement("p", { className: cl("text-sm mb-4", t.textFaint) },
+          "You'll need to back it up — we'll show you how after setup."),
+        error && React.createElement("div", { className: "text-sm text-red-400 mb-3" }, error),
+        React.createElement("button", {
+          onClick: handleGenerate, disabled: busy,
+          className: cl("px-4 py-2.5 rounded-xl text-sm font-semibold transition-all",
+            "bg-teal-600 hover:bg-teal-500 text-white",
+            busy && "opacity-50 cursor-not-allowed"),
+        }, busy ? "Generating..." : "Generate master key")
+      );
+    }
+
+    function ProviderCard({ provider, label, entry, verifyStatus, onAdd, onRotate, onDelete, onVerify }) {
+      const t = useTheme();
+      const configured = !!entry;
+      const status = verifyStatus || { state: "idle" };
+
+      const statusLine = (() => {
+        if (status.state === "verifying") return React.createElement("span", { className: cl("text-sm", t.textMuted) }, "Verifying...");
+        if (status.state === "ok") return React.createElement("span", { className: "text-sm text-emerald-400" }, `\u2713 Working${status.latency_ms != null ? ` (${status.latency_ms}ms)` : ""}`);
+        if (status.state === "fail") return React.createElement("span", { className: "text-sm text-red-400" }, `\u2718 ${status.message || "Verification failed"}`);
+        return null;
+      })();
+
+      return React.createElement(Tile, null,
+        React.createElement("div", { className: "flex items-start gap-3" },
+          React.createElement("div", { className: cl("w-2 h-2 rounded-full mt-2 flex-shrink-0",
+            configured ? "bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.5)]" : "bg-zinc-600") }),
+          React.createElement("div", { className: "flex-1 min-w-0" },
+            React.createElement("div", { className: cl("text-base font-semibold", t.text) }, label),
+            configured
+              ? React.createElement(React.Fragment, null,
+                  React.createElement("div", { className: cl("text-sm font-mono mt-0.5", t.mono) }, `sk-***${entry.last4}`),
+                  React.createElement("div", { className: cl("text-xs mt-0.5", t.textFaint) }, `Last updated ${formatRelativeTime(entry.updated_at)}`)
+                )
+              : React.createElement("div", { className: cl("text-sm mt-0.5", t.textFaint) }, "Not configured"),
+            React.createElement("div", { className: "flex flex-wrap items-center gap-2 mt-3" },
+              configured && React.createElement("button", {
+                onClick: () => onVerify(provider),
+                disabled: status.state === "verifying",
+                className: cl("px-3 py-1.5 rounded-lg text-sm font-medium transition-all border", t.border, t.textMuted, "hover:text-teal-400 hover:border-teal-500"),
+              }, "Verify"),
+              configured && React.createElement("button", {
+                onClick: () => onRotate(provider),
+                className: cl("px-3 py-1.5 rounded-lg text-sm font-medium transition-all border", t.border, t.textMuted, "hover:text-teal-400 hover:border-teal-500"),
+              }, "Rotate"),
+              configured && React.createElement("button", {
+                onClick: () => onDelete(provider),
+                className: cl("px-3 py-1.5 rounded-lg text-sm font-medium transition-all border", t.border, "text-red-400 hover:border-red-500"),
+              }, "Delete"),
+              !configured && React.createElement("button", {
+                onClick: () => onAdd(provider),
+                className: cl("px-3 py-1.5 rounded-lg text-sm font-semibold transition-all",
+                  "bg-teal-600 hover:bg-teal-500 text-white"),
+              }, "Add key"),
+              statusLine
+            )
+          )
+        )
+      );
+    }
+
+    function Toast({ toast, onUndo, onDismiss }) {
+      const t = useTheme();
+      useEffect(() => {
+        const h = setTimeout(onDismiss, 15000);
+        return () => clearTimeout(h);
+      }, [toast, onDismiss]);
+      if (!toast) return null;
+      return React.createElement("div", {
+        className: "fixed bottom-6 right-6 z-50 max-w-sm rounded-xl border p-4 fade-in",
+        style: { background: t.input.includes("zinc-900") ? "#0a0c10" : "#ffffff",
+                 borderColor: "rgba(20,184,166,0.4)" },
+      },
+        React.createElement("div", { className: cl("text-sm font-medium", t.text) }, toast.title),
+        toast.undoLabel && React.createElement("div", { className: "mt-2 flex items-center gap-3" },
+          React.createElement("button", {
+            onClick: onUndo,
+            title: "Coming in next version",
+            className: "text-sm font-medium text-teal-400 hover:text-teal-300 cursor-not-allowed",
+          }, toast.undoLabel),
+          React.createElement("button", {
+            onClick: onDismiss,
+            className: cl("text-sm ml-auto", t.textFaint, "hover:text-zinc-300"),
+          }, "Dismiss")
+        )
+      );
+    }
+
+    function SecretsPage() {
+      const t = useTheme();
+      const [loading, setLoading] = useState(true);
+      const [error, setError] = useState("");
+      const [secrets, setSecrets] = useState([]);
+      const [masterKeyExists, setMasterKeyExists] = useState(null);
+      const [modal, setModal] = useState(null); // { type, provider, current? }
+      const [verifyStatus, setVerifyStatus] = useState({});
+      const [toast, setToast] = useState(null);
+
+      const refresh = useCallback(async () => {
+        setError("");
+        const r = await apiCall("/api/secrets/list");
+        if (!r.ok) {
+          setError(r.error || "Failed to load secrets");
+          setLoading(false);
+          return;
+        }
+        setSecrets(r.data.secrets || []);
+        setMasterKeyExists(!!r.data.master_key_exists);
+        setLoading(false);
+      }, []);
+
+      useEffect(() => { refresh(); }, [refresh]);
+
+      // Auto-clear verify status chips after 15s.
+      useEffect(() => {
+        const entries = Object.entries(verifyStatus);
+        if (!entries.length) return;
+        const settled = entries.filter(([, s]) => s.state === "ok" || s.state === "fail");
+        if (!settled.length) return;
+        const h = setTimeout(() => {
+          setVerifyStatus(vs => {
+            const next = { ...vs };
+            for (const [p, s] of settled) if (next[p] === s) delete next[p];
+            return next;
+          });
+        }, 15000);
+        return () => clearTimeout(h);
+      }, [verifyStatus]);
+
+      const entryFor = (pid) => secrets.find(s => s.provider === pid) || null;
+
+      const handleVerify = async (provider) => {
+        setVerifyStatus(vs => ({ ...vs, [provider]: { state: "verifying" } }));
+        const r = await apiCall("/api/secrets/verify", {
+          method: "POST", body: { provider },
+        });
+        if (!r.ok) {
+          setVerifyStatus(vs => ({ ...vs, [provider]: { state: "fail", message: r.error } }));
+          return;
+        }
+        if (r.data.verified) {
+          setVerifyStatus(vs => ({ ...vs, [provider]: { state: "ok", latency_ms: r.data.latency_ms } }));
+        } else {
+          setVerifyStatus(vs => ({ ...vs, [provider]: { state: "fail", message: r.data.error || "Verification failed" } }));
+        }
+      };
+
+      const closeModal = () => setModal(null);
+
+      const handleSaveSuccess = ({ provider, isRotate, backup }) => {
+        closeModal();
+        refresh();
+        if (isRotate && backup) {
+          const label = SECRET_PROVIDERS.find(p => p.id === provider)?.label || provider;
+          setToast({
+            title: `${label} key rotated successfully`,
+            undoLabel: "Restore previous key",
+            backup,
+            provider,
+          });
+        }
+      };
+
+      const handleDeleteSuccess = () => { closeModal(); refresh(); };
+
+      // Loading skeleton
+      if (loading || masterKeyExists === null) {
+        return React.createElement("div", { className: "space-y-5" },
+          React.createElement(Skeleton, { className: "h-6 w-48" }),
+          React.createElement(Skeleton, { className: "h-24 w-full" }),
+          React.createElement(Skeleton, { className: "h-24 w-full" })
+        );
+      }
+
+      // Setup required
+      if (masterKeyExists === false) {
+        return React.createElement("div", { className: "space-y-5" },
+          React.createElement("div", null,
+            React.createElement("h2", { className: cl("text-lg font-semibold", t.text) }, "API Keys"),
+            React.createElement("p", { className: cl("text-sm mt-1", t.textFaint) }, "Encrypted credentials for your LLM providers")
+          ),
+          error && React.createElement("div", { className: "text-sm text-red-400 p-3 rounded-xl border border-red-500/30 bg-red-500/5" }, error),
+          React.createElement(MasterKeySetupCard, { onGenerated: refresh })
+        );
+      }
+
+      // Main UI
+      const headerRight = React.createElement("div", { className: "flex items-center gap-2" },
+        React.createElement("span", { className: cl("text-sm", t.textFaint) }, "Master key:"),
+        React.createElement("span", { className: "text-sm text-emerald-400" }, "\u2713 ready")
+      );
+
+      return React.createElement("div", { className: "space-y-5" },
+        React.createElement("div", { className: "flex items-start justify-between gap-4 flex-wrap" },
+          React.createElement("div", null,
+            React.createElement("h2", { className: cl("text-lg font-semibold", t.text) }, "API Keys"),
+            React.createElement("p", { className: cl("text-sm mt-1", t.textFaint) }, "Encrypted credentials for your LLM providers")
+          ),
+          headerRight
+        ),
+        error && React.createElement("div", { className: "flex items-center justify-between gap-3 text-sm text-red-400 p-3 rounded-xl border border-red-500/30 bg-red-500/5" },
+          React.createElement("span", null, error),
+          React.createElement("button", {
+            onClick: refresh,
+            className: "text-sm font-medium px-3 py-1 rounded-lg border border-red-500/30 hover:bg-red-500/10",
+          }, "Retry")
+        ),
+        React.createElement("div", { className: "space-y-3" },
+          SECRET_PROVIDERS.map(p => React.createElement(ProviderCard, {
+            key: p.id,
+            provider: p.id,
+            label: p.label,
+            entry: entryFor(p.id),
+            verifyStatus: verifyStatus[p.id],
+            onAdd: (id) => setModal({ type: "add", provider: id }),
+            onRotate: (id) => setModal({ type: "rotate", provider: id, current: entryFor(id) }),
+            onDelete: (id) => setModal({ type: "delete", provider: id, current: entryFor(id) }),
+            onVerify: handleVerify,
+          }))
+        ),
+        modal && (modal.type === "add" || modal.type === "rotate") && React.createElement(KeyModal, {
+          provider: modal.provider,
+          current: modal.type === "rotate" ? modal.current : null,
+          onClose: closeModal,
+          onSubmit: handleSaveSuccess,
+        }),
+        modal && modal.type === "delete" && React.createElement(DeleteModal, {
+          provider: modal.provider,
+          last4: modal.current?.last4,
+          onClose: closeModal,
+          onConfirm: handleDeleteSuccess,
+        }),
+        React.createElement(Toast, {
+          toast,
+          onDismiss: () => setToast(null),
+          onUndo: () => {
+            // Placeholder: backup restore UI lands in commit 7.
+            // Keep the toast open; the button carries a tooltip explaining.
+          },
+        })
+      );
+    }
+
     // ── App ──
     function LoginScreen({ onLogin, mode }) {
       const [token, setToken] = useState("");
@@ -3198,6 +3661,7 @@
         kb: React.createElement(KBPage, { stats, config }),
         pipeline: React.createElement(PipelinePage, { pipeline }),
         config: React.createElement(ConfigPage, { config, onConfigSaved: refresh, onDirtyChange: setConfigDirty }),
+        secrets: React.createElement(SecretsPage, null),
         profile: React.createElement(ProfilePage, { profile }),
       };
 
