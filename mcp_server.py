@@ -272,6 +272,14 @@ class BearerAuthMiddleware:
                 doc_root = _cfg_get_doc("ingest", "document_root") or ""
                 return handle_kb_document_request(qs, doc_root, cors_headers=_CORS_HEADERS)
 
+            # /api/chat/models?provider=<name> → live catalog from the provider's /models endpoint,
+            # cached in-memory for 1h. Feeds the dashboard's dynamic Model dropdowns.
+            elif path == "/api/chat/models":
+                from scripts.lib.models_catalog import handle_request as _models_handle
+                qs = scope.get("query_string", b"").decode()
+                body, status = _models_handle(qs)
+                return _json_response(body, status)
+
             # ── Auth ──
             elif path == "/api/auth/login":
                 # Rate limit check
@@ -1272,6 +1280,16 @@ class BearerAuthMiddleware:
                 # Native chat interface (/api/chat, /api/chat/sessions, /api/chat/sessions/{id}[/rename])
                 # delegates to the chat_api sub-app so the SSE StreamingResponse retains
                 # direct control of the ASGI send channel for real-time token streaming.
+                #
+                # /api/chat/models is a plain JSON endpoint served by models_catalog —
+                # we intercept it here so it goes through the normal _handle_rest_api
+                # path instead of the streaming sub-app. It lives under /api/chat/ so
+                # auth/permission flow (cookie + "read" scope) reuses the is_chat gate
+                # above without a second entry.
+                if path == "/api/chat/models":
+                    response = await self._handle_rest_api(path, scope, receive)
+                    await response(scope, receive, send)
+                    return
                 if path == "/api/chat" or path.startswith("/api/chat/"):
                     await _get_chat_app()(scope, receive, send)
                     return
