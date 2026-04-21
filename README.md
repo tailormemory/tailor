@@ -140,6 +140,7 @@ Without it, the server runs open (suitable for local-only use).
 | **Rate Limiting** | IP-based throttling on failed auth attempts. Configurable max attempts, window, and ban duration. |
 | **Multi-Token Auth** | Per-token permissions (read/write/full). Give ChatGPT read-only access, Claude write access, keep admin full. |
 | **Live Capture** | Chrome extension captures conversations from Claude, ChatGPT, and Gemini in real-time. |
+| **Document Access** | Open the source file behind any KB answer: search results include a download link, and `kb_find_document` fuzzy-finds docs by filename/folder. |
 | **Model Advisor** | Scans HuggingFace + cloud APIs for models matching your hardware. One-click install from the dashboard. |
 
 ### 📥 Multi-Source Ingest
@@ -179,6 +180,7 @@ Without it, the server runs open (suitable for local-only use).
 - Server-sent events stream the model's tokens as they are generated
 - Real streaming on Anthropic (the default provider); word-chunked fallback on OpenAI, Google, and Ollama
 - Tool calls (KB search, fact lookup, `system_status`) surface inline as "⟳ searching memory…" / "✓ searched memory (Nms)" pills
+- Per-session provider choice (Anthropic / OpenAI / Google / DeepSeek / Ollama) with a **Set as default** button to promote your pick to `llm.*` without editing YAML
 - Persistent sessions in SQLite (`db/chat_sessions.sqlite3`): list, rename, resume, delete
 - Markdown rendering via `marked` + `DOMPurify` (loaded from CDN; vendor them locally for fully offline-first setups)
 - Auth: reuses the dashboard cookie session — no separate login, single-user
@@ -500,7 +502,6 @@ Both have: atomic facts, supersession, user profiles, hybrid search, temporal gr
 - **Chrome Web Store** — Browser extension submitted, pending review. Once approved, installable in one click.
 - **Voice I/O in chat** — Speech-to-text and text-to-speech in the Chat tab via the browser Web Speech API.
 - **HUD chat skin** — Optional Iron Man-inspired theme for the Chat tab (cyan accents, reactive SVG rings, CSS animations).
-- **Runtime provider switching** — Dedicated UI to hot-swap the default LLM provider and model from the dashboard without editing YAML.
 - **Model Advisor v2** — Benchmark comparison and automatic backend suggestions when a faster or cheaper model fits the same enrichment role.
 - **Auto-forgetting** — Configurable TTL on facts, with automatic expiration and cleanup.
 - **Webhook real-time ingest** — Push-based ingestion for live data sources (vs. nightly batch).

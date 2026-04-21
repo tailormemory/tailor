@@ -20,6 +20,56 @@ Template for upcoming changes. Move entries under a new version heading on relea
 
 ---
 
+## [1.1.1] - 2026-04-21 — Runtime Provider Switching + Document Access
+
+Patch release focused on two UX gaps surfaced while using v1.1.0 in production:
+selecting a default LLM provider without editing YAML, and opening the source
+document behind a KB answer.
+
+### Added
+
+#### Runtime Provider Switching
+
+- `POST /api/chat/providers/default` — promote a `(provider, model)` pair from `chat_interface.available_providers` to the default `llm.*` configuration. Validates against the configured provider list and the supported-provider whitelist, rejects unknown pairs with 400. Writes `llm.provider` and `llm.model` to `tailor.yaml` (preserving `api_key`, `tool_use`, `max_tokens`, `temperature`), creates a timestamped backup, and soft-reloads `_brain`, `classifier`, `embedding`, and `i18n` singletons. No `.pending-save` marker — the narrow two-field change doesn't warrant the rollback pipeline.
+- Dashboard **Chat** tab: "Set as default" button next to the provider dropdown, visible only when the selected pair differs from the current default. One click POSTs to the new endpoint, flashes `"✓ Default updated"` on success, or surfaces the error inline. Existing chat sessions keep whatever provider they locked to at creation.
+- `" (default)"` suffix in the provider dropdown labels the currently-active pair.
+
+#### Document Access
+
+- `GET /api/kb/document?path=<relative>` — download the source file behind a KB chunk. Relative path is resolved against the new `ingest.document_root` config key with `realpath`-based path traversal guard. MIME inference covers `.docx`, `.xlsx`, `.pptx`, `.pdf`. Returns `Content-Disposition: inline` so browsers preview PDFs in place.
+- `kb_find_document(query, n_results=10)` MCP tool — fuzzy finder over document metadata (filename, folder, path). Scoring prioritizes filename match, then folder, then path substring. Dedupes by `file_path`, filters fully-superseded documents, returns `title`, `file_path`, `folder`, `file_type`, `download_url`, `last_indexed_date`, `chunk_count`. Use when semantic content search isn't finding a document you know exists by name.
+- Search-result enrichment: `kb_search` / `kb_hybrid_search` now include `file_path`, `file_type`, `folder`, and `download_url` in every result whose `source == "document"`. Non-document results are unchanged. Ranking, filtering, and supersession handling are untouched — this is pure output enrichment.
+- New config key `ingest.document_root` in `config/tailor.yaml.example` (descriptive comment; must be an ancestor of every entry in `ingest.document_paths`).
+
+### Changed
+
+- Roadmap: removed "Runtime provider switching" (shipped in this release). Added "Voice I/O in chat" and "HUD chat skin" as separate future items (previously folded into the generic "Native Chat Interface" entry, now also shipped).
+
+### Fixed
+
+- Chat tab: `" (default)"` suffix no longer duplicates when the configured `chat_interface.available_providers` label already contains the word — case-insensitive guard in `labelFor`.
+- `/api/kb/document` endpoint returned 401 Unauthorized on remote connections despite correct `ENDPOINT_PERMISSIONS` registration. The auth middleware's outer path whitelist was missing `/api/kb/`; requests fell through to the unauthenticated-fallback branch before endpoint-permission was checked. Whitelist updated.
+
+### Data Migration (one-off)
+
+- Removed spurious `superseded_by` + `superseded_at` metadata from **17 ChromaDB chunks across 5 documents** that had been erroneously marked as superseded by conversation summaries under the old chunk-level supersession pipeline (now archived in `archive/`). Legitimate `doc → doc_summary` supersessions (729 chunks) preserved. See `docs/supersession-requirements.md` for the semantic hierarchy rule that any future revival of chunk-level supersession must enforce.
+
+### Docs
+
+- New: `docs/supersession-requirements.md` — records the semantic hierarchy `document > doc_summary > conv_summary > {chatgpt, claude, email, telegram}` and the historical bug that prompted it.
+- `config/tailor.yaml.example` — documents `ingest.document_root`.
+- README: Changelog section already linking to `CHANGELOG.md` (added in v1.1.0); roadmap updated to reflect shipped items.
+
+### Stats
+
+- 10 commits since v1.1.0
+- 273 tests (v1.1.0 baseline 249 + 24 new: 8 runtime provider + 7 document download + 3 search enrichment + 6 fuzzy finder)
+- 2 new HTTP endpoints (`/api/chat/providers/default`, `/api/kb/document`)
+- 1 new MCP tool (`kb_find_document`) — total now 22
+- 17 chunks recovered from false supersession
+
+---
+
 ## [1.1.0] - 2026-04-21 — Chat, Chrome, and Config
 
 First major feature release after v1.0.0. Shifts TAILOR from "working memory engine" to "production-ready personal AI platform with its own ecosystem." Three headline additions — a native chat UI, a browser extension, and live runtime configuration — plus a full pass of security hardening.
@@ -236,6 +286,7 @@ First public release. Self-hosted AI memory framework with persistent, searchabl
 
 ---
 
-[Unreleased]: https://github.com/tailormemory/tailor/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/tailormemory/tailor/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/tailormemory/tailor/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/tailormemory/tailor/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/tailormemory/tailor/releases/tag/v1.0.0
