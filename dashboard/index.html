@@ -1632,50 +1632,40 @@
         () => new Set(["anthropic", "openai", "google", "deepseek"]),
         [],
       );
+      // Synchronous in-flight / completed tracking via a ref. We can't rely
+      // on reading `modelCatalog` from the closure (stale across renders)
+      // or on side-effects inside the setModelCatalog updater (React batches
+      // updaters — they run during the next render, *after* the lines that
+      // follow setModelCatalog have already executed). The ref is the only
+      // thing that's both shared across renders AND mutable synchronously,
+      // so it's what we use to decide whether to fire the HTTP call.
+      const fetchStateRef = React.useRef({}); // provider -> "loading" | "ok"
       const fetchProviderModels = useCallback(async (provider) => {
-        console.log("[DIAG fetchProviderModels] called with provider=", provider);
-        if (!provider || !DYNAMIC_MODEL_PROVIDERS.has(provider)) {
-          console.log("[DIAG fetchProviderModels] early-return: provider empty or not in dynamic set", { provider, isDynamic: DYNAMIC_MODEL_PROVIDERS.has(provider) });
-          return;
+        if (!provider || !DYNAMIC_MODEL_PROVIDERS.has(provider)) return;
+        const state = fetchStateRef.current[provider];
+        if (state === "loading" || state === "ok") return;
+        fetchStateRef.current[provider] = "loading";
+        setModelCatalog(prev => ({ ...prev, [provider]: { status: "loading" } }));
+        const r = await apiCall(`/api/chat/models?provider=${encodeURIComponent(provider)}`);
+        if (r.ok) {
+          fetchStateRef.current[provider] = "ok";
+          setModelCatalog(prev => ({ ...prev, [provider]: { status: "ok", models: r.data.models || [] } }));
+        } else {
+          // Leave the ref unset so a subsequent call retries (e.g. user adds an API key
+          // in the Secrets panel and flips the Provider back to retry).
+          delete fetchStateRef.current[provider];
+          setModelCatalog(prev => ({ ...prev, [provider]: { status: "error", error: r.error || "Fetch failed" } }));
         }
-        // Read latest via functional-setState to avoid stale-closure double-fetches
-        // when several rows flip to the same provider in the same tick.
-        let shouldFetch = false;
-        setModelCatalog(prev => {
-          const entry = prev[provider];
-          console.log("[DIAG fetchProviderModels] updater running", { provider, existingStatus: entry && entry.status });
-          if (entry && (entry.status === "ok" || entry.status === "loading")) return prev;
-          shouldFetch = true;
-          return { ...prev, [provider]: { status: "loading" } };
-        });
-        console.log("[DIAG fetchProviderModels] after setModelCatalog, shouldFetch=", shouldFetch, "(NB: updater may not have run yet)");
-        if (!shouldFetch) {
-          console.log("[DIAG fetchProviderModels] skipping fetch: shouldFetch is false");
-          return;
-        }
-        const url = `/api/chat/models?provider=${encodeURIComponent(provider)}`;
-        console.log("[DIAG fetchProviderModels] about to apiCall", url);
-        const r = await apiCall(url);
-        console.log("[DIAG fetchProviderModels] apiCall returned", { provider, ok: r.ok, error: r.error, modelCount: r.data && r.data.models ? r.data.models.length : null });
-        setModelCatalog(prev => {
-          if (r.ok) {
-            return { ...prev, [provider]: { status: "ok", models: r.data.models || [] } };
-          }
-          return { ...prev, [provider]: { status: "error", error: r.error || "Fetch failed" } };
-        });
       }, [DYNAMIC_MODEL_PROVIDERS]);
 
       // Prefetch model lists for every provider referenced by the current
       // draft — llm.provider and each chat_interface.available_providers
       // row — so existing rows render a populated dropdown without waiting
       // for the user to touch the Provider select. fetchProviderModels is
-      // idempotent, so firing it on every draft change is cheap: it
-      // no-ops after the first call for each provider.
+      // idempotent (ref-backed), so firing it on every draft change is
+      // cheap: it no-ops after the first call for each provider.
       useEffect(() => {
-        if (!draft) {
-          console.log("[DIAG prefetch useEffect] draft is falsy, skipping");
-          return;
-        }
+        if (!draft) return;
         const providers = new Set();
         const lp = draft.llm && draft.llm.provider;
         if (lp) providers.add(lp);
@@ -1683,7 +1673,6 @@
         for (const r of ap) {
           if (r && r.provider) providers.add(r.provider);
         }
-        console.log("[DIAG prefetch useEffect] fired. Providers to fetch:", [...providers], "rows:", ap.length);
         providers.forEach(p => { fetchProviderModels(p); });
       }, [draft, fetchProviderModels]);
 
