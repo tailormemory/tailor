@@ -31,6 +31,15 @@ from starlette.routing import Route
 _BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
+# Provider names llm_client.build_brain() can actually instantiate. The
+# /api/chat/providers/default endpoint rejects anything outside this set
+# before touching the yaml — keeps a typo in the request body from landing
+# in tailor.yaml and breaking the next boot.
+_SUPPORTED_PROVIDERS: frozenset[str] = frozenset({
+    "anthropic", "openai", "google", "deepseek", "ollama",
+})
+
+
 # ── system prompt resolution ───────────────────────────────────
 
 _FALLBACK_SYSTEM_PROMPT = (
@@ -76,6 +85,8 @@ def build_app(
     tools=None,
     db_path: str | None = None,
     brain_builder=None,
+    config_path: str | None = None,
+    soft_reload_fn=None,
 ) -> Starlette:
     """Build the chat sub-application.
 
@@ -97,6 +108,16 @@ def build_app(
         (provider: str, model: str) -> LLMClient, used for per-session
         provider selection. Defaults to lib.llm_client.build_brain. Tests
         inject a fake here to avoid hitting real provider SDKs.
+    config_path : str | None
+        Path to tailor.yaml. Used by POST /api/chat/providers/default to
+        promote the currently-selected provider/model to the default
+        (writes back to llm.provider + llm.model). Defaults to
+        <repo>/config/tailor.yaml.
+    soft_reload_fn : callable | None
+        Resets config-derived singletons after a successful default-provider
+        write, so the next /api/chat turn picks up the new llm.*. Defaults
+        to config_runtime.soft_reload. Tests inject a mock to assert it's
+        called exactly once.
     """
     from chat_session_store import ChatSessionStore  # local import: test isolation
     if cfg_get is None:
@@ -109,6 +130,10 @@ def build_app(
         tools = _TOOLS
     if brain_builder is None:
         from llm_client import build_brain as brain_builder  # type: ignore
+    if config_path is None:
+        config_path = os.path.join(_BASE_DIR, "config", "tailor.yaml")
+    if soft_reload_fn is None:
+        from config_runtime import soft_reload as soft_reload_fn  # type: ignore
     if store is None:
         if db_path is None:
             db_path = cfg_get("chat_interface", "db_path", None) or os.path.join(
@@ -257,9 +282,64 @@ def build_app(
     async def list_providers(request: Request) -> Response:
         return JSONResponse(_providers_payload(cfg_get))
 
+    async def set_default_provider(request: Request) -> Response:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(
+                {"ok": False, "error": "invalid JSON", "status": 400},
+                status_code=400,
+            )
+        provider = body.get("provider") if isinstance(body, dict) else None
+        model = body.get("model") if isinstance(body, dict) else None
+        if not isinstance(provider, str) or not provider:
+            return JSONResponse(
+                {"ok": False, "error": "provider is required", "status": 400},
+                status_code=400,
+            )
+        if not isinstance(model, str) or not model:
+            return JSONResponse(
+                {"ok": False, "error": "model is required", "status": 400},
+                status_code=400,
+            )
+        if provider not in _SUPPORTED_PROVIDERS:
+            return JSONResponse(
+                {"ok": False, "error": f"invalid provider: {provider}", "status": 400},
+                status_code=400,
+            )
+        # Require the UI to have a non-empty whitelist. Without it, the
+        # Chat tab would hide the selector anyway and there's nothing
+        # meaningful to promote.
+        if not _available_providers_list(cfg_get):
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "configure chat_interface.available_providers before setting a default",
+                    "status": 400,
+                },
+                status_code=400,
+            )
+        if not _is_available(cfg_get, provider, model):
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": (
+                        f"provider/model not in chat_interface.available_providers: "
+                        f"{provider}/{model}"
+                    ),
+                    "status": 400,
+                },
+                status_code=400,
+            )
+        result, status = _write_default_llm(
+            config_path, provider, model, soft_reload_fn,
+        )
+        return JSONResponse(result, status_code=status)
+
     routes = [
         Route("/api/chat", post_chat, methods=["POST"]),
         Route("/api/chat/providers", list_providers, methods=["GET"]),
+        Route("/api/chat/providers/default", set_default_provider, methods=["POST"]),
         Route("/api/chat/sessions", list_sessions, methods=["GET"]),
         Route("/api/chat/sessions/{session_id}", get_session_detail, methods=["GET"]),
         Route("/api/chat/sessions/{session_id}/rename", rename_session, methods=["POST"]),
@@ -331,6 +411,94 @@ def _providers_payload(cfg_get) -> dict:
     if not avail and default:
         avail = [{**default, "label": f"{default['provider']}/{default['model']} (default)"}]
     return {"default": default, "available": avail}
+
+
+def _write_default_llm(
+    config_path: str, provider: str, model: str, soft_reload_fn,
+) -> tuple[dict, int]:
+    """Update only llm.provider + llm.model in `config_path`.
+
+    Deliberately narrower than config_runtime.save_config: it preserves
+    all other llm.* keys (api_key, tool_use, max_tokens, temperature, …),
+    touches no other top-level section, and does NOT drop a .pending-save
+    marker. A failed write just returns an error to the caller — the
+    rollback machinery is overkill for a two-field change.
+
+    Steps: read yaml → merge llm.* → validate loadable → backup →
+    write → soft_reload. Returns (response_body, http_status).
+    """
+    import yaml
+    from config_runtime import create_backup, validate_loadable
+
+    try:
+        with open(config_path) as f:
+            current = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        return (
+            {"ok": False, "error": f"config not found: {config_path}", "status": 500},
+            500,
+        )
+    except yaml.YAMLError as e:
+        return (
+            {"ok": False, "error": f"YAML parse failed: {e}", "status": 500},
+            500,
+        )
+    except OSError as e:
+        return (
+            {"ok": False, "error": f"config read failed: {e}", "status": 500},
+            500,
+        )
+
+    if not isinstance(current, dict):
+        return (
+            {"ok": False, "error": "config root is not a mapping", "status": 500},
+            500,
+        )
+
+    # Preserve every other llm.* key. If the section is missing or malformed
+    # we create a minimal one — this is the path a brand-new install hits.
+    llm = current.get("llm")
+    if not isinstance(llm, dict):
+        llm = {}
+    llm["provider"] = provider
+    llm["model"] = model
+    current["llm"] = llm
+
+    ok, err = validate_loadable(current)
+    if not ok:
+        return (
+            {"ok": False, "error": f"config validation failed: {err}", "status": 400},
+            400,
+        )
+
+    backup = create_backup(config_path)
+    try:
+        with open(config_path, "w") as f:
+            yaml.safe_dump(
+                current, f, default_flow_style=False, allow_unicode=True, sort_keys=False,
+            )
+    except OSError as e:
+        return (
+            {"ok": False, "error": f"config write failed: {e}", "status": 500},
+            500,
+        )
+
+    try:
+        soft_reload_fn()
+    except Exception as e:
+        return (
+            {"ok": False, "error": f"soft-reload failed: {e}", "status": 500},
+            500,
+        )
+
+    return (
+        {
+            "ok": True,
+            "default": {"provider": provider, "model": model},
+            "backup": os.path.basename(backup) if backup else "",
+        },
+        200,
+    )
 
 
 def _build_llm_history(store, session_id: str, max_history: int) -> list[dict]:

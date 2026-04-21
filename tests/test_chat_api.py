@@ -557,3 +557,229 @@ def test_post_chat_builder_error_returns_400(store):
     resp = client.post("/api/chat", json={"session_id": sid, "message": "hi"})
     assert resp.status_code == 400
     assert "ANTHROPIC_API_KEY" in resp.json()["error"]
+
+
+# ── POST /api/chat/providers/default ──────────────────────────
+#
+# The endpoint promotes a (provider, model) pair currently offered in
+# chat_interface.available_providers to be the new default at
+# llm.provider / llm.model. Uses a narrow write path (NOT save_config's
+# full rollback pipeline) because the blast radius is two fields.
+
+import yaml as _yaml  # noqa: E402
+
+
+_DEFAULT_LLM_BLOCK = {
+    "provider": "anthropic",
+    "model": "claude-haiku-4-5-20251001",
+    "api_key": "${ANTHROPIC_API_KEY}",
+    "tool_use": True,
+    "max_tokens": 1000,
+    "temperature": 0.5,
+}
+
+
+def _write_yaml(path, data):
+    with open(path, "w") as f:
+        _yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
+
+
+def _build_default_test_app(tmp_path, cfg_overrides=None, soft_reload_fn=None):
+    """Variant of `build` that exercises the default-provider endpoint.
+
+    Writes a minimal tailor.yaml to tmp_path and injects it as `config_path`
+    so the endpoint reads/writes an isolated file. Returns (client, config_path,
+    soft_reload_calls)."""
+    cfg_path = tmp_path / "tailor.yaml"
+    _write_yaml(cfg_path, {"llm": dict(_DEFAULT_LLM_BLOCK)})
+    calls = []
+    if soft_reload_fn is None:
+        def soft_reload_fn():
+            calls.append(True)
+            return {}
+
+    dummy_store = ChatSessionStore(str(tmp_path / "chat_sessions.sqlite3"))
+
+    app = build_app(
+        store=dummy_store,
+        llm_factory=lambda: FakeLLM([]),
+        cfg_get=make_cfg(cfg_overrides),
+        tools=[],
+        brain_builder=lambda p, m: (_ for _ in ()).throw(AssertionError("unused")),
+        config_path=str(cfg_path),
+        soft_reload_fn=soft_reload_fn,
+    )
+    return TestClient(app), str(cfg_path), calls
+
+
+def test_set_default_provider_happy_path(tmp_path):
+    client, cfg_path, calls = _build_default_test_app(
+        tmp_path,
+        cfg_overrides={("chat_interface", "available_providers"): AVAILABLE},
+    )
+    resp = client.post(
+        "/api/chat/providers/default",
+        json={"provider": "ollama", "model": "qwen3.5:9b"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["default"] == {"provider": "ollama", "model": "qwen3.5:9b"}
+
+    with open(cfg_path) as f:
+        on_disk = _yaml.safe_load(f)
+    assert on_disk["llm"]["provider"] == "ollama"
+    assert on_disk["llm"]["model"] == "qwen3.5:9b"
+
+    bdir = os.path.join(os.path.dirname(cfg_path), ".backups")
+    assert os.path.isdir(bdir)
+    assert any(f.startswith("tailor-") and f.endswith(".yaml") for f in os.listdir(bdir))
+
+
+def test_set_default_provider_400_when_available_providers_unset(tmp_path):
+    client, _cfg_path, _calls = _build_default_test_app(tmp_path)
+    resp = client.post(
+        "/api/chat/providers/default",
+        json={"provider": "anthropic", "model": "claude-haiku-4-5-20251001"},
+    )
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["ok"] is False
+    assert "configure chat_interface.available_providers" in body["error"]
+
+
+def test_set_default_provider_400_on_invalid_provider_name(tmp_path):
+    client, _cfg_path, _calls = _build_default_test_app(
+        tmp_path,
+        cfg_overrides={("chat_interface", "available_providers"): AVAILABLE},
+    )
+    resp = client.post(
+        "/api/chat/providers/default",
+        json={"provider": "invalid", "model": "whatever"},
+    )
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["ok"] is False
+    assert "invalid" in body["error"].lower()
+
+
+def test_set_default_provider_400_on_model_not_in_available(tmp_path):
+    client, _cfg_path, _calls = _build_default_test_app(
+        tmp_path,
+        cfg_overrides={("chat_interface", "available_providers"): AVAILABLE},
+    )
+    # Whitelisted provider, but paired with a model not in the available list.
+    resp = client.post(
+        "/api/chat/providers/default",
+        json={"provider": "anthropic", "model": "claude-opus-99"},
+    )
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["ok"] is False
+    assert "not in chat_interface.available_providers" in body["error"]
+    assert "anthropic/claude-opus-99" in body["error"]
+
+
+def test_set_default_provider_preserves_other_llm_keys(tmp_path):
+    client, cfg_path, _calls = _build_default_test_app(
+        tmp_path,
+        cfg_overrides={("chat_interface", "available_providers"): AVAILABLE},
+    )
+    resp = client.post(
+        "/api/chat/providers/default",
+        json={"provider": "ollama", "model": "qwen3.5:9b"},
+    )
+    assert resp.status_code == 200
+    with open(cfg_path) as f:
+        on_disk = _yaml.safe_load(f)
+    llm = on_disk["llm"]
+    # Only provider/model should have changed — everything else round-trips.
+    assert llm["api_key"] == _DEFAULT_LLM_BLOCK["api_key"]
+    assert llm["tool_use"] == _DEFAULT_LLM_BLOCK["tool_use"]
+    assert llm["max_tokens"] == _DEFAULT_LLM_BLOCK["max_tokens"]
+    assert llm["temperature"] == _DEFAULT_LLM_BLOCK["temperature"]
+
+
+def test_set_default_provider_creates_timestamped_backup(tmp_path):
+    client, cfg_path, _calls = _build_default_test_app(
+        tmp_path,
+        cfg_overrides={("chat_interface", "available_providers"): AVAILABLE},
+    )
+    resp = client.post(
+        "/api/chat/providers/default",
+        json={"provider": "ollama", "model": "qwen3.5:9b"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["backup"]
+
+    bdir = os.path.join(os.path.dirname(cfg_path), ".backups")
+    names = [f for f in os.listdir(bdir) if f.endswith(".yaml")]
+    assert len(names) == 1
+    import re
+    assert re.match(r"^tailor-\d{8}-\d{6}(-\d+)?\.yaml$", names[0])
+
+
+def test_set_default_provider_triggers_soft_reload_once(tmp_path):
+    calls = []
+
+    def fake_reload():
+        calls.append(True)
+        return {}
+
+    client, _cfg_path, _ = _build_default_test_app(
+        tmp_path,
+        cfg_overrides={("chat_interface", "available_providers"): AVAILABLE},
+        soft_reload_fn=fake_reload,
+    )
+    resp = client.post(
+        "/api/chat/providers/default",
+        json={"provider": "ollama", "model": "qwen3.5:9b"},
+    )
+    assert resp.status_code == 200
+    assert len(calls) == 1
+
+
+def test_set_default_provider_requires_auth(tmp_path):
+    """The endpoint lives under /api/chat/* and therefore rides the same
+    BearerAuthMiddleware the rest of the chat surface rides. Wrap the
+    sub-app in a minimal token gate and confirm an unauthenticated POST
+    is rejected before it reaches the handler."""
+    cfg_path = tmp_path / "tailor.yaml"
+    _write_yaml(cfg_path, {"llm": dict(_DEFAULT_LLM_BLOCK)})
+    dummy_store = ChatSessionStore(str(tmp_path / "chat_sessions.sqlite3"))
+    app = build_app(
+        store=dummy_store,
+        llm_factory=lambda: FakeLLM([]),
+        cfg_get=make_cfg({("chat_interface", "available_providers"): AVAILABLE}),
+        tools=[],
+        brain_builder=lambda p, m: (_ for _ in ()).throw(AssertionError("unused")),
+        config_path=str(cfg_path),
+        soft_reload_fn=lambda: None,
+    )
+
+    class _BearerGate:
+        def __init__(self, inner):
+            self.inner = inner
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] != "http":
+                await self.inner(scope, receive, send)
+                return
+            hdrs = dict(scope.get("headers", []))
+            auth = hdrs.get(b"authorization", b"").decode("utf-8", errors="ignore")
+            if not auth.startswith("Bearer "):
+                from starlette.responses import Response as _R
+                await _R(
+                    content='{"error":"Unauthorized"}',
+                    status_code=401,
+                    media_type="application/json",
+                )(scope, receive, send)
+                return
+            await self.inner(scope, receive, send)
+
+    client = TestClient(_BearerGate(app))
+    resp = client.post(
+        "/api/chat/providers/default",
+        json={"provider": "ollama", "model": "qwen3.5:9b"},
+    )
+    assert resp.status_code == 401
