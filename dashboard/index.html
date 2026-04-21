@@ -1633,18 +1633,30 @@
         [],
       );
       const fetchProviderModels = useCallback(async (provider) => {
-        if (!provider || !DYNAMIC_MODEL_PROVIDERS.has(provider)) return;
+        console.log("[DIAG fetchProviderModels] called with provider=", provider);
+        if (!provider || !DYNAMIC_MODEL_PROVIDERS.has(provider)) {
+          console.log("[DIAG fetchProviderModels] early-return: provider empty or not in dynamic set", { provider, isDynamic: DYNAMIC_MODEL_PROVIDERS.has(provider) });
+          return;
+        }
         // Read latest via functional-setState to avoid stale-closure double-fetches
         // when several rows flip to the same provider in the same tick.
         let shouldFetch = false;
         setModelCatalog(prev => {
           const entry = prev[provider];
+          console.log("[DIAG fetchProviderModels] updater running", { provider, existingStatus: entry && entry.status });
           if (entry && (entry.status === "ok" || entry.status === "loading")) return prev;
           shouldFetch = true;
           return { ...prev, [provider]: { status: "loading" } };
         });
-        if (!shouldFetch) return;
-        const r = await apiCall(`/api/chat/models?provider=${encodeURIComponent(provider)}`);
+        console.log("[DIAG fetchProviderModels] after setModelCatalog, shouldFetch=", shouldFetch, "(NB: updater may not have run yet)");
+        if (!shouldFetch) {
+          console.log("[DIAG fetchProviderModels] skipping fetch: shouldFetch is false");
+          return;
+        }
+        const url = `/api/chat/models?provider=${encodeURIComponent(provider)}`;
+        console.log("[DIAG fetchProviderModels] about to apiCall", url);
+        const r = await apiCall(url);
+        console.log("[DIAG fetchProviderModels] apiCall returned", { provider, ok: r.ok, error: r.error, modelCount: r.data && r.data.models ? r.data.models.length : null });
         setModelCatalog(prev => {
           if (r.ok) {
             return { ...prev, [provider]: { status: "ok", models: r.data.models || [] } };
@@ -1660,7 +1672,10 @@
       // idempotent, so firing it on every draft change is cheap: it
       // no-ops after the first call for each provider.
       useEffect(() => {
-        if (!draft) return;
+        if (!draft) {
+          console.log("[DIAG prefetch useEffect] draft is falsy, skipping");
+          return;
+        }
         const providers = new Set();
         const lp = draft.llm && draft.llm.provider;
         if (lp) providers.add(lp);
@@ -1668,6 +1683,7 @@
         for (const r of ap) {
           if (r && r.provider) providers.add(r.provider);
         }
+        console.log("[DIAG prefetch useEffect] fired. Providers to fetch:", [...providers], "rows:", ap.length);
         providers.forEach(p => { fetchProviderModels(p); });
       }, [draft, fetchProviderModels]);
 
