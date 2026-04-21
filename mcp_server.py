@@ -1208,11 +1208,12 @@ class BearerAuthMiddleware:
             is_auth_api = path.startswith("/api/auth/")
             is_ingest_api = path == "/api/ingest-live"
             is_chat = path == "/api/chat" or path.startswith("/api/chat/")
+            is_kb = path.startswith("/api/kb/")
 
             # Localhost: allow all API calls without auth
-            # Remote: allow dashboard + secrets + auth API + ingest-live + native chat with cookie/token auth
+            # Remote: allow dashboard + secrets + auth API + ingest-live + native chat + kb with cookie/token auth
             _resolved_token = ""
-            if is_localhost or is_dashboard or is_secrets or is_auth_api or is_ingest_api or is_chat:
+            if is_localhost or is_dashboard or is_secrets or is_auth_api or is_ingest_api or is_chat or is_kb:
                 # Remote calls need auth (except /api/auth/login which verifies itself)
                 if not is_localhost and path not in ("/api/auth/login", "/api/dashboard/setup"):
                     token_ok = False
