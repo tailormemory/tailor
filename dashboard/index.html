@@ -2200,31 +2200,101 @@
       );
 
       // ── LLM default ────────────────────────────────────────
+      // Default LLM's Model field is a dynamic dropdown populated from
+      // /api/chat/models for the selected provider, mirroring the
+      // chat_interface row editor above. Ollama and fetch failures fall
+      // back to a free-text input so the user can still enter a model
+      // ID manually. When the chosen model isn't in
+      // chat_interface.available_providers, we surface a neutral info
+      // tooltip — that's a valid configuration (llm.* powers Telegram +
+      // scripts, available_providers is the Chat-tab curated list), not
+      // an error. No save-time blocking.
       const dl = d.llm || {};
+      const llmProv = dl.provider || "";
+      const llmCatalog = llmProv ? modelCatalog[llmProv] : null;
+      const llmIsDynamic = DYNAMIC_MODEL_PROVIDERS.has(llmProv);
+      const llmLoading = llmIsDynamic && llmCatalog && llmCatalog.status === "loading";
+      const llmHasModels = llmIsDynamic && llmCatalog && llmCatalog.status === "ok" && (llmCatalog.models || []).length > 0;
+      const llmError = llmIsDynamic && llmCatalog && llmCatalog.status === "error" ? llmCatalog.error : "";
+
+      const llmModelControl = llmHasModels
+        ? React.createElement(SelectInput, {
+            id: "llm.model", value: dl.model,
+            onChange: v => patch("llm", { model: v }),
+            // Keep a currently-saved model that's no longer in the live catalog visible
+            // — otherwise a deprecated selection would silently blank on load.
+            options: (() => {
+              const opts = llmCatalog.models.map(m => ({ value: m.id, label: m.display_name + " — " + m.id }));
+              if (dl.model && !llmCatalog.models.some(m => m.id === dl.model)) {
+                opts.unshift({ value: dl.model, label: dl.model + " (not in catalog)" });
+              }
+              return opts;
+            })(),
+            allowEmpty: true,
+          })
+        : llmLoading
+        ? React.createElement(SelectInput, {
+            id: "llm.model", value: "",
+            onChange: () => {},
+            options: [{ value: "", label: "Loading models..." }],
+            allowEmpty: false,
+          })
+        : React.createElement(TextInput, {
+            id: "llm.model", value: dl.model, mono: true,
+            onChange: v => patch("llm", { model: v }),
+            placeholder: "model identifier",
+          });
+
+      // Cross-field info tooltip: current llm.{provider,model} not present
+      // in chat_interface.available_providers. Neutral styling (gray/ℹ),
+      // NOT a warning. No effect on save.
+      const availForLlm = (d.chat_interface && d.chat_interface.available_providers) || [];
+      const llmListedInAvail = !!(dl.provider && dl.model && availForLlm.some(
+        r => r && r.provider === dl.provider && r.model === dl.model,
+      ));
+      const showLlmInfo = !!(dl.provider && dl.model) && !llmListedInAvail;
+      const llmInfoTooltip = showLlmInfo ? React.createElement("div", {
+        className: cl("mt-2 text-xs flex items-start gap-2 p-2.5 rounded-lg border",
+          mode === "dark"
+            ? "bg-sky-900/15 border-sky-800/40 text-sky-200"
+            : "bg-sky-50 border-sky-200 text-sky-800"),
+      },
+        React.createElement("span", { className: "shrink-0 leading-5", "aria-hidden": true }, "ℹ"),
+        React.createElement("span", null,
+          "This model is not listed in ",
+          React.createElement("code", { className: "px-1 rounded bg-black/10" }, "chat_interface.available_providers"),
+          ". That's fine — ",
+          React.createElement("code", { className: "px-1 rounded bg-black/10" }, "llm.*"),
+          " is the system-wide default used by Telegram, scripts, and new chat sessions without an explicit pick. If you also want this model selectable in the web Chat tab dropdown, add it to ",
+          React.createElement("code", { className: "px-1 rounded bg-black/10" }, "chat_interface.available_providers"),
+          ".",
+        ),
+      ) : null;
+
       const llmFields = React.createElement("div", null,
         React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-2 gap-3" },
           React.createElement(Field, { id: "llm.provider", label: "Provider" },
             React.createElement(SelectInput, {
               id: "llm.provider", value: dl.provider,
               onChange: v => {
-                const models = LLM_MODELS[v] || [];
-                patch("llm", { provider: v, model: models[0]?.value || dl.model || "" });
+                // Don't auto-pick a model from LLM_MODELS anymore — the catalog fetch
+                // will populate the dropdown shortly. Clear model so a stale value
+                // from a previous provider doesn't leak.
+                patch("llm", { provider: v, model: "" });
+                fetchProviderModels(v);
               },
               options: LLM_PROVIDERS_RUNTIME, allowEmpty: true,
             }),
           ),
           React.createElement(Field, { id: "llm.model", label: "Model" },
-            (LLM_MODELS[dl.provider] && LLM_MODELS[dl.provider].length > 0)
-              ? React.createElement(SelectInput, {
-                  id: "llm.model", value: dl.model,
-                  onChange: v => patch("llm", { model: v }),
-                  options: LLM_MODELS[dl.provider], allowEmpty: true,
-                })
-              : React.createElement(TextInput, {
-                  id: "llm.model", value: dl.model, mono: true,
-                  onChange: v => patch("llm", { model: v }),
-                  placeholder: "model identifier",
-                }),
+            React.createElement("div", null,
+              llmModelControl,
+              llmError
+                ? React.createElement("p", { className: cl("text-xs mt-1", mode === "dark" ? "text-red-400" : "text-red-600") },
+                    "Couldn't load " + llmProv + " models: " + llmError + ". Enter model ID manually.")
+                : null,
+              llmInfoTooltip,
+            ),
           ),
           React.createElement(Field, { id: "llm.temperature", label: "Temperature",
             help: "0 = deterministic. 2 = chaotic. Rejection by provider at runtime if out of range." },
