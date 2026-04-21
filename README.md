@@ -497,13 +497,16 @@ Both have: atomic facts, supersession, user profiles, hybrid search, temporal gr
 
 ## Roadmap
 
-- **Native Chat Interface** — Built-in conversational UI at `/chat` in the dashboard. Talk to TAILOR directly without Claude, ChatGPT, or Telegram. Text-first, with optional voice input/output via browser APIs.
-- **Chrome Web Store** — Publish the browser extension for one-click install (submitted, pending review).
-- **Model Advisor v2** — Benchmark comparison, automatic backend suggestions when a faster/cheaper model fits the same enrichment role.
-- **Runtime provider switching** — Hot-reload LLM provider and model configuration without restart. Switch backends from the dashboard in real time.
-- **Auto-forgetting** — Configurable TTL for facts, with automatic expiration and cleanup.
+- **Chrome Web Store** — Browser extension submitted, pending review. Once approved, installable in one click.
+- **Voice I/O in chat** — Speech-to-text and text-to-speech in the Chat tab via the browser Web Speech API.
+- **HUD chat skin** — Optional Iron Man-inspired theme for the Chat tab (cyan accents, reactive SVG rings, CSS animations).
+- **Runtime provider switching** — Dedicated UI to hot-swap the default LLM provider and model from the dashboard without editing YAML.
+- **Model Advisor v2** — Benchmark comparison and automatic backend suggestions when a faster or cheaper model fits the same enrichment role.
+- **Auto-forgetting** — Configurable TTL on facts, with automatic expiration and cleanup.
 - **Webhook real-time ingest** — Push-based ingestion for live data sources (vs. nightly batch).
 - **Multimodal support** — Video, audio, and code AST ingestion.
+
+Shipped features previously listed here are now in the [CHANGELOG](CHANGELOG.md).
 
 ---
 
