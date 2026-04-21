@@ -1614,6 +1614,63 @@
       const [restartPhase, setRestartPhase] = useState("idle"); // idle|sending|waiting|reconnected|failed
       const [restartCountdown, setRestartCountdown] = useState(0);
 
+      // ── Dynamic provider→models catalog ─────────────────────
+      // Backs the Model dropdowns in the Chat-interface row editor and the
+      // Default-LLM form. Hits GET /api/chat/models?provider=... on demand,
+      // then memoizes per provider for the rest of the session so switching
+      // Provider back and forth never re-fetches. Cleared only on remount.
+      //
+      // Per-provider entry shape:
+      //   { status: "loading" | "ok" | "error", models?: [...], error?: "..." }
+      //
+      // "ollama" is NOT served by this endpoint (no cloud /models API). The
+      // two forms fall back to the hardcoded LLM_MODELS list for Ollama
+      // (and for any provider whose fetch failed) via a free-text input —
+      // that's the escape hatch the spec calls for.
+      const [modelCatalog, setModelCatalog] = useState({});
+      const DYNAMIC_MODEL_PROVIDERS = React.useMemo(
+        () => new Set(["anthropic", "openai", "google", "deepseek"]),
+        [],
+      );
+      const fetchProviderModels = useCallback(async (provider) => {
+        if (!provider || !DYNAMIC_MODEL_PROVIDERS.has(provider)) return;
+        // Read latest via functional-setState to avoid stale-closure double-fetches
+        // when several rows flip to the same provider in the same tick.
+        let shouldFetch = false;
+        setModelCatalog(prev => {
+          const entry = prev[provider];
+          if (entry && (entry.status === "ok" || entry.status === "loading")) return prev;
+          shouldFetch = true;
+          return { ...prev, [provider]: { status: "loading" } };
+        });
+        if (!shouldFetch) return;
+        const r = await apiCall(`/api/chat/models?provider=${encodeURIComponent(provider)}`);
+        setModelCatalog(prev => {
+          if (r.ok) {
+            return { ...prev, [provider]: { status: "ok", models: r.data.models || [] } };
+          }
+          return { ...prev, [provider]: { status: "error", error: r.error || "Fetch failed" } };
+        });
+      }, [DYNAMIC_MODEL_PROVIDERS]);
+
+      // Prefetch model lists for every provider referenced by the current
+      // draft — llm.provider and each chat_interface.available_providers
+      // row — so existing rows render a populated dropdown without waiting
+      // for the user to touch the Provider select. fetchProviderModels is
+      // idempotent, so firing it on every draft change is cheap: it
+      // no-ops after the first call for each provider.
+      useEffect(() => {
+        if (!draft) return;
+        const providers = new Set();
+        const lp = draft.llm && draft.llm.provider;
+        if (lp) providers.add(lp);
+        const ap = (draft.chat_interface && draft.chat_interface.available_providers) || [];
+        for (const r of ap) {
+          if (r && r.provider) providers.add(r.provider);
+        }
+        providers.forEach(p => { fetchProviderModels(p); });
+      }, [draft, fetchProviderModels]);
+
       // Fetch current config. On mount (silent=false) we show the
       // loading skeleton; on re-fetch after an external change (restore
       // from backup, which bumps refreshSignal), we stay silent to
@@ -2027,53 +2084,111 @@
           }),
         ),
         // Available providers table (provider + model + label per row).
+        // Model is a dynamic dropdown populated from /api/chat/models for the
+        // selected provider. If the fetch fails or returns no entries (e.g.
+        // missing API key, ollama — which is not served by the endpoint),
+        // we fall back to a free-text input so the user can still enter a
+        // model ID manually. Label auto-fills with the picked model's
+        // display_name when it's blank or still matches a prior auto-value.
         React.createElement("div", { className: "mb-2" },
           React.createElement("div", { className: cl("text-sm font-medium mb-2", t.textLabel) }, "Available providers in chat"),
           React.createElement("div", { className: cl("text-xs mb-2", t.textFaint) },
             "Shown in the per-session provider dropdown. Each row needs a provider and model."),
           React.createElement("div", { className: "space-y-2" },
-            (ci.available_providers || []).map((row, idx) =>
-              React.createElement("div", { key: idx, className: cl("flex items-center gap-2 p-2 rounded-xl border", t.borderLight, mode === "dark" ? "bg-zinc-900/40" : "bg-zinc-50") },
-                React.createElement("select", {
-                  value: row.provider || "",
-                  onChange: (e) => {
-                    const arr = [...(ci.available_providers || [])];
-                    arr[idx] = { ...arr[idx], provider: e.target.value };
-                    patch("chat_interface", { available_providers: arr });
+            (ci.available_providers || []).map((row, idx) => {
+              const provider = row.provider || "";
+              const catalog = provider ? modelCatalog[provider] : null;
+              const isDynamic = DYNAMIC_MODEL_PROVIDERS.has(provider);
+              const isLoading = isDynamic && catalog && catalog.status === "loading";
+              const hasModels = isDynamic && catalog && catalog.status === "ok" && (catalog.models || []).length > 0;
+              const errorMsg = isDynamic && catalog && catalog.status === "error" ? catalog.error : "";
+
+              const updateRow = (patchObj) => {
+                const arr = [...(ci.available_providers || [])];
+                arr[idx] = { ...arr[idx], ...patchObj };
+                patch("chat_interface", { available_providers: arr });
+              };
+
+              const onPickModel = (newModel) => {
+                const match = hasModels ? catalog.models.find(m => m.id === newModel) : null;
+                const newDisplay = match ? match.display_name : newModel;
+                const prevMatch = hasModels ? catalog.models.find(m => m.id === row.model) : null;
+                const prevDisplay = prevMatch ? prevMatch.display_name : "";
+                // Auto-suggest label only when Label is empty or still equals
+                // the previously-auto-suggested value. Anything else means the
+                // user typed something custom — never overwrite.
+                const currentLabel = row.label || "";
+                const canAutoLabel = !currentLabel || currentLabel === prevDisplay;
+                const next = { model: newModel };
+                if (canAutoLabel && newDisplay) next.label = newDisplay;
+                updateRow(next);
+              };
+
+              const modelControl = hasModels
+                ? React.createElement("select", {
+                    value: row.model || "",
+                    onChange: (e) => onPickModel(e.target.value),
+                    className: cl("flex-1 px-2 py-1.5 rounded-lg border text-sm font-mono", t.input),
                   },
-                  className: cl("w-36 px-2 py-1.5 rounded-lg border text-sm", t.input),
-                },
-                  React.createElement("option", { value: "" }, "Provider..."),
-                  LLM_PROVIDERS_RUNTIME.map(p => React.createElement("option", { key: p.value, value: p.value }, p.label)),
+                    React.createElement("option", { value: "" }, "Select model..."),
+                    // Keep a row.model that's no longer in the live catalog visible
+                    // instead of silently blanking a saved-but-deprecated value.
+                    row.model && !catalog.models.some(m => m.id === row.model)
+                      ? React.createElement("option", { key: "__current", value: row.model }, row.model + " (not in catalog)")
+                      : null,
+                    catalog.models.map(m =>
+                      React.createElement("option", { key: m.id, value: m.id }, m.display_name + " — " + m.id),
+                    ),
+                  )
+                : isLoading
+                ? React.createElement("select", {
+                    value: "", disabled: true,
+                    className: cl("flex-1 px-2 py-1.5 rounded-lg border text-sm font-mono", t.input),
+                  },
+                    React.createElement("option", { value: "" }, "Loading models..."),
+                  )
+                : React.createElement("input", {
+                    type: "text", value: row.model || "",
+                    placeholder: "model name",
+                    onChange: (e) => updateRow({ model: e.target.value }),
+                    className: cl("flex-1 px-2 py-1.5 rounded-lg border text-sm font-mono", t.input),
+                  });
+
+              return React.createElement("div", { key: idx, className: "space-y-1" },
+                React.createElement("div", { className: cl("flex items-center gap-2 p-2 rounded-xl border", t.borderLight, mode === "dark" ? "bg-zinc-900/40" : "bg-zinc-50") },
+                  React.createElement("select", {
+                    value: provider,
+                    onChange: (e) => {
+                      const newProv = e.target.value;
+                      updateRow({ provider: newProv });
+                      fetchProviderModels(newProv);
+                    },
+                    className: cl("w-36 px-2 py-1.5 rounded-lg border text-sm", t.input),
+                  },
+                    React.createElement("option", { value: "" }, "Provider..."),
+                    LLM_PROVIDERS_RUNTIME.map(p => React.createElement("option", { key: p.value, value: p.value }, p.label)),
+                  ),
+                  modelControl,
+                  React.createElement("input", {
+                    type: "text", value: row.label || "", placeholder: "label (optional)",
+                    onChange: (e) => updateRow({ label: e.target.value }),
+                    className: cl("flex-1 px-2 py-1.5 rounded-lg border text-sm", t.input),
+                  }),
+                  React.createElement("button", {
+                    onClick: () => {
+                      const arr = [...(ci.available_providers || [])];
+                      arr.splice(idx, 1);
+                      patch("chat_interface", { available_providers: arr });
+                    },
+                    className: "text-xs px-2 py-1 rounded text-red-400 hover:bg-red-500/10",
+                  }, "\u2715"),
                 ),
-                React.createElement("input", {
-                  type: "text", value: row.model || "", placeholder: "model name",
-                  onChange: (e) => {
-                    const arr = [...(ci.available_providers || [])];
-                    arr[idx] = { ...arr[idx], model: e.target.value };
-                    patch("chat_interface", { available_providers: arr });
-                  },
-                  className: cl("flex-1 px-2 py-1.5 rounded-lg border text-sm font-mono", t.input),
-                }),
-                React.createElement("input", {
-                  type: "text", value: row.label || "", placeholder: "label (optional)",
-                  onChange: (e) => {
-                    const arr = [...(ci.available_providers || [])];
-                    arr[idx] = { ...arr[idx], label: e.target.value };
-                    patch("chat_interface", { available_providers: arr });
-                  },
-                  className: cl("flex-1 px-2 py-1.5 rounded-lg border text-sm", t.input),
-                }),
-                React.createElement("button", {
-                  onClick: () => {
-                    const arr = [...(ci.available_providers || [])];
-                    arr.splice(idx, 1);
-                    patch("chat_interface", { available_providers: arr });
-                  },
-                  className: "text-xs px-2 py-1 rounded text-red-400 hover:bg-red-500/10",
-                }, "\u2715"),
-              ),
-            ),
+                errorMsg
+                  ? React.createElement("div", { className: cl("text-xs ml-40 pl-2", mode === "dark" ? "text-red-400" : "text-red-600") },
+                      "Couldn't load " + provider + " models: " + errorMsg + ". Enter model ID manually.")
+                  : null,
+              );
+            }),
           ),
           React.createElement("button", {
             onClick: () => patch("chat_interface", {
