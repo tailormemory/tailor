@@ -26,6 +26,7 @@ TOOL_PERMISSIONS = {
     "kb_search_by_entity": "read",
     "kb_search_by_topic": "read",
     "kb_search_docs": "read",
+    "kb_find_document": "read",
     "kb_query_advanced": "read",
     "kb_list_conversations": "read",
     "kb_stats": "read",

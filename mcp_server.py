@@ -2102,6 +2102,48 @@ def kb_search_by_entity(entity: str, entity_type: str = "", n_results: int = 10,
         return f"kb_search_by_entity error: {str(e)}"
 
 
+@mcp.tool(annotations={"readOnlyHint": True})
+def kb_find_document(query: str, n_results: int = 10) -> list[dict]:
+    """Find documents in the KB by filename, folder, or path (fuzzy match).
+
+    Use this when you know the name or location of a document but semantic
+    content search isn't finding it. For searching document *contents*,
+    use `kb_search` with `source_filter='document'` instead.
+
+    Args:
+        query: Filename, folder, or path fragment (e.g. "integrazione aprile",
+            "Salute & Fitness", "report.pdf").
+        n_results: Max results to return (default 10).
+    """
+    from scripts.lib.kb_find_document import find_documents
+    try:
+        collection = get_collection()
+        if collection is None:
+            return []
+        # Pull every chunk tagged source=document. ChromaDB returns lists,
+        # not an iterator; paginate to keep memory bounded.
+        BATCH = 1000
+        all_chunks: list[tuple[str, dict]] = []
+        offset = 0
+        while True:
+            batch = collection.get(
+                where={"source": "document"},
+                include=["metadatas"],
+                limit=BATCH, offset=offset,
+            )
+            ids = batch.get("ids") or []
+            metas = batch.get("metadatas") or []
+            if not ids:
+                break
+            all_chunks.extend(zip(ids, metas))
+            if len(ids) < BATCH:
+                break
+            offset += len(ids)
+        return find_documents(query, all_chunks, n_results=n_results)
+    except Exception as e:
+        return [{"error": f"kb_find_document error: {str(e)}"}]
+
+
 @mcp.tool()
 def kb_list_conversations(limit: int = 50) -> str:
     """List conversations stored in the Knowledge Base.
