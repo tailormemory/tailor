@@ -456,6 +456,10 @@
       }
       if (!base) base = provider + "/" + model;
       if (defaultProvider && defaultProvider.provider === provider && defaultProvider.model === model) {
+        // Don't append "(default)" if the configured label already contains it
+        // (e.g. label: "Claude Haiku 4.5 (default)"). Case-insensitive check to
+        // catch common variations like "(Default)" or "(DEFAULT)".
+        if (base.toLowerCase().indexOf("(default)") !== -1) return base;
         return base + " (default)";
       }
       return base;
