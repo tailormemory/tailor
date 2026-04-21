@@ -507,6 +507,12 @@ Both have: atomic facts, supersession, user profiles, hybrid search, temporal gr
 
 ---
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for the full release history.
+
+---
+
 ## License
 
 [Apache 2.0](LICENSE)
