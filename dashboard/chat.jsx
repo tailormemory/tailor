@@ -273,6 +273,7 @@
     var options = props.providers || [];
     var sel = props.value || {};
     var cur = sel.provider && sel.model ? sel.provider + "|" + sel.model : "";
+    var labelFor = props.labelFor || function (p) { return p.label || (p.provider + "/" + p.model); };
     return h("label", { className: "flex items-center gap-2 text-xs" },
       h("span", { className: cl("uppercase tracking-widest font-mono", t.textFaint) }, "Model"),
       h("select", {
@@ -289,9 +290,40 @@
       },
         options.map(function (p) {
           var key = p.provider + "|" + p.model;
-          return h("option", { key: key, value: key }, p.label || key);
+          return h("option", { key: key, value: key }, labelFor(p));
         })
       )
+    );
+  }
+
+  // One-click "promote current selection to the default llm.* brain".
+  // Status is owned by the parent: null = idle, "loading" = POST in
+  // flight, "ok" = success flash (cleared after 2s), {error: str} = show
+  // the message inline. No modal, no spinner — matches the rest of the
+  // dashboard's inline-feedback pattern.
+  function SetDefaultButton(props) {
+    var t = props.theme;
+    var status = props.status;
+    var loading = status === "loading";
+    var okFlash = status === "ok";
+    var errMsg = (status && typeof status === "object" && status.error) ? status.error : null;
+    return h("span", { className: "inline-flex items-center gap-2" },
+      h("button", {
+        onClick: props.onClick,
+        disabled: loading,
+        className: cl(
+          "px-3 py-1.5 rounded-lg text-xs font-medium border transition",
+          loading ? "opacity-50 cursor-wait" : "hover:border-teal-500/50 hover:text-teal-300 hover:bg-teal-500/[0.06]",
+          t.border, t.textLabel
+        ),
+      }, "Set as default"),
+      okFlash ? h("span", {
+        className: cl("text-xs", "text-teal-400"),
+      }, "✓ Default updated") : null,
+      errMsg ? h("span", {
+        className: "text-xs text-red-400 font-mono truncate max-w-[200px]",
+        title: errMsg,
+      }, errMsg) : null
     );
   }
 
@@ -349,6 +381,14 @@
     var _av = useState([]); var providers = _av[0], setProviders = _av[1];
     var _def = useState(null); var defaultSel = _def[0], setDefaultSel = _def[1];
     var _sel = useState(null); var selected = _sel[0], setSelected = _sel[1];
+    // `defaultProvider` tracks what llm.* currently points at. Drives the
+    // "(default)" suffix in the dropdown and the visibility of the "Set as
+    // default" button. Distinct from `defaultSel`: the latter has a fallback
+    // to avail[0] when llm.* is missing, which we don't want for labeling.
+    var _dp = useState(null); var defaultProvider = _dp[0], setDefaultProvider = _dp[1];
+    // Transient status for the "Set as default" button. null | "loading" |
+    // "ok" | {error: string}. Cleared after 2s on success.
+    var _du = useState(null); var defaultUpdate = _du[0], setDefaultUpdate = _du[1];
 
     function openSidebar() { setSidebarOpen(true); }
     function closeSidebar() { setSidebarOpen(false); }
@@ -386,10 +426,13 @@
         if (!body) return;
         var avail = Array.isArray(body.available) ? body.available : [];
         setProviders(avail);
-        var def = null;
+        var strictDefault = null;
         if (body.default && body.default.provider && body.default.model) {
-          def = { provider: body.default.provider, model: body.default.model };
-        } else if (avail.length > 0) {
+          strictDefault = { provider: body.default.provider, model: body.default.model };
+        }
+        setDefaultProvider(strictDefault);
+        var def = strictDefault;
+        if (!def && avail.length > 0) {
           def = { provider: avail[0].provider, model: avail[0].model };
         }
         if (def) {
@@ -402,13 +445,20 @@
     // Map (provider, model) → label from the fetched list; falls back to
     // "<provider>/<model>" when the pair isn't in available_providers (e.g.
     // a session pinned on a provider that was later removed from config).
+    // Appends " (default)" when the pair matches the currently-active llm.*
+    // — drives the dropdown suffix and the pinned-provider badge on mobile.
     function labelFor(provider, model) {
       if (!provider || !model) return "";
+      var base = null;
       for (var i = 0; i < providers.length; i++) {
         var p = providers[i];
-        if (p.provider === provider && p.model === model) return p.label;
+        if (p.provider === provider && p.model === model) { base = p.label; break; }
       }
-      return provider + "/" + model;
+      if (!base) base = provider + "/" + model;
+      if (defaultProvider && defaultProvider.provider === provider && defaultProvider.model === model) {
+        return base + " (default)";
+      }
+      return base;
     }
 
     useEffect(function () {
@@ -544,6 +594,49 @@
       if (abortRef.current) abortRef.current.abort();
     }
 
+    // Promote the currently-selected (provider, model) to the default llm.*.
+    // Fire-and-wait: POST, update local state on success, flash an inline
+    // confirmation for 2s. On failure, surface the error via the same
+    // inline mechanism (no banner, no modal).
+    function promoteToDefault() {
+      if (!selected || !selected.provider || !selected.model) return;
+      setDefaultUpdate("loading");
+      api("/api/chat/providers/default", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: selected.provider, model: selected.model }),
+      }).then(function (r) { return r.json().then(function (body) { return { ok: r.ok, body: body }; }); })
+        .then(function (res) {
+          if (res.ok && res.body && res.body.ok && res.body.default) {
+            setDefaultProvider({
+              provider: res.body.default.provider,
+              model: res.body.default.model,
+            });
+            setDefaultSel({
+              provider: res.body.default.provider,
+              model: res.body.default.model,
+            });
+            setDefaultUpdate("ok");
+            setTimeout(function () { setDefaultUpdate(null); }, 2000);
+          } else {
+            var msg = (res.body && res.body.error) || "update failed";
+            setDefaultUpdate({ error: msg });
+          }
+        })
+        .catch(function (err) {
+          setDefaultUpdate({ error: String((err && err.message) || err) });
+        });
+    }
+
+    // Is `selected` different from the current default? Controls visibility
+    // of the "Set as default" button — hiding it when the user is already
+    // on the default avoids a no-op click.
+    function selectionIsDefault() {
+      if (!selected || !defaultProvider) return false;
+      return selected.provider === defaultProvider.provider
+        && selected.model === defaultProvider.model;
+    }
+
     if (!enabled) {
       return h("div", { className: cl("rounded-2xl border p-8 text-center", t.border, t.tile) },
         h("div", { className: cl("text-lg font-semibold mb-1", t.text) }, "Chat interface disabled"),
@@ -565,6 +658,11 @@
     // is created/selected. After the first send `activeId` is set and the
     // selection is locked in the DB.
     var showSelector = activeId == null && providers.length > 1;
+    // Labeler for the dropdown options. Same rules as labelFor() used
+    // elsewhere; passed into ProviderSelector so option text also reflects
+    // the "(default)" suffix on the matching pair.
+    var optionLabelFor = function (p) { return labelFor(p.provider, p.model); };
+    var showSetDefault = showSelector && !!selected && !!defaultProvider && !selectionIsDefault();
 
     return h("div", {
       className: cl("chat-shell relative rounded-2xl border overflow-hidden flex", t.border),
@@ -649,6 +747,12 @@
             value: selected,
             onChange: setSelected,
             disabled: busy,
+            labelFor: optionLabelFor,
+          }) : null,
+          showSetDefault ? h(SetDefaultButton, {
+            theme: t,
+            status: defaultUpdate,
+            onClick: promoteToDefault,
           }) : null,
           (!showSelector && pinnedLabel) ? h("span", {
             className: cl("text-xs font-mono", t.textFaint),
@@ -666,7 +770,13 @@
             value: selected,
             onChange: setSelected,
             disabled: busy,
-          })
+            labelFor: optionLabelFor,
+          }),
+          showSetDefault ? h(SetDefaultButton, {
+            theme: t,
+            status: defaultUpdate,
+            onClick: promoteToDefault,
+          }) : null
         ) : null,
 
         h("div", { ref: scrollRef, className: "flex-1 overflow-y-auto px-4 md:px-5 py-4 min-h-0" },
