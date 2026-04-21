@@ -63,6 +63,7 @@ ENDPOINT_PERMISSIONS = {
     "/api/dashboard/rate-limit": "read",
     "/api/search": "read",
     "/api/fetch/": "read",
+    "/api/kb/document": "read",
     # Write
     "/api/dashboard/upload": "write",
     "/api/ingest-live": "write",

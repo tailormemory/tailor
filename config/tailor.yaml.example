@@ -27,6 +27,12 @@ user:
 # ── Document Ingest ───────────────────────────────────────────
 # Folders to scan recursively for documents (PDF, Excel, CSV, Word, PPTX).
 ingest:
+  # Root directory used to resolve relative file_path values stored in the KB.
+  # Documents live under ingest.document_paths (absolute), but the KB stores
+  # paths relative to this root for portability. Must be an ancestor of every
+  # entry in document_paths. Required for the /api/kb/document download
+  # endpoint; when unset the endpoint returns 503.
+  document_root: /Users/jarvis/OneDrive/Personale
   document_paths:
     - /path/to/your/documents/folder1
     - /path/to/your/documents/folder2

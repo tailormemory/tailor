@@ -264,6 +264,14 @@ class BearerAuthMiddleware:
                     })
                 return _json_response({"results": out})
 
+            # /api/kb/document?path=<relative_path>  → raw file bytes
+            elif path == "/api/kb/document":
+                from scripts.lib.kb_document_api import handle_kb_document_request
+                from scripts.lib.config import get as _cfg_get_doc
+                qs = scope.get("query_string", b"").decode()
+                doc_root = _cfg_get_doc("ingest", "document_root") or ""
+                return handle_kb_document_request(qs, doc_root, cors_headers=_CORS_HEADERS)
+
             # ── Auth ──
             elif path == "/api/auth/login":
                 # Rate limit check
