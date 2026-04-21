@@ -1599,6 +1599,11 @@ def is_superseded(meta: dict) -> bool:
     return bool(meta.get("superseded_by", ""))
 
 
+# Helper lives in scripts.lib.kb_document_api so tests can import it without
+# pulling in the full MCP server (ChromaDB, FastMCP, embedding model...).
+from scripts.lib.kb_document_api import format_document_fileref  # noqa: E402
+
+
 def filter_superseded(ids: list, documents: list, metadatas: list, distances: list | None = None, n_results: int | None = None) -> dict:
     """Filter superseded chunks from ChromaDB results.
     Returns the same structures without chunks that have non-empty superseded_by."""
@@ -1674,11 +1679,13 @@ def kb_search(query: str, n_results: int = 5, source_filter: str = "", include_s
             category = meta.get("category", "")
             extra = " | ".join(filter(None, [folder, doc_type, f"[{category}]" if category else ""]))
             facts_block = format_facts_block(chunk_facts.get(cid, []))
+            fileref = format_document_fileref(meta)
             output.append(
                 f"--- Result {i+1} (relevance: {relevance:.2f}) ---\n"
                 f"Conversazione: {meta.get('title', 'N/A')}\n"
                 f"Data: {meta.get('date', 'N/A')}\n"
                 f"Fonte: {source}" + (f" | {extra}" if extra else "") + "\n"
+                + fileref +
                 f"---\n{doc[:2000]}{facts_block}\n"
             )
         # Append derived facts (inferences) if relevant
@@ -1863,11 +1870,13 @@ def kb_hybrid_search(query: str, n_results: int = 10, source_filter: str = "", i
             score_str = f"{item['score']:.2f}" if item["source_type"] == "semantic" else "entity"
 
             facts_block = format_facts_block(chunk_facts.get(cid, []))
+            fileref = format_document_fileref(meta)
             output.append(
                 f"--- Result {i+1} [{tag} {score_str}] ---\n"
                 f"Titolo: {meta.get('title', 'N/A')}\n"
                 f"Data: {meta.get('date', 'N/A')} | Fonte: {source}"
                 + (f" | {extra}" if extra else "") + "\n"
+                + fileref +
                 f"---\n{item['doc'][:2000]}{facts_block}\n"
             )
 

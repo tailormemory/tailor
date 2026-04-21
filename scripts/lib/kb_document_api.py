@@ -13,9 +13,32 @@ from __future__ import annotations
 
 import mimetypes
 import os
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 from starlette.responses import Response
+
+
+def format_document_fileref(meta: dict) -> str:
+    """Render the file_path / file_type / folder / download_url lines for
+    document-sourced KB search results.
+
+    Returns '' when meta['source'] != 'document' so the four fields are
+    absent (not null, not present-with-empty-value) in the rendered output
+    for non-document results. The download_url is only emitted when a
+    file_path is present; the path component is URL-encoded with safe=''.
+    """
+    if (meta or {}).get("source") != "document":
+        return ""
+    file_path = meta.get("file_path", "") or ""
+    file_type = meta.get("file_type", "") or ""
+    folder = meta.get("folder", "") or ""
+    download_url = f"/api/kb/document?path={quote(file_path, safe='')}" if file_path else ""
+    return (
+        f"file_path: {file_path}\n"
+        f"file_type: {file_type}\n"
+        f"folder: {folder}\n"
+        f"download_url: {download_url}\n"
+    )
 
 
 _EXTRA_MIMES = {
