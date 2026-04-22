@@ -653,11 +653,28 @@
       if (sessions[si].id === activeId) { activeSession = sessions[si]; break; }
     }
     var mobileTitle = activeSession ? (activeSession.title || "New chat") : "New chat";
-    // Pinned provider label for active sessions (read-only badge in the
-    // mobile top bar + above the chat). Null when the session uses default.
-    var pinnedLabel = (activeSession && activeSession.provider && activeSession.model)
-      ? labelFor(activeSession.provider, activeSession.model)
-      : null;
+    // Label for the desktop "via" badge and the active-session case on
+    // mobile. Priority:
+    //   1. Session has an explicit pinned provider/model → use that
+    //   2. Otherwise, fall back to the current llm.* default
+    //   3. If neither (defaults not loaded yet) → null, badge hidden
+    // A session's provider is immutable after creation — the badge is
+    // informational only.
+    var pinnedLabel = null;
+    if (activeSession && activeSession.provider && activeSession.model) {
+      pinnedLabel = labelFor(activeSession.provider, activeSession.model);
+    } else if (activeSession && defaultProvider) {
+      pinnedLabel = labelFor(defaultProvider.provider, defaultProvider.model);
+    }
+    // Extends pinnedLabel to the pre-send "new chat" state on mobile by
+    // falling back to whichever pair is currently selected in the dropdown.
+    // Keeps the top-bar badge populated in every state so the mobile user
+    // always sees which model will answer, even when the dropdown isn't
+    // rendered (single-provider setups) or is easy to miss.
+    var mobileModelLabel = pinnedLabel;
+    if (!mobileModelLabel && selected && selected.provider && selected.model) {
+      mobileModelLabel = labelFor(selected.provider, selected.model);
+    }
     // Show the provider selector only on a fresh "new chat" — before a session
     // is created/selected. After the first send `activeId` is set and the
     // selection is locked in the DB.
@@ -732,10 +749,10 @@
             "aria-label": "Open sessions",
           }, h(HamburgerIcon)),
           h("div", { className: cl("flex-1 min-w-0 truncate text-sm font-medium", t.text) }, mobileTitle),
-          pinnedLabel ? h("span", {
-            className: cl("shrink-0 text-[10px] font-mono px-2 py-0.5 rounded border", t.textFaint, "border-zinc-700/50"),
-            title: "Model: " + pinnedLabel,
-          }, pinnedLabel) : null
+          mobileModelLabel ? h("span", {
+            className: cl("shrink-0 text-xs font-mono px-2 py-1 rounded-md border", t.textFaint, "border-zinc-700/50"),
+            title: "Model: " + mobileModelLabel,
+          }, mobileModelLabel) : null
         ),
 
         // Chat header strip. Shown when there's something to show — either the
