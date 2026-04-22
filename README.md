@@ -18,6 +18,7 @@
 
 <p align="center">
   <a href="https://tailormemory.ai"><img src="https://img.shields.io/badge/website-tailormemory.ai-teal?style=flat-square" alt="Website" /></a>
+  <a href="https://chromewebstore.google.com/detail/tailor-%E2%80%94-ai-memory-captur/phkhilpdfpmlbnfficopnbflhpmnfdfe"><img src="https://img.shields.io/badge/Chrome_Web_Store-install-4285F4?style=flat-square&logo=googlechrome&logoColor=white" alt="Chrome Web Store" /></a>
   <img src="https://img.shields.io/badge/python-3.11+-blue?style=flat-square" alt="Python" />
   <img src="https://img.shields.io/badge/license-Apache_2.0-green?style=flat-square" alt="License" />
   <img src="https://img.shields.io/badge/MCP-compatible-teal?style=flat-square" alt="MCP" />
@@ -35,7 +36,7 @@ Your conversations, documents, emails, and decisions — indexed, searchable, an
 | 🧠 **Persistent Memory** | Facts, decisions, and preferences survive across sessions and across different AI providers. |
 | 🔒 **100% Local** | ChromaDB + Ollama. No cloud dependency for core functions. Your data stays on your machine. |
 | 🔌 **LLM-Agnostic** | Anthropic, OpenAI, Google, Ollama. Switch providers by changing one line in the config. |
-| 🤖 **MCP Native** | 21 tools. Connects to Claude, ChatGPT, and any MCP-compatible client. |
+| 🤖 **MCP Native** | 22 tools. Connects to Claude, ChatGPT, and any MCP-compatible client. |
 | 🔄 **Self-Enriching** | Nightly pipelines extract atomic facts, build entity graphs, derive inferences, supersede outdated info. |
 | 📱 **Telegram Bot** | Full conversational interface with KB access, reminders, and automatic session capture. |
 
@@ -404,6 +405,14 @@ TAILOR includes a Chrome extension that captures conversations from Claude, Chat
 
 ### Install
 
+**Option A — Chrome Web Store (recommended)**
+
+One-click install from the [Chrome Web Store listing](https://chromewebstore.google.com/detail/tailor-%E2%80%94-ai-memory-captur/phkhilpdfpmlbnfficopnbflhpmnfdfe). After install, click the extension icon, enter your TAILOR server URL and API token, then enable **Capture enabled**.
+
+**Option B — Developer mode (from this repo)**
+
+For users who want to run the exact extension source shipped in the repo (e.g. while contributing):
+
 1. Open `chrome://extensions/` in Chrome
 2. Enable **Developer mode** (toggle top-right)
 3. Click **Load unpacked** and select the `extension/` folder from this repo
@@ -499,7 +508,6 @@ Both have: atomic facts, supersession, user profiles, hybrid search, temporal gr
 
 ## Roadmap
 
-- **Chrome Web Store** — Browser extension submitted, pending review. Once approved, installable in one click.
 - **Voice I/O in chat** — Speech-to-text and text-to-speech in the Chat tab via the browser Web Speech API.
 - **HUD chat skin** — Optional Iron Man-inspired theme for the Chat tab (cyan accents, reactive SVG rings, CSS animations).
 - **Model Advisor v2** — Benchmark comparison and automatic backend suggestions when a faster or cheaper model fits the same enrichment role.

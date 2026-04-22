@@ -20,6 +20,51 @@ Template for upcoming changes. Move entries under a new version heading on relea
 
 ---
 
+## [1.2.0] - 2026-04-22 — Chrome Web Store + Dynamic Model Picker
+
+Minor release marking two step-changes: the browser extension is **live on the Chrome Web Store** (one-click install, no developer-mode gymnastics) and the dashboard's model selection moved from free-text to live provider catalogs.
+
+### Added
+
+#### Chrome Web Store availability
+
+- The TAILOR browser extension is published on the Chrome Web Store: [install page](https://chromewebstore.google.com/detail/tailor-%E2%80%94-ai-memory-captur/phkhilpdfpmlbnfficopnbflhpmnfdfe).
+- README install section rewritten to offer Chrome Web Store as the default path, with "developer mode from repo" kept as option B for contributors.
+- New Chrome Web Store badge in the README header.
+
+#### Dynamic model dropdown
+
+- New endpoint `GET /api/chat/models?provider=<anthropic|openai|google|deepseek>` — fetches the live list of chat/reasoning models from each provider's `/v1/models` endpoint, filters out embedding/audio/image/tts models, and caches per provider for 1 hour in memory. Drop-in for any UI that needs to populate a model dropdown.
+- Dashboard Config → **Chat interface** accordion: the per-row Model field is now a dropdown populated by the new endpoint (provider-aware, auto-refetched when the user flips the Provider select). Picks auto-fill Label with the model's display name when Label is empty or matches a prior auto-value. Fetch failures fall back to a free-text input so unlisted models stay usable.
+- Dashboard Config → **Default LLM** accordion: same dynamic dropdown replacing the hardcoded two-option `<select>`. When `llm.model` doesn't appear in `chat_interface.available_providers` a neutral info tooltip explains the two sections serve different audiences (system-wide default vs. web-chat curated list) — no save-time block.
+- Mobile Chat tab: the active model (or the pair selected for a new chat) is now tracked in the header badge via a new `mobileModelLabel` that falls through session pin → llm.* default → current dropdown pick.
+
+### Fixed
+
+- Chat model dropdown stuck on `Loading…` forever. The catalog prefetch used a `setModelCatalog` functional updater to mark "already fetching" before kicking off the HTTP request; React 18 batches the updater for the next render, so the guard flag stayed `false` every pass and `apiCall` was never reached. Replaced with a `fetchStateRef.current` map that's mutable synchronously across renders.
+
+### Changed (performance)
+
+- Dashboard static assets now ship with split cache policies:
+  - `vendor/*` and `icons/*` (stable across releases): `public, max-age=604800, immutable` — browsers and CDNs skip revalidation entirely.
+  - Everything else (index.jsx, chat.jsx, app-authored JS/CSS): `no-cache, must-revalidate` — revalidated on every load via conditional GET, 304 when unchanged.
+  - `/dashboard` (index.html) previously had no `Cache-Control` header at all, now also `no-cache, must-revalidate`.
+- Result: frontend changes show up immediately after deploy, without manual CDN purges or hard refreshes.
+
+### Docs
+
+- README roadmap: removed "Chrome Web Store — pending review" (shipped).
+- README hero features: MCP tools count bumped from 21 to 22 (reflects `kb_find_document` added in v1.1.1).
+
+### Stats
+
+- 7 commits since v1.1.1
+- 281 tests (baseline 273 + 8 new for `GET /api/chat/models`)
+- 1 new HTTP endpoint
+- 1 new significant frontend behaviour (dynamic dropdowns, 2 form integrations)
+
+---
+
 ## [1.1.1] - 2026-04-21 — Runtime Provider Switching + Document Access
 
 Patch release focused on two UX gaps surfaced while using v1.1.0 in production:
@@ -286,7 +331,8 @@ First public release. Self-hosted AI memory framework with persistent, searchabl
 
 ---
 
-[Unreleased]: https://github.com/tailormemory/tailor/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/tailormemory/tailor/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/tailormemory/tailor/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/tailormemory/tailor/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/tailormemory/tailor/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/tailormemory/tailor/releases/tag/v1.0.0
