@@ -1176,16 +1176,32 @@ class BearerAuthMiddleware:
         if not TAILOR_API_KEY and not path.startswith("/api/") and path != "/dashboard":
             await self.app(scope, receive, send)
             return
-        # Serve dashboard HTML
+        # Serve dashboard HTML.
+        # No-cache on the entry point so browsers/CDNs always revalidate with
+        # the server — otherwise a fresh deploy is invisible until every stale
+        # CDN edge expires (up to 7 days). The conditional GET round-trip is
+        # fast (304 if unchanged), and index.html is tiny.
         if path == "/dashboard":
             dashboard_path = os.path.join(BASE_DIR, "dashboard", "index.html")
             if os.path.exists(dashboard_path):
                 with open(dashboard_path, "r") as _df:
                     html = _df.read()
-                response = Response(content=html, status_code=200, media_type="text/html")
+                response = Response(content=html, status_code=200, media_type="text/html",
+                    headers={"Cache-Control": "no-cache, must-revalidate"})
                 await response(scope, receive, send)
                 return
-        # Serve dashboard static assets (icons, vendor js, images)
+        # Serve dashboard static assets (icons, vendor js, images).
+        # Cache strategy, two tiers:
+        #  - Vendor libraries and icons (paths starting with "vendor/" or
+        #    "icons/") are essentially immutable — same file across releases.
+        #    Cache hard for a week with "immutable" so browsers don't even
+        #    conditionally revalidate.
+        #  - Everything else — index.jsx, chat.jsx, any app-authored JS/CSS —
+        #    changes between deploys. Serve with "no-cache, must-revalidate"
+        #    so browser and CDN always re-check with the server. The server
+        #    returns 304 when the file hasn't changed (fast path), or 200 with
+        #    fresh bytes when it has. This eliminates the "hard-refresh to see
+        #    fixes" dance entirely.
         if path.startswith("/dashboard/") and path != "/dashboard" and path != "/dashboard/":
             import mimetypes
             # Resolve path relative to dashboard/ — strip leading /dashboard/
@@ -1197,8 +1213,12 @@ class BearerAuthMiddleware:
                 mime = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
                 with open(file_path, "rb") as _sf:
                     data = _sf.read()
+                is_vendor = rel.startswith("vendor/") or rel.startswith("icons/")
+                cache_header = ("public, max-age=604800, immutable"
+                                if is_vendor
+                                else "no-cache, must-revalidate")
                 response = Response(content=data, status_code=200, media_type=mime,
-                    headers={"Cache-Control": "public, max-age=604800"})
+                    headers={"Cache-Control": cache_header})
                 await response(scope, receive, send)
                 return
 
