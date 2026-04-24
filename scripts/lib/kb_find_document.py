@@ -64,20 +64,27 @@ def _score(query: str, meta: dict) -> tuple[int, float]:
     return 0, best
 
 
-def _download_url(file_path: str) -> str:
-    return f"/api/kb/document?path={quote(file_path, safe='')}" if file_path else ""
+def _download_url(file_path: str, base_url: str = "") -> str:
+    if not file_path:
+        return ""
+    prefix = base_url.rstrip("/") if base_url else ""
+    return f"{prefix}/api/kb/document?path={quote(file_path, safe='')}"
 
 
 def find_documents(
     query: str,
     chunks: list[tuple[str, dict]],
     n_results: int = 10,
+    base_url: str = "",
 ) -> list[dict]:
     """Rank documents by metadata fuzzy-match.
 
     chunks: list of (chunk_id, metadata) — pass every source=document chunk
     you want considered. Dedup-by-file_path and supersession filtering
     happen here.
+
+    base_url: optional absolute origin ("https://host[:port]") to prefix
+    each download_url. When empty, relative URLs are emitted.
     """
     # Group chunks by file_path — one result per document.
     groups: dict[str, dict] = {}
@@ -118,7 +125,7 @@ def find_documents(
             "file_path": fp,
             "folder": g["folder"],
             "file_type": g["file_type"],
-            "download_url": _download_url(fp),
+            "download_url": _download_url(fp, base_url),
             "last_indexed_date": last_indexed,
             "chunk_count": g["chunk_count"],
             "_tier": tier,

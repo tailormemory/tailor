@@ -510,7 +510,6 @@ Both have: atomic facts, supersession, user profiles, hybrid search, temporal gr
 
 ### Next up
 
-- **Absolute `download_url` in KB payloads** — `kb_search` / `kb_hybrid_search` / `kb_find_document` currently return relative paths (`/api/kb/document?path=...`) that some smaller LLMs hallucinate absolute hostnames for. Build absolute URLs server-side from the request host.
 - **English system prompt in `tailor.yaml.example`** — Ship a neutral, English-language `chat_interface.system_prompt` and `persona.system_prompt` with retry-on-miss guidance, domain-pattern hints, and source-citation rules, so fresh installs get the good prompt out of the box.
 - **Voice I/O in chat** — Speech-to-text and text-to-speech in the Chat tab via the browser Web Speech API.
 

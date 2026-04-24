@@ -42,8 +42,26 @@ def test_filename_exact_match_ranks_first():
     results = find_documents("report.pdf", chunks)
     assert results[0]["file_path"] == "Finance/report.pdf"
     assert results[0]["title"] == "report.pdf"
+    # Default (no base_url) → relative URL for backward compatibility.
     assert results[0]["download_url"] == (
         "/api/kb/document?path=Finance%2Freport.pdf"
+    )
+
+
+def test_base_url_produces_absolute_download_url():
+    chunks = [
+        _chunk(
+            "c1", title="report.pdf", file_path="Finance/report.pdf",
+            folder="Finance", file_type=".pdf",
+        ),
+    ]
+    results = find_documents(
+        "report.pdf", chunks, base_url="https://tailor.example.com",
+    )
+    url = results[0]["download_url"]
+    assert url.startswith("https://") or url.startswith("http://")
+    assert url == (
+        "https://tailor.example.com/api/kb/document?path=Finance%2Freport.pdf"
     )
 
 

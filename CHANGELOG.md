@@ -20,6 +20,40 @@ Template for upcoming changes. Move entries under a new version heading on relea
 
 ---
 
+## [1.2.1] - 2026-04-24 — Absolute `download_url` in KB payloads
+
+Patch release fixing a hallucination vector in KB search responses served to smaller LLMs.
+
+### Added
+
+- **`server.public_base_url` config key** — new top-level `server:` section in `config/tailor.yaml.example` for setting the absolute base URL used when constructing KB download links. Defaults to `null` (auto-detect from `Host` + `X-Forwarded-Proto` request headers). Set explicitly when a reverse proxy or tunnel (Cloudflare, nginx, Caddy, Traefik) doesn't forward those headers the way auto-detect expects.
+- **`_resolve_download_base_url(request)` helper** in `scripts/lib/kb_document_api.py` — single resolver consulted by `kb_search`, `kb_hybrid_search`, and `kb_find_document`. Returns `(base_url, source)` with `source ∈ {"config", "auto"}`, config taking precedence. Trailing-slash stripping is defensive (save-side validation already rejects them).
+- **Dashboard Config → Server accordion** — single-field form for `server.public_base_url` with help text and a browser-origin placeholder as a hint at what auto-detect would produce.
+- **`validate_server_section` config validator** in `scripts/lib/config_runtime.py` — rejects non-string, trailing-slash, and non-http(s) values on save with a clear 400. Prevents a typo from silently breaking every `download_url` emitted across the KB API.
+- **Startup log** — one-line stderr log of `server.public_base_url` when configured. Silent in the default (auto-detect) case to avoid noise.
+
+### Changed
+
+- **`kb_search`, `kb_hybrid_search`, `kb_find_document`** now emit absolute `download_url` values for `source=document` results when either (a) `server.public_base_url` is configured, or (b) the incoming request carries a resolvable `Host`. Previous behaviour (relative `/api/kb/document?path=...`) is preserved for callers outside an HTTP context and when no `base_url` is threaded through. Rationale: smaller LLMs (GPT-4o mini, Haiku, DeepSeek) hallucinate absolute hostnames from relative tool-payload URLs (observed `https://api.kb/...`, invented vanity domains). Giving them the real hostname up front removes the guesswork.
+- **`format_document_fileref(meta, base_url="")`** and **`find_documents(..., base_url="")`** gained a `base_url` keyword. Existing callers and tests that pass no `base_url` keep emitting relative URLs.
+
+### Fixed
+
+- Soft-reload correctly picks up `server.public_base_url` changes — the existing `config._config` cache-drop (phase 1 of `soft_reload()`) covers this field, so no MCP restart is needed when flipping the value from the dashboard.
+
+### Docs
+
+- Roadmap: removed "Absolute `download_url` in KB payloads" from **Next up** (shipped).
+
+### Stats
+
+- 1 new config key
+- 1 new section in `tailor.yaml.example`
+- 3 MCP tools updated (no breaking signature changes)
+- 310 tests passing (baseline + new unit, helper, validator, and integration tests)
+
+---
+
 ## [1.2.0] - 2026-04-22 — Chrome Web Store + Dynamic Model Picker
 
 Minor release marking two step-changes: the browser extension is **live on the Chrome Web Store** (one-click install, no developer-mode gymnastics) and the dashboard's model selection moved from free-text to live provider catalogs.

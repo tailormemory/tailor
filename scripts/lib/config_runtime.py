@@ -91,6 +91,40 @@ def check_blacklist(incoming: dict) -> str | None:
     return None
 
 
+_PUBLIC_BASE_URL_RE = re.compile(r"^https?://[^\s/]+(:\d+)?(/[^\s]*)?$")
+
+
+def validate_server_section(section: Any) -> tuple[bool, str]:
+    """Field-level validation for the `server:` block.
+
+    Today the only field under `server:` is `public_base_url`. Rules:
+      - null / missing / empty string → accept (auto-detect takes over).
+      - must be a string when set.
+      - no trailing slash — we append "/api/..." and a doubled "//" would
+        break every downstream URL.
+      - must match a plain http(s) scheme + host[:port] + optional path,
+        with no whitespace. A full URL parser would accept weird shapes
+        (userinfo, fragments, queries) we don't want in a base URL.
+    """
+    if section is None:
+        return True, ""
+    if not isinstance(section, dict):
+        return False, "server: must be a mapping"
+    url = section.get("public_base_url")
+    if url is None or url == "":
+        return True, ""
+    if not isinstance(url, str):
+        return False, "server.public_base_url must be a string or null"
+    if url.endswith("/"):
+        return False, "server.public_base_url must not have a trailing slash"
+    if not _PUBLIC_BASE_URL_RE.match(url):
+        return False, (
+            "server.public_base_url must be a valid http(s) URL "
+            "(e.g. https://tailor.example.com)"
+        )
+    return True, ""
+
+
 def validate_loadable(merged: dict) -> tuple[bool, str]:
     """Shape-check: does `merged` round-trip through yaml.safe_dump/safe_load
     without error and produce a dict?
@@ -523,6 +557,16 @@ def save_config(
     ok, err = validate_loadable(merged)
     if not ok:
         raise ConfigSaveError(400, f"Config validation failed: {err}")
+
+    # Field-level section validators. Only a handful of sections have rules
+    # strict enough to warrant catching on save (vs. at runtime); add more
+    # here as the need arises. `server:` has regex-constrained URLs so a
+    # typo would silently break download_url construction in every KB
+    # response — better to reject on save with a clear message.
+    if "server" in merged:
+        ok, err = validate_server_section(merged.get("server"))
+        if not ok:
+            raise ConfigSaveError(400, err)
 
     if dry_run:
         return {"ok": True, "dry_run": True, "backup": "", "reloaded": {}}

@@ -1266,7 +1266,7 @@
     //     (a single error string from the backend, not per-field yet)
     const RUNTIME_EDITABLE_SECTIONS = [
       "chat_interface", "llm", "classifier", "embedding",
-      "persona", "branding", "user",
+      "persona", "branding", "user", "server",
     ];
 
     // Provider dropdown for the runtime editor — kept separate from the
@@ -2436,6 +2436,28 @@
         ),
       );
 
+      // ── Server ─────────────────────────────────────────────
+      // public_base_url controls the absolute prefix on KB download URLs.
+      // Placeholder shows the browser's current origin as a hint at what
+      // auto-detect would produce if the reverse proxy forwards headers
+      // correctly; it's best-effort — the server may still see different
+      // Host / X-Forwarded-Proto values.
+      const ds = d.server || {};
+      const browserOrigin = (typeof window !== "undefined" && window.location)
+        ? `${window.location.protocol}//${window.location.host}`
+        : "";
+      const serverFields = React.createElement("div", null,
+        React.createElement(Field, { id: "server.public_base_url", label: "Public base URL",
+          help: "Leave empty to auto-detect from request headers (Host + X-Forwarded-Proto). Set explicitly if your reverse proxy doesn't forward these correctly. Example: https://tailor.example.com (no trailing slash)." },
+          React.createElement(TextInput, {
+            id: "server.public_base_url",
+            value: ds.public_base_url || "",
+            placeholder: browserOrigin,
+            onChange: v => patch("server", { public_base_url: v ? v : null }),
+          }),
+        ),
+      );
+
       // ── Outer render ───────────────────────────────────────
       //
       // Wrap in RuntimeEditorCtx.Provider so the hoisted helpers
@@ -2513,6 +2535,8 @@
                 subtitle: "App name" }, brandingFields),
               React.createElement(AccSection, { id: "user", title: "About you", icon: "\u{1F464}",
                 subtitle: "Name, bio, language" }, userFields),
+              React.createElement(AccSection, { id: "server", title: "Server", icon: "\u{1F310}",
+                subtitle: "Public base URL for absolute download links" }, serverFields),
             )
           : React.createElement("div", null,
               // Mobile hint: CM5 is usable but cramped on small screens.

@@ -12,6 +12,19 @@ paths:
   backups: ./backups
   models: ./models
 
+# ── Server ────────────────────────────────────────────────────
+# HTTP server settings for the MCP endpoint and dashboard.
+server:
+  # Public base URL used to construct absolute links (e.g. download URLs
+  # for KB documents served via /api/kb/document).
+  # Set this if you expose TAILOR through a reverse proxy or tunnel
+  # (Cloudflare, nginx, Caddy, Traefik) and auto-detection from request
+  # headers gives incorrect results.
+  # Leave null to auto-detect from Host + X-Forwarded-Proto headers.
+  # Example: https://tailor.example.com
+  # No trailing slash.
+  public_base_url: null
+
 # ── User Identity ─────────────────────────────────────────────
 # Used by profile generation, fact supersession, and persona prompt.
 user:

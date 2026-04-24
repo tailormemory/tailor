@@ -37,6 +37,7 @@ from scripts.lib.config_runtime import (  # noqa: E402
     soft_reload,
     trigger_self_restart,
     validate_loadable,
+    validate_server_section,
     write_pending_save,
 )
 
@@ -170,6 +171,89 @@ def test_save_rejects_yaml_unloadable_after_merge(config_path):
         save_config(bad, config_path)
     assert exc.value.status == 400
     assert open(config_path).read() == before
+
+
+# ── validate_server_section ─────────────────────────────────────
+
+
+@pytest.mark.parametrize("value", [
+    None,                        # null explicitly — auto-detect
+    "",                          # empty string — auto-detect
+    "http://localhost:8787",     # dev default
+    "https://tailor.example.com",
+    "https://tailor.example.com:8443",
+    "https://example.com/tailor",  # sub-path is allowed (proxy mount)
+])
+def test_validate_server_section_accepts_valid(value):
+    ok, err = validate_server_section({"public_base_url": value})
+    assert ok, err
+
+
+@pytest.mark.parametrize("value,hint", [
+    ("https://tailor.example.com/", "trailing slash"),
+    ("not-a-url", "valid http(s) URL"),
+    ("ftp://example.com", "valid http(s) URL"),
+    ("https://host with spaces.com", "valid http(s) URL"),
+    ("  ", "valid http(s) URL"),
+    (42, "must be a string"),
+])
+def test_validate_server_section_rejects_invalid(value, hint):
+    ok, err = validate_server_section({"public_base_url": value})
+    assert not ok
+    assert hint in err
+
+
+def test_validate_server_section_accepts_missing_section():
+    ok, err = validate_server_section(None)
+    assert ok and err == ""
+
+
+def test_validate_server_section_empty_dict_is_ok():
+    ok, err = validate_server_section({})
+    assert ok and err == ""
+
+
+def test_save_rejects_invalid_public_base_url(config_path):
+    before = open(config_path).read()
+    with pytest.raises(ConfigSaveError) as exc:
+        save_config(
+            {"server": {"public_base_url": "https://example.com/"}},
+            config_path,
+        )
+    assert exc.value.status == 400
+    assert "trailing slash" in exc.value.message
+    assert open(config_path).read() == before, "file must be untouched on 400"
+
+
+def test_save_rejects_garbage_public_base_url(config_path):
+    with pytest.raises(ConfigSaveError) as exc:
+        save_config(
+            {"server": {"public_base_url": "not a url at all"}},
+            config_path,
+        )
+    assert exc.value.status == 400
+
+
+def test_save_accepts_valid_public_base_url(config_path):
+    result = save_config(
+        {"server": {"public_base_url": "https://tailor.example.com"}},
+        config_path,
+    )
+    assert result["ok"] is True
+    # Verify the merged config now contains the server section.
+    reloaded = yaml.safe_load(open(config_path).read())
+    assert reloaded["server"]["public_base_url"] == "https://tailor.example.com"
+
+
+def test_save_accepts_null_public_base_url(config_path):
+    # null is the documented "leave unset to auto-detect" value.
+    result = save_config(
+        {"server": {"public_base_url": None}},
+        config_path,
+    )
+    assert result["ok"] is True
+    reloaded = yaml.safe_load(open(config_path).read())
+    assert reloaded["server"]["public_base_url"] is None
 
 
 # ── Backup + rotation ───────────────────────────────────────────

@@ -193,6 +193,20 @@ if not TAILOR_API_KEY:
 if not OPENAI_API_KEY:
     print("\u26a0\ufe0f  OPENAI_API_KEY non impostata. Entity extraction inline disabilitata.", file=sys.stderr)
 
+# Log the configured public base URL when set. When unset, the server
+# auto-detects per-request from Host + X-Forwarded-Proto headers; staying
+# silent in that (default) case keeps startup output clean.
+try:
+    from scripts.lib.config import get as _cfg_get_pub
+    _configured_public_base_url = _cfg_get_pub("server", "public_base_url")
+except Exception:
+    _configured_public_base_url = None
+if _configured_public_base_url:
+    print(
+        f"[tailor] server.public_base_url: {_configured_public_base_url} (from config)",
+        file=sys.stderr, flush=True,
+    )
+
 
 # ============================================================
 # MIDDLEWARE AUTENTICAZIONE
@@ -1640,7 +1654,29 @@ def is_superseded(meta: dict) -> bool:
 
 # Helper lives in scripts.lib.kb_document_api so tests can import it without
 # pulling in the full MCP server (ChromaDB, FastMCP, embedding model...).
-from scripts.lib.kb_document_api import format_document_fileref  # noqa: E402
+from scripts.lib.kb_document_api import (  # noqa: E402
+    _resolve_download_base_url,
+    format_document_fileref,
+)
+
+
+def _current_mcp_request():
+    """Return the Starlette Request driving the current MCP tool call, or
+    None if the tool is invoked outside an HTTP context (e.g. stdio, tests).
+
+    FastMCP's streamable-HTTP transport attaches the Starlette Request to
+    the RequestContext via a contextvar. We read it so download-URL
+    construction can consult the incoming Host / X-Forwarded-Proto headers
+    when server.public_base_url is unset.
+    """
+    try:
+        from mcp.server.lowlevel.server import request_ctx
+        ctx = request_ctx.get(None)
+    except Exception:
+        return None
+    if ctx is None:
+        return None
+    return getattr(ctx, "request", None)
 
 
 def filter_superseded(ids: list, documents: list, metadatas: list, distances: list | None = None, n_results: int | None = None) -> dict:
@@ -1708,6 +1744,8 @@ def kb_search(query: str, n_results: int = 5, source_filter: str = "", include_s
         reranked_ids = [item["id"] for item in kb_items]
         chunk_facts = get_facts_for_chunks(reranked_ids)
 
+        base_url, _ = _resolve_download_base_url(_current_mcp_request())
+
         output = []
         for i, item in enumerate(kb_items):
             cid, doc, meta, distance = item["id"], item["doc"], item["meta"], item.get("distance", 0)
@@ -1718,7 +1756,7 @@ def kb_search(query: str, n_results: int = 5, source_filter: str = "", include_s
             category = meta.get("category", "")
             extra = " | ".join(filter(None, [folder, doc_type, f"[{category}]" if category else ""]))
             facts_block = format_facts_block(chunk_facts.get(cid, []))
-            fileref = format_document_fileref(meta)
+            fileref = format_document_fileref(meta, base_url=base_url)
             output.append(
                 f"--- Result {i+1} (relevance: {relevance:.2f}) ---\n"
                 f"Conversazione: {meta.get('title', 'N/A')}\n"
@@ -1898,6 +1936,8 @@ def kb_hybrid_search(query: str, n_results: int = 10, source_filter: str = "", i
         top_chunk_ids = [cid for cid, _ in top_items]
         chunk_facts = get_facts_for_chunks(top_chunk_ids)
 
+        base_url, _ = _resolve_download_base_url(_current_mcp_request())
+
         for i, (cid, item) in enumerate(top_items):
             meta = item["meta"]
             source = meta.get("source", "")
@@ -1909,7 +1949,7 @@ def kb_hybrid_search(query: str, n_results: int = 10, source_filter: str = "", i
             score_str = f"{item['score']:.2f}" if item["source_type"] == "semantic" else "entity"
 
             facts_block = format_facts_block(chunk_facts.get(cid, []))
-            fileref = format_document_fileref(meta)
+            fileref = format_document_fileref(meta, base_url=base_url)
             output.append(
                 f"--- Result {i+1} [{tag} {score_str}] ---\n"
                 f"Titolo: {meta.get('title', 'N/A')}\n"
@@ -2178,7 +2218,10 @@ def kb_find_document(query: str, n_results: int = 10) -> list[dict]:
             if len(ids) < BATCH:
                 break
             offset += len(ids)
-        return find_documents(query, all_chunks, n_results=n_results)
+        base_url, _ = _resolve_download_base_url(_current_mcp_request())
+        return find_documents(
+            query, all_chunks, n_results=n_results, base_url=base_url,
+        )
     except Exception as e:
         return [{"error": f"kb_find_document error: {str(e)}"}]
 

@@ -18,7 +18,48 @@ from urllib.parse import quote, unquote
 from starlette.responses import Response
 
 
-def format_document_fileref(meta: dict) -> str:
+def _resolve_download_base_url(request) -> tuple[str, str]:
+    """Resolve the public base URL for constructing absolute download links.
+
+    Returns (base_url, source) where source ∈ {"config", "auto"}. `base_url`
+    has no trailing slash.
+
+    Precedence:
+      1. server.public_base_url from tailor.yaml if set and non-empty.
+      2. Auto-detect from the incoming request's Host / X-Forwarded-Proto
+         headers. Falls back to http://localhost:8787 when no request is
+         available (e.g. a direct tool call outside an HTTP context).
+
+    Smaller LLMs hallucinate absolute hostnames when they see relative URLs
+    in tool payloads; this helper is what makes the emitted download_url
+    absolute so they have something real to parrot back.
+    """
+    # 1. Explicit config wins — set via the dashboard when the reverse proxy
+    # doesn't forward Host / X-Forwarded-Proto the way we'd auto-detect.
+    try:
+        from scripts.lib.config import get as _cfg_get
+        configured = _cfg_get("server", "public_base_url")
+    except Exception:
+        configured = None
+    if configured:
+        s = str(configured).strip()
+        if s:
+            return (s.rstrip("/"), "config")
+
+    # 2. Auto-detect from request headers.
+    host = "localhost:8787"
+    proto = "http"
+    if request is not None:
+        try:
+            headers = request.headers
+            host = headers.get("host") or host
+            proto = headers.get("x-forwarded-proto") or proto
+        except Exception:
+            pass
+    return (f"{proto}://{host}", "auto")
+
+
+def format_document_fileref(meta: dict, base_url: str = "") -> str:
     """Render the file_path / file_type / folder / download_url lines for
     document-sourced KB search results.
 
@@ -26,13 +67,22 @@ def format_document_fileref(meta: dict) -> str:
     absent (not null, not present-with-empty-value) in the rendered output
     for non-document results. The download_url is only emitted when a
     file_path is present; the path component is URL-encoded with safe=''.
+
+    When `base_url` is non-empty, the download_url is emitted as an
+    absolute URL ("{base_url}/api/kb/document?path=..."). When empty, a
+    relative URL is emitted for backward compatibility with tests and
+    callers that don't have a request in scope.
     """
     if (meta or {}).get("source") != "document":
         return ""
     file_path = meta.get("file_path", "") or ""
     file_type = meta.get("file_type", "") or ""
     folder = meta.get("folder", "") or ""
-    download_url = f"/api/kb/document?path={quote(file_path, safe='')}" if file_path else ""
+    if file_path:
+        prefix = base_url.rstrip("/") if base_url else ""
+        download_url = f"{prefix}/api/kb/document?path={quote(file_path, safe='')}"
+    else:
+        download_url = ""
     return (
         f"file_path: {file_path}\n"
         f"file_type: {file_type}\n"
