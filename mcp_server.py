@@ -3209,13 +3209,27 @@ class _RedactTokenFilter(logging.Filter):
 
 
 if __name__ == "__main__":
-    # Install token-redaction filter on uvicorn.access BEFORE serve() spins up.
-    logging.getLogger("uvicorn.access").addFilter(_RedactTokenFilter())
+    # Build a uvicorn LOGGING_CONFIG with our token-redaction filter wired in
+    # at config-time so it survives uvicorn's dictConfig() during serve().
+    from copy import deepcopy
+    from uvicorn.config import LOGGING_CONFIG as _UVICORN_LOG_CFG
+    _log_cfg = deepcopy(_UVICORN_LOG_CFG)
+    _log_cfg.setdefault("filters", {})["redact_token"] = {
+        "()": "__main__._RedactTokenFilter",
+    }
+    _log_cfg["loggers"]["uvicorn.access"]["filters"] = ["redact_token"]
 
     async def run():
         starlette_app = mcp.streamable_http_app()
         authed_app = BearerAuthMiddleware(starlette_app)
-        config = uvicorn.Config(authed_app, host="0.0.0.0", port=SERVER_PORT, log_level="info", timeout_keep_alive=30)
+        config = uvicorn.Config(
+            authed_app,
+            host="0.0.0.0",
+            port=SERVER_PORT,
+            log_level="info",
+            log_config=_log_cfg,
+            timeout_keep_alive=30,
+        )
         server = uvicorn.Server(config)
         await server.serve()
 

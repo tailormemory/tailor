@@ -114,3 +114,51 @@ def test_filter_returns_true_always(filter_class):
     for path, ver in cases:
         r = _make_record("1.2.3.4:0", "GET", path, ver, 200)
         assert f.filter(r) is True
+
+
+def test_filter_survives_uvicorn_dictconfig():
+    """End-to-end: uvicorn calls dictConfig(LOGGING_CONFIG_with_filter) during
+    serve(). The filter must remain wired to uvicorn.access after that.
+
+    This caught a regression where addFilter() at module import was wiped out
+    by uvicorn's own dictConfig call. Fix: build log_config with the filter
+    declaratively and pass via uvicorn.Config(log_config=...).
+    """
+    import io
+    import logging
+    import logging.config
+    from copy import deepcopy
+
+    import mcp_server
+    from uvicorn.config import LOGGING_CONFIG
+
+    # In production mcp_server.py runs as __main__ and references
+    # "__main__._RedactTokenFilter". In tests pytest is __main__, so we
+    # reference the class via its actual module path. Both forms exercise
+    # the same dictConfig resolution path.
+    log_cfg = deepcopy(LOGGING_CONFIG)
+    log_cfg.setdefault("filters", {})["redact_token"] = {
+        "()": "mcp_server._RedactTokenFilter",
+    }
+    log_cfg["loggers"]["uvicorn.access"]["filters"] = ["redact_token"]
+
+    logging.config.dictConfig(log_cfg)
+
+    acc = logging.getLogger("uvicorn.access")
+    assert any(
+        f.__class__.__name__ == "_RedactTokenFilter" for f in acc.filters
+    ), "filter not installed on uvicorn.access after dictConfig"
+
+    # Capture the formatted output
+    buf = io.StringIO()
+    for h in acc.handlers:
+        if hasattr(h, "stream"):
+            h.stream = buf
+
+    acc.info(
+        '%s - "%s %s HTTP/%s" %d',
+        "1.2.3.4:0", "GET", "/mcp?token=THIS_MUST_NOT_LEAK", "1.1", 200,
+    )
+    out = buf.getvalue()
+    assert "THIS_MUST_NOT_LEAK" not in out, f"raw token leaked into log: {out!r}"
+    assert "token=REDACTED" in out, f"redaction not applied: {out!r}"
