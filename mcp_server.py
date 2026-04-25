@@ -83,6 +83,8 @@ import signal
 import anyio
 from filelock import FileLock
 import uvicorn
+import re
+import logging
 from datetime import datetime
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -3183,7 +3185,33 @@ def update_profile(fact: str, action: str = "add") -> str:
 # AVVIO SERVER CON AUTH MIDDLEWARE
 # ============================================================
 
+class _RedactTokenFilter(logging.Filter):
+    """Redact `token=<hex>` query-param values in uvicorn.access log records.
+
+    uvicorn.access records carry args = (client_addr, method, full_path,
+    http_version, status_code). The token, when present, lives in
+    `full_path` (record.args[2]). We rewrite it in place before the
+    AccessFormatter renders the line.
+    """
+
+    _TOKEN_RE = re.compile(r"(token=)[^&\s]+", re.IGNORECASE)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = getattr(record, "args", None)
+        if not args or not isinstance(args, tuple) or len(args) < 3:
+            return True
+        full_path = args[2]
+        if not isinstance(full_path, str) or "token=" not in full_path.lower():
+            return True
+        redacted = self._TOKEN_RE.sub(r"\1REDACTED", full_path)
+        record.args = args[:2] + (redacted,) + args[3:]
+        return True
+
+
 if __name__ == "__main__":
+    # Install token-redaction filter on uvicorn.access BEFORE serve() spins up.
+    logging.getLogger("uvicorn.access").addFilter(_RedactTokenFilter())
+
     async def run():
         starlette_app = mcp.streamable_http_app()
         authed_app = BearerAuthMiddleware(starlette_app)
