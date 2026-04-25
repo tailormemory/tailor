@@ -2058,17 +2058,22 @@ def kb_search_docs(query: str, folder: str = "", doc_type: str = "", n_results: 
         # Lookup fatti atomici
         chunk_facts = get_facts_for_chunks(f["ids"])
 
+        # Resolve absolute base URL once (matches kb_search / kb_hybrid_search pattern).
+        base_url, _ = _resolve_download_base_url(_current_mcp_request())
+
         output = []
         for i, (cid, doc, meta, distance) in enumerate(zip(
             f["ids"], f["documents"], f["metadatas"], f["distances"]
         )):
             relevance = max(0, 1 - distance)
             facts_block = format_facts_block(chunk_facts.get(cid, []))
+            fileref = format_document_fileref(meta, base_url=base_url)
             output.append(
                 f"--- Result {i+1} (relevance: {relevance:.2f}) ---\n"
                 f"File: {meta.get('title', 'N/A')}\n"
                 f"Cartella: {meta.get('folder', 'N/A')} | Tipo: {meta.get('doc_type', 'N/A')}\n"
                 f"Data: {meta.get('date', 'N/A')}\n"
+                + fileref +
                 f"---\n{doc[:2000]}{facts_block}\n"
             )
         return "\n".join(output)
