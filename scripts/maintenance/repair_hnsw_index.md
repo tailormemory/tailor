@@ -125,5 +125,5 @@ A note on classification: the **Phase A** human forensic analysis grouped the 66
 - **Affected versions**: ChromaDB 1.x — observed on `chromadb==1.5.5`.
 - **Symptom**: `embeddings.max_seq_id` for the metadata segment advances after a successful `collection.upsert()` / `.delete()`, but the on-disk HNSW pickle is missing those entries. Once the vector segment's `max_seq_id` also advances, `embeddings_queue` rows are purged, and the drift becomes unrecoverable without re-embedding.
 - **Trigger** (incomplete): some combination of MCP maintenance-mode handoff (SIGUSR1 drops the client reference) overlapping with the start of the ingest's own client. Out of ~155k chunks ingested across several months, only one window of 116 chunks (66 + 50) drifted. Reproduction conditions are not yet confirmed.
-- **Expected resolution**: upstream fix in chromadb. GitHub issue link: `https://github.com/chroma-core/chroma/issues/TBD` (placeholder until filed).
+- **Expected resolution**: upstream fix in chromadb. GitHub issue: [chroma-core/chroma#6975](https://github.com/chroma-core/chroma/issues/6975).
 - **Mitigation**: this tool, plus the planned post-ingest verifier in `scripts/ingest/ingest_docs.py` (tracked for v1.2.3).
