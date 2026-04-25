@@ -1,0 +1,533 @@
+"""Tests for scripts.maintenance.repair_hnsw_index.
+
+The script reads a ChromaDB SQLite + the HNSW segment's
+`index_metadata.pickle` to detect drift, and uses
+`collection.upsert()` to repair SQL-only orphans. Tests build a
+synthetic minimal Chroma layout under a tmp_path and exercise the
+audit/apply/refusal paths without requiring chromadb to be installed
+or the live DB to be touched.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import pickle
+import sqlite3
+import sys
+import time
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, "scripts", "maintenance"))
+
+import repair_hnsw_index as rhi  # noqa: E402
+
+
+# ============================================================
+# FIXTURES
+# ============================================================
+
+
+META_SEG_ID = "meta-seg-test"
+VEC_SEG_ID = "vec-seg-test"
+COLLECTION_ID = "coll-test"
+
+
+def _make_chroma_sqlite(db_path: str, *, embeddings: list[dict], queue_ids: list[str] | None = None) -> None:
+    """Create a minimal Chroma-shaped SQLite at db_path.
+
+    Each entry in `embeddings` is a dict with keys:
+        embedding_id (str), int_id (int), metadata (dict)
+    All embeddings are attached to the metadata segment.
+    """
+    queue_ids = queue_ids or []
+    con = sqlite3.connect(db_path)
+    cur = con.cursor()
+    cur.executescript(
+        """
+        CREATE TABLE segments (
+            id TEXT PRIMARY KEY,
+            type TEXT,
+            scope TEXT,
+            collection TEXT
+        );
+        CREATE TABLE embeddings (
+            id INTEGER PRIMARY KEY,
+            segment_id TEXT NOT NULL,
+            embedding_id TEXT NOT NULL,
+            seq_id BLOB NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (segment_id, embedding_id)
+        );
+        CREATE TABLE embedding_metadata (
+            id INTEGER REFERENCES embeddings(id),
+            key TEXT NOT NULL,
+            string_value TEXT,
+            int_value INTEGER,
+            float_value REAL,
+            bool_value INTEGER,
+            PRIMARY KEY (id, key)
+        );
+        CREATE TABLE embeddings_queue (
+            seq_id INTEGER PRIMARY KEY,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            operation INTEGER NOT NULL,
+            topic TEXT NOT NULL,
+            id TEXT NOT NULL,
+            vector BLOB,
+            encoding TEXT,
+            metadata TEXT
+        );
+        CREATE TABLE max_seq_id (
+            segment_id TEXT PRIMARY KEY,
+            seq_id INTEGER
+        );
+        CREATE TABLE maintenance_log (
+            id INT PRIMARY KEY,
+            timestamp INT NOT NULL,
+            operation TEXT NOT NULL
+        );
+        """
+    )
+    cur.execute("INSERT INTO segments VALUES (?, ?, ?, ?)", (META_SEG_ID, "urn:chroma:segment/metadata/sqlite", "METADATA", COLLECTION_ID))
+    cur.execute("INSERT INTO segments VALUES (?, ?, ?, ?)", (VEC_SEG_ID, "urn:chroma:segment/vector/hnsw-local-persisted", "VECTOR", COLLECTION_ID))
+
+    for e in embeddings:
+        cur.execute(
+            "INSERT INTO embeddings (id, segment_id, embedding_id, seq_id) VALUES (?, ?, ?, ?)",
+            (e["int_id"], META_SEG_ID, e["embedding_id"], e["int_id"]),
+        )
+        for key, val in e["metadata"].items():
+            sv = iv = fv = bv = None
+            if isinstance(val, bool):
+                bv = 1 if val else 0
+            elif isinstance(val, int):
+                iv = val
+            elif isinstance(val, float):
+                fv = val
+            else:
+                sv = str(val) if val is not None else None
+            cur.execute(
+                "INSERT INTO embedding_metadata (id, key, string_value, int_value, float_value, bool_value) VALUES (?, ?, ?, ?, ?, ?)",
+                (e["int_id"], key, sv, iv, fv, bv),
+            )
+    seq = 1000
+    for qid in queue_ids:
+        cur.execute(
+            "INSERT INTO embeddings_queue (seq_id, operation, topic, id) VALUES (?, ?, ?, ?)",
+            (seq, 2, "default", qid),
+        )
+        seq += 1
+    cur.execute("INSERT INTO max_seq_id VALUES (?, ?)", (META_SEG_ID, seq))
+    cur.execute("INSERT INTO max_seq_id VALUES (?, ?)", (VEC_SEG_ID, 1000))
+    con.commit()
+    con.close()
+
+
+def _make_hnsw_pickle(db_dir: str, vec_seg_id: str, hnsw_ids: list[str]) -> None:
+    seg_dir = os.path.join(db_dir, vec_seg_id)
+    os.makedirs(seg_dir, exist_ok=True)
+    payload = {
+        "dimensionality": 768,
+        "total_elements_added": len(hnsw_ids),
+        "max_seq_id": None,
+        "id_to_label": {hid: i for i, hid in enumerate(hnsw_ids)},
+        "label_to_id": {i: hid for i, hid in enumerate(hnsw_ids)},
+        "id_to_seq_id": {},
+    }
+    with open(os.path.join(seg_dir, "index_metadata.pickle"), "wb") as f:
+        pickle.dump(payload, f)
+
+
+def _make_doc_chunk(int_id: int, embedding_id: str, conv_id: str, title: str, chunk_index: int, text: str = "doc body text") -> dict:
+    return {
+        "int_id": int_id,
+        "embedding_id": embedding_id,
+        "metadata": {
+            "source": "document",
+            "conv_id": conv_id,
+            "title": title,
+            "chunk_index": chunk_index,
+            "folder": "Wealth",
+            "doc_type": "spreadsheet",
+            "chroma:document": text,
+            "char_count": len(text),
+        },
+    }
+
+
+def _make_summary_chunk(int_id: int, embedding_id: str, text: str = "[RIASSUNTO] summary text") -> dict:
+    return {
+        "int_id": int_id,
+        "embedding_id": embedding_id,
+        "metadata": {
+            "source": "document",
+            "conv_id": "doc_summary_20260416",
+            "title": "summary.pdf",
+            "chunk_index": -1,
+            "chroma:document": text,
+            "char_count": len(text),
+        },
+    }
+
+
+@pytest.fixture
+def synthetic_db(tmp_path, monkeypatch):
+    """Build a Chroma-shaped DB with: 2 healthy doc chunks, 3 SQL-only doc orphans,
+    1 SQL-only summary orphan, 2 HNSW-only ghosts (under a doc_<hash> not in registry)."""
+    db_dir = tmp_path / "db"
+    db_dir.mkdir()
+    db_path = db_dir / "chroma.sqlite3"
+
+    healthy = [
+        _make_doc_chunk(1, "doc_aaaaaaaaaaaa_chunk_0000", "doc_aaaaaaaaaaaa", "healthy.pdf", 0, "healthy chunk 0"),
+        _make_doc_chunk(2, "doc_aaaaaaaaaaaa_chunk_0001", "doc_aaaaaaaaaaaa", "healthy.pdf", 1, "healthy chunk 1"),
+    ]
+    orphans = [
+        _make_doc_chunk(10, "doc_bbbbbbbbbbbb_chunk_0000", "doc_bbbbbbbbbbbb", "orphan.pdf", 0, "orphan body 0"),
+        _make_doc_chunk(11, "doc_bbbbbbbbbbbb_chunk_0001", "doc_bbbbbbbbbbbb", "orphan.pdf", 1, "orphan body 1"),
+        _make_doc_chunk(12, "doc_cccccccccccc_chunk_0000", "doc_cccccccccccc", "lonely.pdf", 0, "lonely body"),
+        _make_summary_chunk(20, "doc_summary_aaaa1111", "summary text alpha"),
+    ]
+    embeddings = healthy + orphans
+
+    hnsw_ids = [
+        "doc_aaaaaaaaaaaa_chunk_0000",
+        "doc_aaaaaaaaaaaa_chunk_0001",
+        # ghosts (not in SQL):
+        "doc_dddddddddddd_chunk_0000",
+        "doc_dddddddddddd_chunk_0001",
+    ]
+
+    _make_chroma_sqlite(str(db_path), embeddings=embeddings, queue_ids=[])
+    _make_hnsw_pickle(str(db_dir), VEC_SEG_ID, hnsw_ids)
+
+    # doc_registry only contains the live doc (so doc_dddd... is correctly classified
+    # as superseded). doc_bbbb / cccc must be in registry for orphans to be repairable
+    # (the audit doesn't require this, but it's realistic).
+    registry = {
+        "/cloud/healthy.pdf": {"hash": "aaaaaaaaaaaaaaaa", "chunks": 2},
+        "/cloud/orphan.pdf": {"hash": "bbbbbbbbbbbbbbbb", "chunks": 2},
+        "/cloud/lonely.pdf": {"hash": "ccccccccccccccccc", "chunks": 1},
+    }
+    (db_dir / "doc_registry.json").write_text(json.dumps(registry))
+
+    # Point module-level constants at the synthetic dirs
+    monkeypatch.setattr(rhi, "BASE_DIR", str(tmp_path))
+    monkeypatch.setattr(rhi, "DB_DIR", str(db_dir))
+    monkeypatch.setattr(rhi, "DB_PATH", str(db_path))
+    monkeypatch.setattr(rhi, "BACKUPS_DIR", str(tmp_path / "backups"))
+    monkeypatch.setattr(rhi, "MAINTENANCE_LOCK", str(tmp_path / "maintenance.lock"))
+    monkeypatch.setattr(rhi, "AUDIT_HISTORY_DIR", str(tmp_path / "logs" / "hnsw_audits"))
+
+    return {
+        "tmp_path": tmp_path,
+        "db_path": str(db_path),
+        "db_dir": str(db_dir),
+        "audit_dir": str(tmp_path / "logs" / "hnsw_audits"),
+        "backups_dir": str(tmp_path / "backups"),
+        "lock_path": str(tmp_path / "maintenance.lock"),
+        "expected_orphan_ids": [
+            "doc_bbbbbbbbbbbb_chunk_0000",
+            "doc_bbbbbbbbbbbb_chunk_0001",
+            "doc_cccccccccccc_chunk_0000",
+            "doc_summary_aaaa1111",
+        ],
+        "expected_ghost_ids": [
+            "doc_dddddddddddd_chunk_0000",
+            "doc_dddddddddddd_chunk_0001",
+        ],
+    }
+
+
+class FakeCollection:
+    """Stand-in for chromadb.Collection. Records upsert() calls."""
+
+    def __init__(self):
+        self.upsert_calls: list[dict] = []
+
+    def upsert(self, *, ids, embeddings, documents, metadatas):
+        assert len(ids) == len(embeddings) == len(documents) == len(metadatas)
+        self.upsert_calls.append({
+            "ids": list(ids),
+            "embeddings": [list(e) for e in embeddings],
+            "documents": list(documents),
+            "metadatas": [dict(m) for m in metadatas],
+        })
+
+
+def _deterministic_embed(texts):
+    """Embedding mock: hash each text into a 4-dim vector. Deterministic, reproducible."""
+    out = []
+    for t in texts:
+        h = hash(t)
+        out.append([
+            ((h >> 0) & 0xFFFF) / 65535.0,
+            ((h >> 16) & 0xFFFF) / 65535.0,
+            ((h >> 32) & 0xFFFF) / 65535.0,
+            ((h >> 48) & 0xFFFF) / 65535.0,
+        ])
+    return out
+
+
+# ============================================================
+# TESTS
+# ============================================================
+
+
+def test_audit_dry_run_reports_known_drift(synthetic_db):
+    """B.4.1 — Audit-mode dry-run on synthetic collection produces expected report."""
+    report = rhi.audit(db_path=synthetic_db["db_path"], db_dir=synthetic_db["db_dir"])
+    assert report.sql_only_count == 4  # 3 doc orphans + 1 summary
+    assert report.hnsw_only_count == 2
+    assert report.queue_total == 0
+    assert report.unknown_count == 0
+    found_orphans = sorted(o.embedding_id for o in report.sql_only_orphans)
+    assert found_orphans == sorted(synthetic_db["expected_orphan_ids"])
+    found_ghosts = sorted(g.embedding_id for g in report.hnsw_only_ghosts)
+    assert found_ghosts == sorted(synthetic_db["expected_ghost_ids"])
+
+    text = rhi.format_report_human(report)
+    assert "SQL-only orphans:" in text
+    assert "doc_bbbbbbbbbbbb" in text
+    # Grouping is by conv_id, not embedding_id
+    assert "doc_summary_20260416" in text
+    assert "doc_dddddddddddd" in text
+    assert "[known_document]" in text
+    assert "[known_summary]" in text
+    assert "[known_superseded_doc]" in text
+    assert "UNEXPECTED DRIFT TYPES" in text
+    assert "  none" in text
+
+
+def test_apply_repairs_orphans_via_upsert(synthetic_db):
+    """B.4.5 — Apply correctly re-embeds and upserts SQL-only orphans."""
+    report = rhi.audit(db_path=synthetic_db["db_path"], db_dir=synthetic_db["db_dir"])
+    coll = FakeCollection()
+    result = rhi.repair(report, embed_fn=_deterministic_embed, collection=coll, batch_size=2)
+    assert result["repaired"] == 4
+    assert result["skipped_oversize"] == 0
+    upserted_ids = [i for call in coll.upsert_calls for i in call["ids"]]
+    assert sorted(upserted_ids) == sorted(synthetic_db["expected_orphan_ids"])
+
+    # Each upsert call must include parallel embeddings/documents/metadatas
+    for call in coll.upsert_calls:
+        assert all(isinstance(e, list) and len(e) == 4 for e in call["embeddings"])
+        # chroma:document must NOT be passed in metadatas (it's the documents arg)
+        for m in call["metadatas"]:
+            assert "chroma:document" not in m
+            assert "__int_id__" not in m
+
+    # documents arg passed verbatim from chroma:document for all sources
+    for call in coll.upsert_calls:
+        for eid, doc, meta in zip(call["ids"], call["documents"], call["metadatas"]):
+            assert meta.get("source") == "document"
+            if eid.startswith("doc_summary_"):
+                assert doc == "summary text alpha"  # raw chroma:document
+            else:
+                assert "orphan body" in doc or "lonely body" in doc
+
+
+def test_apply_is_idempotent_after_simulated_success(synthetic_db):
+    """B.4.2 — Re-running --apply after a successful run reports 0 drift to fix."""
+    # Simulate successful repair by adding the orphan ids to the HNSW pickle
+    report1 = rhi.audit(db_path=synthetic_db["db_path"], db_dir=synthetic_db["db_dir"])
+    assert report1.sql_only_count == 4
+    coll = FakeCollection()
+    rhi.repair(report1, embed_fn=_deterministic_embed, collection=coll)
+
+    # Update the pickle to reflect the writes
+    pickle_path = os.path.join(synthetic_db["db_dir"], VEC_SEG_ID, "index_metadata.pickle")
+    with open(pickle_path, "rb") as f:
+        m = pickle.load(f)
+    next_label = max(m["id_to_label"].values()) + 1
+    for eid in synthetic_db["expected_orphan_ids"]:
+        m["id_to_label"][eid] = next_label
+        m["label_to_id"][next_label] = eid
+        next_label += 1
+    with open(pickle_path, "wb") as f:
+        pickle.dump(m, f)
+
+    report2 = rhi.audit(db_path=synthetic_db["db_path"], db_dir=synthetic_db["db_dir"])
+    assert report2.sql_only_count == 0
+    coll2 = FakeCollection()
+    result2 = rhi.repair(report2, embed_fn=_deterministic_embed, collection=coll2)
+    assert result2["repaired"] == 0
+    assert coll2.upsert_calls == []
+
+
+def test_apply_refuses_when_not_in_maintenance_mode(synthetic_db):
+    """B.4.3 — --apply refuses when MCP is not in maintenance mode."""
+    assert not os.path.exists(synthetic_db["lock_path"])
+    rc = rhi.main(["--apply", "--no-history"])
+    assert rc == 2  # not_in_maintenance_mode
+
+
+def test_apply_refuses_when_no_recent_backup(synthetic_db):
+    """B.4.4 — --apply refuses when no recent backup exists."""
+    Path(synthetic_db["lock_path"]).write_text("12345")  # enter maintenance mode
+    # No backup at all
+    rc = rhi.main(["--apply", "--no-history"])
+    assert rc == 3  # no_recent_backup
+
+    # Stale backup (older than 60 min) — also refused
+    Path(synthetic_db["backups_dir"]).mkdir(exist_ok=True)
+    stale_backup = Path(synthetic_db["backups_dir"]) / "chroma_20260101_010101.sqlite3.gz"
+    stale_backup.write_text("fake")
+    old_mtime = time.time() - 7200  # 2h old
+    os.utime(str(stale_backup), (old_mtime, old_mtime))
+    rc2 = rhi.main(["--apply", "--no-history"])
+    assert rc2 == 3
+
+
+def test_apply_refuses_when_unknown_drift_present(synthetic_db):
+    """B.4.6 — Unexpected drift type triggers refusal."""
+    # Add an "unknown" SQL-only chunk: source not in known set, conv_id off-pattern
+    con = sqlite3.connect(synthetic_db["db_path"])
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO embeddings (id, segment_id, embedding_id, seq_id) VALUES (?, ?, ?, ?)",
+        (99, META_SEG_ID, "weirdo_chunk", 99),
+    )
+    cur.execute(
+        "INSERT INTO embedding_metadata (id, key, string_value, int_value, float_value, bool_value) VALUES (?, ?, ?, ?, ?, ?)",
+        (99, "source", "mystery_source", None, None, None),
+    )
+    con.commit()
+    con.close()
+
+    report = rhi.audit(db_path=synthetic_db["db_path"], db_dir=synthetic_db["db_dir"])
+    assert report.unknown_count >= 1
+    with pytest.raises(RuntimeError, match="unknown drift"):
+        rhi.repair(report, embed_fn=_deterministic_embed, collection=FakeCollection())
+
+    # CLI path: maintenance lock + fresh backup, but unknown drift -> rc=4
+    Path(synthetic_db["lock_path"]).write_text("12345")
+    Path(synthetic_db["backups_dir"]).mkdir(exist_ok=True)
+    fresh = Path(synthetic_db["backups_dir"]) / "chroma_now.sqlite3.gz"
+    fresh.write_text("fake")
+    rc = rhi.main(["--apply", "--no-history"])
+    assert rc == 4
+
+
+def test_prune_hnsw_ghosts_raises_not_implemented(synthetic_db):
+    """B.4.7 — --prune-hnsw-ghosts raises NotImplementedError cleanly."""
+    with pytest.raises(NotImplementedError, match="deferred"):
+        rhi.main(["--prune-hnsw-ghosts"])
+
+
+def test_maintenance_log_row_written_per_run(synthetic_db):
+    """B.4.8 — maintenance_log row written on each run."""
+    rc = rhi.main(["--audit", "--no-history"])
+    assert rc == 1  # drift exists
+    con = sqlite3.connect(synthetic_db["db_path"])
+    rows = con.execute("SELECT id, timestamp, operation FROM maintenance_log").fetchall()
+    con.close()
+    assert len(rows) == 1
+    payload = json.loads(rows[0][2])
+    assert payload["mode"] == "audit"
+    assert payload["drift_summary"]["sql_only_count"] == 4
+    assert payload["drift_summary"]["hnsw_only_count"] == 2
+    assert payload["action_taken"] == "audit-only"
+
+    # Second run -> second row, with monotonic id
+    rhi.main(["--audit", "--no-history"])
+    con = sqlite3.connect(synthetic_db["db_path"])
+    ids = [r[0] for r in con.execute("SELECT id FROM maintenance_log ORDER BY id").fetchall()]
+    con.close()
+    assert ids == [1, 2]
+
+
+def test_delta_section_when_recent_history_exists(synthetic_db):
+    """B.4.9 — Delta section appears when audit history JSON exists from <2h ago."""
+    Path(synthetic_db["audit_dir"]).mkdir(parents=True, exist_ok=True)
+    # Seed a prior audit that thought there were 100 orphans (different state)
+    fake_prev = {
+        "timestamp": "2026-04-25 09:14:02",
+        "timestamp_unix": int(time.time()) - 3600,  # 1h ago
+        "sql_only_orphans": [
+            {"embedding_id": "doc_zzz_chunk_0000"},
+            {"embedding_id": "doc_bbbbbbbbbbbb_chunk_0000"},  # still orphan
+        ],
+        "hnsw_only_ghosts": [{"embedding_id": "doc_dddddddddddd_chunk_0000"}],
+        "queue_total": 100,
+    }
+    prev_path = Path(synthetic_db["audit_dir"]) / "audit_20260425_091402.json"
+    prev_path.write_text(json.dumps(fake_prev))
+    one_hour_ago = time.time() - 3600
+    os.utime(str(prev_path), (one_hour_ago, one_hour_ago))
+
+    report = rhi.audit(db_path=synthetic_db["db_path"], db_dir=synthetic_db["db_dir"])
+    history_path = rhi.write_audit_history(report, audit_dir=synthetic_db["audit_dir"])
+    found_prev = rhi.find_recent_audit(audit_dir=synthetic_db["audit_dir"], exclude=history_path)
+    assert found_prev == str(prev_path)
+    delta = rhi.compute_delta(found_prev, report)
+    assert delta is not None
+    assert delta.queue_change == -100  # current is 0, prev was 100
+    assert "doc_zzz_chunk_0000" in delta.resolved_orphan_ids
+    assert "doc_cccccccccccc_chunk_0000" in delta.new_orphan_ids
+    assert "doc_summary_aaaa1111" in delta.new_orphan_ids
+
+    text = rhi.format_report_human(report, delta)
+    assert "DELTA SINCE LAST AUDIT" in text
+    assert "Queue backlog:" in text
+
+
+def test_delta_section_omitted_when_no_recent_history(synthetic_db):
+    """B.4.10 — Delta section is omitted when no recent audit history exists."""
+    # Empty history dir
+    found = rhi.find_recent_audit(audit_dir=synthetic_db["audit_dir"])
+    assert found is None
+
+    # Stale history (>2h old) is ignored
+    Path(synthetic_db["audit_dir"]).mkdir(parents=True, exist_ok=True)
+    stale = Path(synthetic_db["audit_dir"]) / "audit_old.json"
+    stale.write_text(json.dumps({"timestamp": "old", "timestamp_unix": 0, "sql_only_orphans": [], "hnsw_only_ghosts": [], "queue_total": 0}))
+    old_mtime = time.time() - 10800  # 3h ago
+    os.utime(str(stale), (old_mtime, old_mtime))
+    found2 = rhi.find_recent_audit(audit_dir=synthetic_db["audit_dir"])
+    assert found2 is None
+
+    report = rhi.audit(db_path=synthetic_db["db_path"], db_dir=synthetic_db["db_dir"])
+    text = rhi.format_report_human(report, delta=None)
+    assert "DELTA SINCE LAST AUDIT" not in text
+
+
+def test_audit_history_json_written_to_known_dir(synthetic_db):
+    """The audit-history JSON is written under logs/hnsw_audits/ on each run."""
+    rc = rhi.main(["--audit"])  # no --no-history this time
+    assert rc == 1
+    files = list(Path(synthetic_db["audit_dir"]).glob("audit_*.json"))
+    assert len(files) == 1
+    payload = json.loads(files[0].read_text())
+    assert payload["sql_total"] >= 4
+    assert payload["sql_only_orphans"]
+
+
+def test_doc_chunk_embedding_text_includes_prefix(synthetic_db):
+    """White-box: re-embed text for doc chunks must reconstruct the ingest_docs prefix."""
+    report = rhi.audit(db_path=synthetic_db["db_path"], db_dir=synthetic_db["db_dir"])
+    coll = FakeCollection()
+
+    captured_texts: list[str] = []
+
+    def capture_embed(texts):
+        captured_texts.extend(texts)
+        return _deterministic_embed(texts)
+
+    rhi.repair(report, embed_fn=capture_embed, collection=coll, batch_size=10)
+    # Find the text used for a doc chunk and a summary chunk
+    doc_text = next(t for t in captured_texts if "orphan body 0" in t)
+    summary_text = next(t for t in captured_texts if "summary text alpha" in t)
+    # Doc chunk gets prefix
+    assert "Cartella: Wealth" in doc_text
+    assert "Tipo: spreadsheet" in doc_text
+    assert "File: orphan.pdf" in doc_text
+    # Summary chunk does NOT get an extra prefix (uses chroma:document as-is)
+    assert summary_text == "summary text alpha"
+    assert "Cartella:" not in summary_text

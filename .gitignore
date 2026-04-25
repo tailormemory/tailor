@@ -49,3 +49,6 @@ models/
 
 # Chrome Web Store assets
 docs/store/
+
+# Local scratch prompts (not for repo)
+prompts/

@@ -20,6 +20,38 @@ Template for upcoming changes. Move entries under a new version heading on relea
 
 ---
 
+## [1.2.2] - 2026-04-25 — HNSW index drift audit & repair utility
+
+Patch release adding a maintenance utility for ChromaDB SQL/HNSW segment drift.
+
+### Added
+
+- **`scripts/maintenance/repair_hnsw_index.py`** — diagnostic and repair tool for ChromaDB 1.x persist-on-shutdown drift. Three-mode: `--audit` (default, read-only diagnosis), `--apply` (re-embeds SQL-only orphans via `collection.upsert()`), `--prune-hnsw-ghosts` (deferred — raises `NotImplementedError`). `--json` flag for machine-readable output. Read-only audit opens SQLite via `mode=ro` URI; apply uses `chromadb.PersistentClient` exclusively. Re-embedding goes through the existing `scripts/lib/embedding.py:get_embeddings` so the configured provider (Ollama / OpenAI / Google) is honoured.
+- **Restart-aware delta tracking** — every audit run writes a timestamped JSON to `logs/hnsw_audits/`. When a previous run from <2h ago is on disk, the next audit emits a `DELTA SINCE LAST AUDIT` section listing newly-appeared and resolved orphan ids, plus queue/HNSW count changes. This makes race-induced drift around an MCP restart visible.
+- **`maintenance_log` table** — the existing (previously empty) table now receives one row per `repair_hnsw_index.py` invocation. The `operation` TEXT column holds a JSON object with `tool`, `mode`, `drift_summary`, `action_taken`, and (for apply runs) `post_apply_sql_only_count` + `backup_used`. First write to this table since it was created.
+- **Three preconditions for `--apply`**, all of which the tool refuses without operator action:
+  1. MCP in maintenance mode — `maintenance.lock` present (`kill -USR1 <mcp_pid>`).
+  2. Recent backup — file matching `backups/chroma_*.sqlite3.gz` or `db/chroma.sqlite3.backup.*` with mtime within 60 minutes.
+  3. No "unknown" drift types — every SQL-only chunk and HNSW-only ghost must fit a known classification, or `--apply` blocks for human review.
+- **Documentation**: `scripts/maintenance/repair_hnsw_index.md` covers the three modes, the restart-aware workflow, the `maintenance_log` schema convention, why the tool exists (upstream ChromaDB race, not a TAILOR bug), and the planned post-ingest verifier coming in v1.2.3 as the prevention complement.
+
+### Fixed
+
+- Recovers the `kb_search source_filter='document'` failure ("Internal error: Error finding id") caused by 66 chunks present in SQL metadata but missing from the HNSW pickle. All 66 trace back to a single ingest run on 2026-04-16 03:01:39. Repair re-embeds the affected chunks via `collection.upsert()`; running it requires v1.2.2 + the operator preconditions above.
+
+### Stats
+
+- 1 new utility (audit + apply, ~600 LoC including dataclasses)
+- 1 new doc (`scripts/maintenance/repair_hnsw_index.md`)
+- `maintenance_log` table now has its first writer
+- 322 tests passing (310 baseline + 12 new in `tests/test_repair_hnsw_index.py`)
+
+### Notes
+
+- v1.2.3 will add the **post-ingest verifier** in `scripts/ingest/ingest_docs.py` — a vector-path read-back after each `collection.upsert()` that retries or marks chunks for repair if HNSW didn't catch them. This audit-and-fix utility recovers existing drift; the verifier prevents future drift. They are independent and ship separately.
+
+---
+
 ## [1.2.1] - 2026-04-24 — Absolute `download_url` in KB payloads
 
 Patch release fixing a hallucination vector in KB search responses served to smaller LLMs.
