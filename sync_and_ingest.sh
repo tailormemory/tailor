@@ -486,6 +486,54 @@ DURATION=$(( END_TIME - START_TIME ))
 
 log "END sync_and_ingest v9 (${DURATION}s)"
 
+# ── 6.5 HNSW VERIFIER DRIFT CHECK ──
+# Scan maintenance_log for verify-mode rows written since START_TIME
+# (post-ingest verifier in scripts/lib/ingest_helpers.py records them when
+# the vector-path read-back fails). Surface the count + per-source breakdown
+# in the end-of-run Telegram so persist-on-shutdown drift is visible to the
+# operator without waiting for the next repair_hnsw_index.py audit.
+HNSW_DRIFT_LINE=""
+# NB: '\$.mode' is escaped because this Python block is a double-quoted
+# bash string — without the backslash, bash would expand $.mode to "" and
+# the SQLite JSON path filter would silently match nothing (zero rows
+# returned, drift never surfaced). The backslash preserves the literal
+# $ for json_extract.
+HNSW_DRIFT_RAW=$("$PYTHON" -c "
+import sqlite3, json, os, sys
+db = os.path.join('$TAILOR_DIR', 'db', 'chroma.sqlite3')
+if not os.path.exists(db):
+    sys.exit(0)
+con = sqlite3.connect('file:' + db + '?mode=ro', uri=True)
+try:
+    rows = con.execute(
+        \"SELECT operation FROM maintenance_log WHERE timestamp >= ? \"
+        \"AND json_extract(operation, '\$.mode') = 'verify'\",
+        ($START_TIME,),
+    ).fetchall()
+finally:
+    con.close()
+if not rows:
+    sys.exit(0)
+total = 0
+per_source = {}
+for (op,) in rows:
+    p = json.loads(op)
+    n = p.get('drift_summary', {}).get('drift_total', 0)
+    src = p.get('source', 'unknown')
+    total += n
+    per_source[src] = per_source.get(src, 0) + n
+parts = ', '.join(f'{s}:{c}' for s, c in sorted(per_source.items()))
+print(f'{total}|{parts}')
+" 2>/dev/null)
+
+if [ -n "$HNSW_DRIFT_RAW" ]; then
+    HNSW_DRIFT_TOTAL=$(echo "$HNSW_DRIFT_RAW" | cut -d'|' -f1)
+    HNSW_DRIFT_PARTS=$(echo "$HNSW_DRIFT_RAW" | cut -d'|' -f2)
+    HNSW_DRIFT_LINE="
+🧷 *HNSW drift detected*: ${HNSW_DRIFT_TOTAL} chunks (${HNSW_DRIFT_PARTS}) — run repair_hnsw_index.py --apply"
+    log "HNSW drift detected this run: ${HNSW_DRIFT_TOTAL} chunks (${HNSW_DRIFT_PARTS})"
+fi
+
 # ── 7. NOTIFICA TELEGRAM ──
 if [ -n "$ERRORS" ]; then
     ICON="⚠️"
@@ -542,6 +590,10 @@ if [ -n "$ERRORS" ]; then
     MSG="${MSG}
 
 ⚠️ ${ERRORS}"
+fi
+
+if [ -n "$HNSW_DRIFT_LINE" ]; then
+    MSG="${MSG}${HNSW_DRIFT_LINE}"
 fi
 
 send_telegram "$MSG"

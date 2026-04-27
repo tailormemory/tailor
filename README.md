@@ -510,7 +510,6 @@ Both have: atomic facts, supersession, user profiles, hybrid search, temporal gr
 
 ### Next up
 
-- **Post-ingest HNSW verifier** (v1.2.3) — Vector-path read-back after each `collection.upsert()` in `scripts/ingest/ingest_docs.py`, with auto-persist trigger via idempotent re-upsert when sub-threshold writes leave the on-disk pickle stale. Prevents the deterministic ChromaDB 1.x persist-on-threshold-only behaviour from silently dropping low-volume ingests. Complements the audit-and-fix utility shipped in v1.2.2.
 - **English system prompt in `tailor.yaml.example`** — Ship a neutral, English-language `chat_interface.system_prompt` and `persona.system_prompt` with retry-on-miss guidance, domain-pattern hints, and source-citation rules, so fresh installs get the good prompt out of the box.
 - **Voice I/O in chat** — Speech-to-text and text-to-speech in the Chat tab via the browser Web Speech API.
 

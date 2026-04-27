@@ -35,6 +35,7 @@ sys.path.insert(0, os.path.join(BASE_DIR, "scripts", "ingest"))
 
 from config import get as cfg, load_config
 from embedding import get_embeddings, info as embedding_info
+from ingest_helpers import verified_upsert, make_run_id
 
 # ── Constants ─────────────────────────────────────────────────
 DB_DIR = os.path.join(BASE_DIR, "db")
@@ -177,7 +178,7 @@ def delete_source_chunks(collection, source: str):
         return 0
 
 
-def ingest_chunks(chunks: list[dict], collection, dry_run: bool = False):
+def ingest_chunks(chunks: list[dict], collection, dry_run: bool = False, run_id: str | None = None, source: str = "conversation"):
     """Embed and ingest chunks into ChromaDB."""
     if not chunks:
         return 0, 0
@@ -186,6 +187,7 @@ def ingest_chunks(chunks: list[dict], collection, dry_run: bool = False):
     processed = 0
     errors = 0
     start_time = time.time()
+    run_id = run_id or make_run_id(source)
 
     for batch_start in range(0, total, BATCH_SIZE):
         batch = chunks[batch_start:batch_start + BATCH_SIZE]
@@ -229,12 +231,12 @@ def ingest_chunks(chunks: list[dict], collection, dry_run: bool = False):
             })
 
         try:
-            collection.upsert(
-                ids=ids,
-                embeddings=embeddings,
-                documents=documents,
-                metadatas=metadatas
+            ok = verified_upsert(
+                collection, ids, embeddings, documents, metadatas,
+                run_id=run_id, source=source,
             )
+            if not ok:
+                errors += len(batch)
         except Exception as e:
             print(f"\n  ChromaDB upsert error: {e}")
             errors += len(batch)
@@ -319,6 +321,7 @@ def main():
     total_processed = 0
     total_errors = 0
     start_time = time.time()
+    run_id = make_run_id("conversation")
 
     for source_cfg in sources:
         name = source_cfg.get("name", "unknown")
@@ -377,7 +380,7 @@ def main():
         if deleted > 0:
             print(f"[{name}] Deleted {deleted:,} old chunks")
 
-        processed, errors = ingest_chunks(all_chunks, collection)
+        processed, errors = ingest_chunks(all_chunks, collection, source=name, run_id=run_id)
         total_processed += processed
         total_errors += errors
         print(f"[{name}] Ingested: {processed:,} chunks, {errors} errors")

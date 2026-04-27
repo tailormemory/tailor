@@ -145,6 +145,22 @@ def _load_segment_ids(con: sqlite3.Connection) -> tuple[str, str]:
     return meta_row[0], vec_row[0]
 
 
+def _resolve_hnsw_pickle_path(db_path: str, db_dir: str) -> str | None:
+    """Best-effort resolution of the HNSW pickle path. Returns None if either
+    the segments table or the pickle file is missing — callers use this for
+    optional mtime observation, not enforcement."""
+    try:
+        con = _open_sqlite_ro(db_path)
+        try:
+            _, vec_seg = _load_segment_ids(con)
+        finally:
+            con.close()
+        path = os.path.join(db_dir, vec_seg, "index_metadata.pickle")
+        return path if os.path.exists(path) else None
+    except Exception:
+        return None
+
+
 def _load_hnsw_pickle_ids(db_dir: str, vec_seg: str) -> set[str]:
     pickle_path = os.path.join(db_dir, vec_seg, "index_metadata.pickle")
     if not os.path.exists(pickle_path):
@@ -666,6 +682,7 @@ def repair(
     repaired = 0
     batches = 0
     skipped_oversize = 0
+    repaired_ids: list[str] = []
 
     orphans = report.sql_only_orphans
     for batch_start in range(0, len(orphans), batch_size):
@@ -702,11 +719,17 @@ def repair(
             metadatas=metadatas,
         )
         repaired += len(ids)
+        repaired_ids.extend(ids)
         batches += 1
         if progress:
             progress(repaired, len(orphans))
 
-    return {"repaired": repaired, "batches": batches, "skipped_oversize": skipped_oversize}
+    return {
+        "repaired": repaired,
+        "batches": batches,
+        "skipped_oversize": skipped_oversize,
+        "repaired_ids": repaired_ids,
+    }
 
 
 # ============================================================
@@ -824,6 +847,7 @@ def main(argv: list[str] | None = None) -> int:
     sys.path.insert(0, os.path.join(BASE_DIR, "scripts", "lib"))
     import chromadb  # noqa: E402
     from embedding import get_embeddings  # noqa: E402
+    import chroma_persist  # noqa: E402
 
     client = chromadb.PersistentClient(path=DB_DIR)
     collection = client.get_or_create_collection(name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
@@ -834,6 +858,29 @@ def main(argv: list[str] | None = None) -> int:
 
     _print(f"\nRe-embedding {report.sql_only_count} orphan chunks via collection.upsert()...", args.json)
     result = repair(report, embed_fn=get_embeddings, collection=collection, progress=_progress)
+
+    # Auto-persist: force chromadb to flush HNSW state to disk so the repair
+    # survives the next restart even if shutdown is unclean. Skipped when
+    # nothing was repaired (no ids to replay).
+    auto_persist: dict[str, Any] = {"triggered": False}
+    repaired_ids = result.get("repaired_ids") or []
+    if repaired_ids:
+        pickle_path = _resolve_hnsw_pickle_path(DB_PATH, DB_DIR)
+        _print(
+            f"\nForcing HNSW persist via {chroma_persist.DEFAULT_TARGET_WRITES} idempotent re-upserts "
+            f"of the {len(repaired_ids)} repaired chunks...",
+            args.json,
+        )
+        persist_result = chroma_persist.force_chroma_persist(
+            collection, repaired_ids, pickle_path=pickle_path,
+        )
+        auto_persist = {
+            "triggered": True,
+            "iterations": persist_result["iterations"],
+            "total_writes": persist_result["total_writes"],
+            "mtime_advanced": persist_result["mtime_advanced"],
+            "success": persist_result["success"],
+        }
 
     # Re-audit to confirm
     post = audit()
@@ -848,7 +895,11 @@ def main(argv: list[str] | None = None) -> int:
                 report=report,
                 action=f"repaired {result['repaired']} chunks in {result['batches']} batches"
                        + (f" (skipped {result['skipped_oversize']} oversize)" if result['skipped_oversize'] else ""),
-                extra={"post_apply_sql_only_count": post.sql_only_count, "backup_used": os.path.basename(backup)},
+                extra={
+                    "post_apply_sql_only_count": post.sql_only_count,
+                    "backup_used": os.path.basename(backup),
+                    "auto_persist": auto_persist,
+                },
             )
         finally:
             con.close()
@@ -859,11 +910,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print(json.dumps({
             "apply": result,
+            "auto_persist": auto_persist,
             "post_apply_sql_only_count": post.sql_only_count,
             "success": success,
         }, indent=2))
     else:
         print(f"\nRepair result: {result}")
+        if auto_persist.get("triggered"):
+            print(
+                f"Auto-persist: {auto_persist['iterations']} iterations × {len(repaired_ids)} ids "
+                f"= {auto_persist['total_writes']} writes; "
+                f"mtime_advanced={auto_persist['mtime_advanced']}"
+            )
         print(f"Post-apply SQL-only orphans: {post.sql_only_count}")
         if success:
             print("OK — drift is now zero.")

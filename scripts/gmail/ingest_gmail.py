@@ -30,6 +30,7 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 sys.path.insert(0, os.path.join(BASE_DIR, "scripts", "lib"))
 from config import get as cfg
 from embedding import get_embeddings as _embed_fn
+from ingest_helpers import verified_upsert, make_run_id
 
 DB_DIR = cfg("kb", "chromadb_path") or os.path.join(BASE_DIR, "db")
 
@@ -111,7 +112,7 @@ def delete_email_chunks(collection):
     return total_deleted
 
 
-def ingest_chunks(collection, chunks, dry_run=False):
+def ingest_chunks(collection, chunks, dry_run=False, run_id: str | None = None):
     """Scrive chunk in ChromaDB in batch."""
     total = len(chunks)
     processed = 0
@@ -119,6 +120,7 @@ def ingest_chunks(collection, chunks, dry_run=False):
     skipped = 0
 
     start_time = time.time()
+    run_id = run_id or make_run_id("email")
 
     for batch_start in range(0, total, BATCH_SIZE):
         batch = chunks[batch_start:batch_start + BATCH_SIZE]
@@ -149,12 +151,12 @@ def ingest_chunks(collection, chunks, dry_run=False):
         metadatas = [c["metadata"] for c in batch]
 
         try:
-            collection.upsert(
-                ids=ids,
-                embeddings=embeddings,
-                documents=documents,
-                metadatas=metadatas,
+            ok = verified_upsert(
+                collection, ids, embeddings, documents, metadatas,
+                run_id=run_id, source="email",
             )
+            if not ok:
+                errors += len(batch)
         except Exception as e:
             print(f"\n  ChromaDB errore: {e}")
             errors += len(batch)

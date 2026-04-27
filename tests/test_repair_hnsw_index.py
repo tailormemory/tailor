@@ -6,6 +6,19 @@ The script reads a ChromaDB SQLite + the HNSW segment's
 synthetic minimal Chroma layout under a tmp_path and exercise the
 audit/apply/refusal paths without requiring chromadb to be installed
 or the live DB to be touched.
+
+CONCURRENCY WARNING — the apply-path tests added in v1.2.3
+(`test_apply_triggers_auto_persist_on_nonempty_repair`,
+`test_apply_skips_auto_persist_when_repair_set_is_empty`,
+`test_apply_records_mtime_did_not_advance`) inject fake `chromadb`,
+`embedding`, and `chroma_persist` modules via
+`monkeypatch.setitem(sys.modules, ...)`. pytest's `monkeypatch`
+reverts cleanly between tests in serial execution, but `sys.modules`
+is process-global. **Do NOT run this file under pytest-xdist or any
+parallel test runner** without first refactoring the fakes to
+fixture-scoped instances and serialising the apply tests with a
+mutex. Today they are safe only because pytest runs them in-process
+and sequentially.
 """
 
 from __future__ import annotations
@@ -507,6 +520,163 @@ def test_audit_history_json_written_to_known_dir(synthetic_db):
     payload = json.loads(files[0].read_text())
     assert payload["sql_total"] >= 4
     assert payload["sql_only_orphans"]
+
+
+def test_repair_returns_repaired_ids(synthetic_db):
+    """B.4.11 — repair() returns the ids it actually upserted, in order, for
+    the auto-persist downstream consumer."""
+    report = rhi.audit(db_path=synthetic_db["db_path"], db_dir=synthetic_db["db_dir"])
+    coll = FakeCollection()
+    result = rhi.repair(report, embed_fn=_deterministic_embed, collection=coll, batch_size=2)
+    assert "repaired_ids" in result
+    assert sorted(result["repaired_ids"]) == sorted(synthetic_db["expected_orphan_ids"])
+    # Order in repaired_ids matches the order they were upserted across batches
+    upserted_in_order = [i for call in coll.upsert_calls for i in call["ids"]]
+    assert result["repaired_ids"] == upserted_in_order
+
+
+def _install_apply_mocks(monkeypatch, synthetic_db):
+    """Install fake chromadb / embedding / chroma_persist at the lazy-import
+    sites inside main(). Returns (fake_collection, persist_calls list)."""
+    fake_collection = FakeCollection()
+
+    class _FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+        def get_or_create_collection(self, name, metadata=None):
+            return fake_collection
+
+    fake_chromadb = type(sys)("chromadb")
+    fake_chromadb.PersistentClient = _FakeClient
+    monkeypatch.setitem(sys.modules, "chromadb", fake_chromadb)
+
+    fake_embedding = type(sys)("embedding")
+    fake_embedding.get_embeddings = _deterministic_embed
+    monkeypatch.setitem(sys.modules, "embedding", fake_embedding)
+
+    persist_calls: list[dict] = []
+
+    def _fake_force(collection, ids, *, pickle_path=None, target_writes=1100):
+        persist_calls.append({
+            "ids": list(ids),
+            "pickle_path": pickle_path,
+            "target_writes": target_writes,
+        })
+        return {
+            "success": True,
+            "iterations": 17,
+            "total_writes": 17 * len(ids),
+            "ids_persisted": len(ids),
+            "mtime_advanced": True,
+            "mtime_before": 1000.0,
+            "mtime_after": 1001.0,
+        }
+
+    fake_chroma_persist = type(sys)("chroma_persist")
+    fake_chroma_persist.DEFAULT_TARGET_WRITES = 1100
+    fake_chroma_persist.force_chroma_persist = _fake_force
+    monkeypatch.setitem(sys.modules, "chroma_persist", fake_chroma_persist)
+
+    # Apply preconditions: maintenance lock + fresh backup
+    Path(synthetic_db["lock_path"]).write_text("12345")
+    Path(synthetic_db["backups_dir"]).mkdir(exist_ok=True)
+    fresh = Path(synthetic_db["backups_dir"]) / "chroma_now.sqlite3.gz"
+    fresh.write_text("fake")
+
+    return fake_collection, persist_calls
+
+
+def test_apply_triggers_auto_persist_on_nonempty_repair(synthetic_db, monkeypatch):
+    """B.4.12 — --apply with a non-empty repair set invokes force_chroma_persist
+    on the repaired ids, and records the result in maintenance_log."""
+    fake_collection, persist_calls = _install_apply_mocks(monkeypatch, synthetic_db)
+
+    rc = rhi.main(["--apply", "--no-history"])
+    # post-audit still sees drift (fake collection didn't actually update SQL/HNSW),
+    # so rc=5 is expected. The auto-persist still ran because repair() returned ids.
+    assert rc == 5
+
+    # Persist invoked exactly once with the repaired ids
+    assert len(persist_calls) == 1
+    assert sorted(persist_calls[0]["ids"]) == sorted(synthetic_db["expected_orphan_ids"])
+    # Pickle path resolved from the synthetic DB
+    assert persist_calls[0]["pickle_path"] is not None
+    assert persist_calls[0]["pickle_path"].endswith("index_metadata.pickle")
+
+    # maintenance_log apply row contains auto_persist details
+    con = sqlite3.connect(synthetic_db["db_path"])
+    rows = con.execute(
+        "SELECT operation FROM maintenance_log "
+        "WHERE json_extract(operation, '$.mode') = 'apply'"
+    ).fetchall()
+    con.close()
+    assert len(rows) == 1
+    payload = json.loads(rows[0][0])
+    ap = payload["auto_persist"]
+    assert ap["triggered"] is True
+    assert ap["iterations"] == 17
+    assert ap["total_writes"] == 17 * 4  # 4 orphans
+    assert ap["mtime_advanced"] is True
+    assert ap["success"] is True
+
+
+def test_apply_skips_auto_persist_when_repair_set_is_empty(synthetic_db, monkeypatch):
+    """B.4.13 — When repair() returns no repaired_ids (e.g. all orphans were
+    oversize-skipped), force_chroma_persist is NOT invoked and the
+    maintenance_log row records `auto_persist.triggered=false`."""
+    fake_collection, persist_calls = _install_apply_mocks(monkeypatch, synthetic_db)
+
+    # Make repair return an empty ids list
+    def _fake_repair(report, *, embed_fn, collection, batch_size=10, progress=None):
+        return {"repaired": 0, "batches": 0, "skipped_oversize": 4, "repaired_ids": []}
+    monkeypatch.setattr(rhi, "repair", _fake_repair)
+
+    rc = rhi.main(["--apply", "--no-history"])
+    # Drift remains since repair did nothing → rc=5
+    assert rc == 5
+    assert persist_calls == []  # auto-persist NOT invoked
+
+    con = sqlite3.connect(synthetic_db["db_path"])
+    rows = con.execute(
+        "SELECT operation FROM maintenance_log "
+        "WHERE json_extract(operation, '$.mode') = 'apply'"
+    ).fetchall()
+    con.close()
+    assert len(rows) == 1
+    payload = json.loads(rows[0][0])
+    assert payload["auto_persist"] == {"triggered": False}
+
+
+def test_apply_records_mtime_did_not_advance(synthetic_db, monkeypatch):
+    """B.4.14 — When force_chroma_persist reports mtime_advanced=False
+    (defensive observation), the apply still succeeds and the
+    maintenance_log row preserves the False flag for operator visibility."""
+    fake_collection, _ = _install_apply_mocks(monkeypatch, synthetic_db)
+
+    # Override the persist mock to report no mtime advance
+    def _fake_force_no_advance(collection, ids, *, pickle_path=None, target_writes=1100):
+        return {
+            "success": True,
+            "iterations": 17,
+            "total_writes": 17 * len(ids),
+            "ids_persisted": len(ids),
+            "mtime_advanced": False,
+            "mtime_before": 1000.0,
+            "mtime_after": 1000.0,
+        }
+    sys.modules["chroma_persist"].force_chroma_persist = _fake_force_no_advance
+
+    rhi.main(["--apply", "--no-history"])
+
+    con = sqlite3.connect(synthetic_db["db_path"])
+    rows = con.execute(
+        "SELECT operation FROM maintenance_log "
+        "WHERE json_extract(operation, '$.mode') = 'apply'"
+    ).fetchall()
+    con.close()
+    payload = json.loads(rows[0][0])
+    assert payload["auto_persist"]["mtime_advanced"] is False
+    assert payload["auto_persist"]["triggered"] is True
 
 
 def test_doc_chunk_embedding_text_includes_prefix(synthetic_db):

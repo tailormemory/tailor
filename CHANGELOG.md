@@ -20,6 +20,48 @@ Template for upcoming changes. Move entries under a new version heading on relea
 
 ---
 
+## [1.2.3] - 2026-04-27 — Post-ingest HNSW verifier + auto-persist after repair
+
+Patch release that closes the chromadb 1.x persist-on-shutdown gap at write time, complementing the audit-and-fix utility shipped in v1.2.2. Two independent components.
+
+### Added
+
+#### Component A — post-ingest verifier
+
+- **`scripts/lib/ingest_helpers.py:verified_upsert()`** — wraps `collection.upsert()` with a vector-path read-back: re-uses the just-upserted embeddings as `query_embeddings` with `n_results=1` and checks each chunk's top-1 self-match returns the chunk's own id (cosine ≈0). If HNSW is missing the write, the top-1 is some other chunk → drift. SQL-only readback (`collection.get(ids=...)`) was the obvious wrong primitive — it always succeeds in exactly the failure mode we're trying to catch — so this took some live inspection to design correctly. Single 500ms retry handles vector-consumer lag; persistent drift is logged for the next audit, not hard-failed. Cost on the live 155k-chunk collection: ~14ms per batch of 10.
+- **Drift logging path**: `logs/hnsw_audits/pending_<run_id>.json` (full id list, append-only across batches in one run) + a row in the `maintenance_log` SQLite table with `mode: "verify"`, source attribution, capped `drift_ids` (first 50) and `drift_total` for full count. Mirrors the convention from `repair_hnsw_index.py:_ensure_maintenance_log_row`. Composes with the audit/repair tool: drift detected at write time gets repaired by the next `--apply` run.
+- **`make_run_id(source)`** helper: `<source>_YYYYMMDD_HHMMSS_<pid>` to disambiguate same-second parallel runs (cron, manual back-to-back, tests).
+- **All 4 ingest paths now call `verified_upsert()`**: `scripts/ingest/ingest_conversations.py:231`, `scripts/ingest/ingest_docs.py:677`, `scripts/ingest/ingest_upload.py:130`, `scripts/gmail/ingest_gmail.py:152`. Surrounding context (progress reporting, job-status updates, stdout) is preserved unchanged. Existing per-script error handling (log error, increment counter, continue loop) stays intact — `verified_upsert()` returns False on drift, never raises, and the caller bumps `errors` exactly as before.
+- **End-of-run drift surfacing**: `sync_and_ingest.sh` queries `maintenance_log` for `mode='verify'` rows since `START_TIME` and appends a per-source drift line to the existing Telegram message. Reuses the existing `send_telegram()` function — no new alerting path.
+
+#### Component B — auto-persist after repair
+
+- **`scripts/lib/chroma_persist.py:force_chroma_persist()`** — issues `target_writes=1100` (sync_threshold 1000 + ~10% margin) idempotent re-upserts of a sample to bump chromadb's internal write counter past sync_threshold and trigger `_persist()`. Originally executed manually as "Track 3a" on 2026-04-25 against the 9ad2790b vector segment; now formalised. Returns success/iterations/total_writes plus optional mtime advancement check on the HNSW pickle. mtime check is **defensive observation, not enforcement** — a non-advancing mtime emits a stderr warning but the function still returns success, since the next audit catches any residual drift and failing here would just hide it.
+- **`repair_hnsw_index.py --apply` now invokes `force_chroma_persist()` automatically** after re-embedding orphans, eliminating the "second restart dance" that previously had to be done by hand. The `repair()` function gained a `repaired_ids` field in its result dict, threaded through to the persist call. Empty repair set (nothing to fix) skips the persist step. The maintenance_log row for `--apply` gains an `auto_persist: {triggered, iterations, total_writes, mtime_advanced, success}` field for operator visibility from the dashboard.
+
+### Changed
+
+- `scripts/maintenance/repair_hnsw_index.py:repair()` now returns `repaired_ids: list[str]` in its result dict (previously only `repaired: int`, `batches: int`, `skipped_oversize: int`). Existing callers that used keys-by-name still work; positional access would break, but there were none.
+- The `[1.2.2]` notes mentioned the verifier would land "in `scripts/ingest/ingest_docs.py`" — the actual scope expanded to all 4 ingest scripts via the shared helper. Defensible: the chromadb 1.x race can hit any upserter, not just the document path.
+
+### Fixed
+
+- Closes the chromadb 1.5.5 sync_threshold gap at write time without waiting for the upstream fix at chroma-core/chroma#6975. v1.2.2 recovers existing drift; v1.2.3 prevents new drift and forces persistence after recovery.
+
+### Stats
+
+- 2 new shared helpers (`scripts/lib/ingest_helpers.py`, `scripts/lib/chroma_persist.py`)
+- 4 ingest scripts wired to the verifier (no behavioural change on the success path)
+- 1 new auto-persist trigger in `repair_hnsw_index.py --apply`
+- 358 tests passing (322 baseline + 12 from v1.2.2 + 24 new across `test_ingest_helpers.py` (10), `test_chroma_persist.py` (10), `test_repair_hnsw_index.py` (4 added))
+
+### Notes
+
+- The `auto_persist.mtime_advanced` flag in `maintenance_log` is observational — `False` does not mean the repair failed. It means we can't confirm the persist trigger fired this time. Re-running `--audit` after the next MCP restart is the authoritative check.
+- The post-ingest verifier and the repair tool are now mutually reinforcing: verifier catches drift the moment it happens, audit catches anything the verifier missed (or anything that drifted from external causes like the original Apr 16 race).
+
+---
+
 ## [1.2.2] - 2026-04-25 — HNSW index drift audit & repair utility
 
 Patch release adding a maintenance utility for ChromaDB SQL/HNSW segment drift.

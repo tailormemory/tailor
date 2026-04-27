@@ -40,6 +40,7 @@ import chromadb
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 from embedding import get_embedding, get_embeddings
 from config import get as cfg
+from ingest_helpers import verified_upsert, make_run_id
 
 # Cartelle da scansionare (ricorsivamente) — from YAML
 WATCH_FOLDERS = cfg("ingest", "document_paths") or []
@@ -641,11 +642,12 @@ def chunk_document(sections, file_info):
 
 
 
-def ingest_chunks(collection, chunks):
+def ingest_chunks(collection, chunks, run_id: str | None = None):
     """Scrive chunk in ChromaDB in batch."""
     total = len(chunks)
     processed = 0
     errors = 0
+    run_id = run_id or make_run_id("document")
 
     for batch_start in range(0, total, BATCH_SIZE):
         batch = chunks[batch_start:batch_start + BATCH_SIZE]
@@ -674,12 +676,12 @@ def ingest_chunks(collection, chunks):
         metadatas = [c["metadata"] for c in batch]
 
         try:
-            collection.upsert(
-                ids=ids,
-                embeddings=embeddings,
-                documents=documents,
-                metadatas=metadatas
+            ok = verified_upsert(
+                collection, ids, embeddings, documents, metadatas,
+                run_id=run_id, source="document",
             )
+            if not ok:
+                errors += len(batch)
         except Exception as e:
             print(f"\n  ChromaDB errore: {e}")
             errors += len(batch)
@@ -870,6 +872,7 @@ def main():
     total_chunks_added = 0
     total_errors = 0
     start_time = time.time()
+    run_id = make_run_id("document")
 
     for idx, f in enumerate(to_process):
         print(f"\n[{idx+1}/{len(to_process)}] {f['filename']} ({f['size_kb']:.0f} KB)")
@@ -905,7 +908,7 @@ def main():
         print(f"  Generati {len(chunks)} chunk")
 
         # Ingest
-        processed, errors = ingest_chunks(collection, chunks)
+        processed, errors = ingest_chunks(collection, chunks, run_id=run_id)
         total_chunks_added += processed
         total_errors += errors
         print(f"  Ingestati {processed} chunk" + (f" ({errors} errori)" if errors else ""))

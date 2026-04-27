@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.join(BASE_DIR, "scripts", "lib"))
 sys.path.insert(0, os.path.join(BASE_DIR, "scripts", "ingest"))
 from config import get as cfg, load_config
 from embedding import get_embeddings
+from ingest_helpers import verified_upsert, make_run_id
 
 DB_DIR = os.path.join(BASE_DIR, "db")
 COLLECTION_NAME = cfg("kb", "collection") or "tailor_kb"
@@ -115,6 +116,7 @@ def main():
         cl = chromadb.PersistentClient(path=DB_DIR)
         col = cl.get_collection(name=COLLECTION_NAME)
         total=len(achunks); proc=0; errs=0; t0=time.time()
+        run_id = make_run_id(f"upload_{stype}")
         for bs in range(0, total, BATCH_SIZE):
             batch = achunks[bs:bs+BATCH_SIZE]
             txts = [f"Conversazione: {c['title']}" + (f" ({c['date']})" if c.get('date') else "") + f"\n\n{c['text']}" for c in batch]
@@ -127,7 +129,9 @@ def main():
                 "create_time":c.get("create_time",0),"default_model":c.get("source",""),
                 "chunk_index":c.get("chunk_index",0),"char_count":c.get("char_count",0),
                 "turn_count":0,"source":c.get("source","unknown")} for c in batch]
-            try: col.upsert(ids=ids, embeddings=embs, documents=docs, metadatas=metas)
+            try:
+                ok = verified_upsert(col, ids, embs, docs, metas, run_id=run_id, source=stype)
+                if not ok: errs += len(batch)
             except Exception as e: print(f"  DB err: {e}"); errs+=len(batch); continue
             proc += len(batch)
             if proc % 50 < BATCH_SIZE:

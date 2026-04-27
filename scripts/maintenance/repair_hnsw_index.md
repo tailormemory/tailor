@@ -116,7 +116,18 @@ The drift this tool repairs is **not** a TAILOR bug. It's an upstream race in Ch
 
 Until the upstream race is fixed, running this tool periodically is part of normal operation for any project using ChromaDB 1.x with an active write workload.
 
-There is a separate prevention layer planned: a **post-ingest verifier** in `scripts/ingest/ingest_docs.py` that does a vector-path read-back after each `collection.upsert()` and either retries or marks the chunks for repair on the next audit. That's tracked for v1.2.3 and is the complement to this audit-and-fix utility — write-time prevention versus read-time recovery.
+A separate prevention layer ships in v1.2.3: the **post-ingest verifier** at `scripts/lib/ingest_helpers.py:verified_upsert`, called by all 4 ingest scripts. After each `collection.upsert()` it re-uses the just-upserted embeddings as `query_embeddings` (top-1, self-match) to confirm the chunks are reachable via HNSW; on drift it logs to `logs/hnsw_audits/pending_<run_id>.json` + the `maintenance_log` table with `mode='verify'`, and the next run of this tool picks them up. Write-time prevention versus read-time recovery; mutually reinforcing.
+
+## Auto-persist after `--apply` (v1.2.3)
+
+`--apply` now invokes `scripts/lib/chroma_persist.py:force_chroma_persist()` automatically after re-embedding orphans. The mechanism — issuing 1100 idempotent re-upserts of the just-repaired chunks to push chromadb's internal write counter past `hnsw:sync_threshold` (1000) — was originally executed by hand as "Track 3a" on 2026-04-25 to flush the 9ad2790b vector segment after the 66-orphan repair. Formalising it here eliminates the "second restart dance" the operator previously had to do by hand to make the repair durable across MCP shutdowns.
+
+Behaviour:
+- Empty repair set (nothing to fix) → persist step skipped.
+- The HNSW pickle's mtime is sampled before/after as a defensive observation. If it didn't advance, a stderr warning is emitted but `--apply` still exits with the success code — the next audit catches any residual drift, and failing here would just hide that fact.
+- The `maintenance_log` row for `--apply` gains an `auto_persist: {triggered, iterations, total_writes, mtime_advanced, success}` field. Operators can filter the dashboard maintenance view by `auto_persist.triggered=true` to see when the apply path was used.
+
+The 1100 target is `sync_threshold (1000) + ~10% margin` — a safety buffer for boundary races (off-by-one batching, thread scheduling at the threshold). It's not magic, and it's not tunable from the CLI — change `DEFAULT_TARGET_WRITES` in `scripts/lib/chroma_persist.py` if upstream's threshold ever changes.
 
 A note on classification: the **Phase A** human forensic analysis grouped the 66 SQL-only orphans by source document and missed 5 of them (the `doc_summary_*` chunks from the same Apr-16 03:01 batch) because the manual inspection grouped by file rather than by chunk. This audit tool groups dynamically by `conv_id` and catches all chunks regardless of classification — which is one of the reasons a tool is more reliable than spot-checks for this class of bug.
 
