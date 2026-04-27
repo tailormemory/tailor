@@ -1064,7 +1064,6 @@ class BearerAuthMiddleware:
                     pass
                 # Embed and upsert
                 try:
-                    from scripts.lib.embedding import get_embeddings
                     embedding = get_embeddings(text[:4000])
                     # Flatten if nested list (some providers return [[...]])
                     if embedding and isinstance(embedding[0], list):
