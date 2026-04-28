@@ -379,3 +379,108 @@ def test_verifier_handles_malformed_result_shape(env, monkeypatch):
     pending_path = Path(env["pending_dir"]) / "pending_test_run_008.json"
     data = json.loads(pending_path.read_text())
     assert "a_chunk_1" in data["entries"][0]["ids"]
+
+
+# ============================================================
+# v1.2.3.1: queue-membership check suppresses transient drift
+# ============================================================
+
+
+def test_verified_upsert_suppresses_transient_queue_lag(env, monkeypatch, capsys):
+    """All drift ids found in embeddings_queue → suppress, return True,
+    no pending JSON, no maintenance_log row."""
+    coll = FakeCollection(drop_hnsw_for=["a_chunk_0", "a_chunk_1", "a_chunk_2"])
+    p = _payload(["a_chunk_0", "a_chunk_1", "a_chunk_2"])
+    monkeypatch.setattr(ih.time, "sleep", lambda d: None)
+    # Simulate: every drifted id is sitting in embeddings_queue
+    monkeypatch.setattr(
+        ih, "_check_queue_membership",
+        lambda db_path, ids: set(ids),
+    )
+
+    ok = ih.verified_upsert(
+        coll, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
+        run_id="test_queue_001", source="email",
+    )
+    assert ok is True
+
+    pending_path = Path(env["pending_dir"]) / "pending_test_queue_001.json"
+    assert not pending_path.exists()
+    con = sqlite3.connect(env["db_path"])
+    rows = con.execute("SELECT * FROM maintenance_log").fetchall()
+    con.close()
+    assert rows == []
+
+    captured = capsys.readouterr()
+    assert "transient drift suppressed" in captured.err
+    assert "3 chunk(s)" in captured.err
+    assert "test_queue_001" in captured.err
+
+
+def test_verified_upsert_partial_queue_lag_records_only_real_drift(env, monkeypatch):
+    """Half the drift ids in queue, half not → pending JSON contains only
+    the not-in-queue ids; maintenance_log payload tracks both counts."""
+    coll = FakeCollection(drop_hnsw_for=["a_chunk_0", "a_chunk_1", "a_chunk_2", "a_chunk_3"])
+    p = _payload(["a_chunk_0", "a_chunk_1", "a_chunk_2", "a_chunk_3"])
+    monkeypatch.setattr(ih.time, "sleep", lambda d: None)
+    # Half are in queue (transient), half are real drift
+    monkeypatch.setattr(
+        ih, "_check_queue_membership",
+        lambda db_path, ids: {"a_chunk_0", "a_chunk_2"},
+    )
+
+    ok = ih.verified_upsert(
+        coll, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
+        run_id="test_queue_002", source="email",
+    )
+    assert ok is False
+
+    pending_path = Path(env["pending_dir"]) / "pending_test_queue_002.json"
+    assert pending_path.exists()
+    data = json.loads(pending_path.read_text())
+    assert len(data["entries"]) == 1
+    assert sorted(data["entries"][0]["ids"]) == ["a_chunk_1", "a_chunk_3"]
+
+    con = sqlite3.connect(env["db_path"])
+    rows = con.execute("SELECT operation FROM maintenance_log").fetchall()
+    con.close()
+    assert len(rows) == 1
+    payload = json.loads(rows[0][0])
+    assert payload["drift_summary"]["drift_total"] == 2
+    assert payload["drift_summary"]["transient_count"] == 2
+    assert sorted(payload["drift_ids"]) == ["a_chunk_1", "a_chunk_3"]
+
+
+def test_verified_upsert_queue_check_failure_degrades_gracefully(env, monkeypatch, capsys):
+    """If _check_queue_membership raises (defensive: helper already
+    swallows sqlite errors, but we must never re-raise), behavior matches
+    pre-v1.2.3.1: all drift recorded as permanent, transient_count=0."""
+    coll = FakeCollection(drop_hnsw_for=["a_chunk_0", "a_chunk_1"])
+    p = _payload(["a_chunk_0", "a_chunk_1"])
+    monkeypatch.setattr(ih.time, "sleep", lambda d: None)
+
+    def raising_check(db_path, ids):
+        raise RuntimeError("simulated failure past helper try/except")
+    monkeypatch.setattr(ih, "_check_queue_membership", raising_check)
+
+    ok = ih.verified_upsert(
+        coll, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
+        run_id="test_queue_003", source="email",
+    )
+    assert ok is False
+
+    pending_path = Path(env["pending_dir"]) / "pending_test_queue_003.json"
+    data = json.loads(pending_path.read_text())
+    assert sorted(data["entries"][0]["ids"]) == ["a_chunk_0", "a_chunk_1"]
+
+    con = sqlite3.connect(env["db_path"])
+    rows = con.execute("SELECT operation FROM maintenance_log").fetchall()
+    con.close()
+    payload = json.loads(rows[0][0])
+    assert payload["drift_summary"]["drift_total"] == 2
+    assert payload["drift_summary"]["transient_count"] == 0
+    assert sorted(payload["drift_ids"]) == ["a_chunk_0", "a_chunk_1"]
+
+    captured = capsys.readouterr()
+    assert "queue-membership check failed" in captured.err
+    assert "test_queue_003" in captured.err

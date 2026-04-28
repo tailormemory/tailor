@@ -11,6 +11,13 @@ when drift is detected, the suspect ids are appended to
 picks them up and re-embeds. Ingest continues; the per-script `errors`
 counter is incremented by the caller. No hard fail, no inline alerts.
 
+v1.2.3.1: before recording drift, suspect ids are checked against
+chromadb's `embeddings_queue` table. Ids still pending in the queue are
+vector-consumer lag (transient), not permanent drift, and are
+suppressed from pending JSON / maintenance_log. The maintenance_log
+payload's `drift_summary.transient_count` records how many suspects
+were filtered out for observability.
+
 Upstream issue: chroma-core/chroma#6975 (observed on chromadb==1.5.5).
 """
 
@@ -74,6 +81,35 @@ def _vector_path_drift(
     return drift
 
 
+def _check_queue_membership(db_path: str, ids: Sequence[str]) -> set[str]:
+    """Return the subset of `ids` currently present in chromadb's
+    `embeddings_queue` table.
+
+    These ids are writes the vector segment has not yet consumed —
+    so a verifier observation of "missing from HNSW" is expected lag,
+    not permanent drift.
+
+    Read-only against the chromadb sqlite. On any sqlite error returns
+    an empty set (degrades to pre-v1.2.3.1 behavior: caller treats all
+    drift as permanent)."""
+    if not ids:
+        return set()
+    try:
+        uri = f"file:{db_path}?mode=ro"
+        con = sqlite3.connect(uri, uri=True)
+        try:
+            placeholders = ",".join("?" * len(ids))
+            cur = con.execute(
+                f"SELECT id FROM embeddings_queue WHERE id IN ({placeholders})",
+                list(ids),
+            )
+            return {row[0] for row in cur.fetchall()}
+        finally:
+            con.close()
+    except Exception:
+        return set()
+
+
 def _record_pending_drift(
     run_id: str,
     source: str,
@@ -109,6 +145,8 @@ def _record_maintenance_log(
     run_id: str,
     source: str,
     drift_ids: Sequence[str],
+    *,
+    transient_count: int = 0,
 ) -> bool:
     """Insert one row into maintenance_log. Mirrors the convention from
     `repair_hnsw_index.py:_ensure_maintenance_log_row`. Best-effort: failure
@@ -130,6 +168,7 @@ def _record_maintenance_log(
                     "drift_total": drift_total,
                     "drift_ids_in_payload": len(capped),
                     "drift_ids_capped_at": MAINTENANCE_LOG_DRIFT_ID_CAP,
+                    "transient_count": transient_count,
                 },
                 "action_taken": "logged for next audit",
                 "drift_ids": capped,
@@ -171,10 +210,11 @@ def verified_upsert(
     """Upsert into ChromaDB and verify all ids are reachable via HNSW.
 
     Returns True on clean upsert (verifier passed, possibly after a single
-    retry that handled vector-consumer lag). Returns False on persistent
-    drift, after recording the suspect ids for the next audit run. Does
-    not raise: the caller's existing error-handling path (increment counter,
-    continue loop) stays intact.
+    retry that handled vector-consumer lag, or after the v1.2.3.1
+    queue-membership check classified all drift as transient). Returns
+    False on persistent drift, after recording the suspect ids for the
+    next audit run. Does not raise: the caller's existing error-handling
+    path (increment counter, continue loop) stays intact.
 
     `run_id` is the caller-supplied identifier shared across all batches in
     one ingest run; use `make_run_id(source)` at the top of the script.
@@ -195,6 +235,36 @@ def verified_upsert(
     if not drift:
         return True
 
-    _record_pending_drift(run_id, source, drift, pending_dir=pending_dir)
-    _record_maintenance_log(db_path if db_path is not None else DB_PATH, run_id, source, drift)
+    # Vector consumer may simply be behind: writes from this upsert can
+    # still be in embeddings_queue rather than missing from HNSW
+    # permanently. Filter pending-in-queue ids before raising the alarm.
+    target_db = db_path if db_path is not None else DB_PATH
+    try:
+        in_queue = _check_queue_membership(target_db, drift)
+    except Exception as e:
+        # Belt-and-suspenders: helper already swallows sqlite errors; if
+        # something else explodes we still must not break the never-raise
+        # contract. Fall back to pre-v1.2.3.1 behaviour (treat all as drift).
+        print(
+            f"[ingest_helpers] WARN: queue-membership check failed for "
+            f"run_id={run_id}: {e}. Treating all drift as permanent.",
+            file=sys.stderr,
+        )
+        in_queue = set()
+
+    real_drift = [eid for eid in drift if eid not in in_queue]
+    transient_count = len(drift) - len(real_drift)
+
+    if not real_drift:
+        print(
+            f"[ingest_helpers] transient drift suppressed: "
+            f"{transient_count} chunk(s) pending in embeddings_queue "
+            f"(run_id={run_id}, source={source})",
+            file=sys.stderr,
+        )
+        return True
+
+    _record_pending_drift(run_id, source, real_drift, pending_dir=pending_dir)
+    _record_maintenance_log(target_db, run_id, source, real_drift,
+                            transient_count=transient_count)
     return False
