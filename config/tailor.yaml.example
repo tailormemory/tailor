@@ -257,8 +257,10 @@ enrichment:
 
   fact_derivation:
     backends:
+      - provider: google
+        model: gemini-2.5-flash
       - provider: anthropic
-        model: claude-haiku-4-5-20251001
+        model: claude-haiku-4-5-20251001  # fallback on Gemini rate-limit/error
 
   entity_extraction:
     backends:
@@ -271,9 +273,14 @@ enrichment:
         model: claude-haiku-4-5-20251001
 
   fact_supersession:
+    daily_limit_per_backend: 50000  # high-volume role; default 4500 would route 91% of pairs to fallback
     backends:
+      - provider: google
+        model: gemini-2.5-flash
+        workers: 5
       - provider: anthropic
-        model: claude-haiku-4-5-20251001
+        model: claude-haiku-4-5-20251001  # fallback on Gemini rate-limit/error
+        workers: 15
 
   summaries:
     backends:

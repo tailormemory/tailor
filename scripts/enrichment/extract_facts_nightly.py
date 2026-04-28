@@ -110,6 +110,11 @@ def _parse_facts_json(content):
 # BACKEND CALLERS
 # ============================================================
 
+# NOTE: shared implementation now lives at scripts/lib/backend_manager.py
+# (used by fact_supersession.py and derive_facts.py). This in-line copy
+# is preserved temporarily to avoid expanding test surface in the
+# v1.2.3.x cost-leak fix PR. Migration tracked in
+# docs/v1.2.4_resume_state.md "v1.2.5 backlog".
 class BackendManager:
     """Gestisce la rotazione tra backend con tracking dei rate limit."""
 
