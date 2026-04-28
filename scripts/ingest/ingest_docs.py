@@ -74,6 +74,130 @@ OVERLAP_CHARS = 200
 
 import re as _re
 
+
+# # v1.2.4 paddle real impl
+# Lazy module-level singleton for PPStructureV3.
+# Init cost (warm cache): ~1.6s. Cold cache: triggers ~1GB model download from
+# Paddle CDN (allocate 30-60min on first run, depending on bandwidth).
+# Singleton avoids re-init across multiple PDFs in same process (e.g. nightly
+# batch ingestion).
+_paddle_pipeline = None
+
+
+def _get_paddle_ocr():
+    """Return lazy-initialized PPStructureV3 instance.
+
+    Silences paddleocr/paddlex/ppocr loggers to WARNING to suppress per-predict
+    'Creating model:' noise (cosmetic — models already in memory after init).
+    """
+    global _paddle_pipeline
+    if _paddle_pipeline is None:
+        import logging
+        for _name in ("paddleocr", "paddlex", "ppocr"):
+            logging.getLogger(_name).setLevel(logging.WARNING)
+        from paddleocr import PPStructureV3
+        _paddle_pipeline = PPStructureV3(
+            lang="it",
+            use_textline_orientation=True,
+            use_table_recognition=True,
+            use_seal_recognition=False,
+            use_formula_recognition=False,
+            use_chart_recognition=False,
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+        )
+    return _paddle_pipeline
+
+
+# Patterns that identify "bilancio gestionale centro-di-costo" templates
+# (Sistemi/Zucchetti/TeamSystem). These have layout detection failures in
+# PaddleOCR PPStructureV3 — see docs/v1.2.4_paddleocr_comparison.md.
+# Detection: scan first page text via PyMuPDF; if any pattern matches, route
+# to legacy extractor regardless of paddle config.
+_GESTIONALE_PATTERNS = (
+    "BILANCIO DI VERIFICA",
+    "TCA PER CENTRO DI COSTO",
+    "Centro di costo",
+    "TCA per centro di costo",
+)
+
+
+def _is_bilancio_gestionale(filepath):
+    """Return True if first page of PDF matches gestionale template patterns.
+
+    Uses PyMuPDF quick text extract (no OCR). ~50-100ms cost per doc.
+    Conservative: if extraction fails, returns False (paddle proceeds).
+    """
+    try:
+        import fitz
+        with fitz.open(filepath) as doc:
+            if doc.page_count == 0:
+                return False
+            first_page_text = doc[0].get_text()
+            for pat in _GESTIONALE_PATTERNS:
+                if pat in first_page_text:
+                    return True
+    except Exception:
+        return False
+    return False
+
+
+def _normalize_legacy_sections(sections):
+    """Add 'markdown' key and 'metadata.extractor' to legacy sections so that
+    whole-doc fallback returns a schema consistent with paddle output.
+    Idempotent.
+    """
+    out = []
+    for s in sections or []:
+        if not isinstance(s, dict):
+            out.append(s)
+            continue
+        meta = dict(s.get("metadata") or {})
+        meta.setdefault("extractor", "legacy_fallback")
+        out.append({
+            "text": s.get("text", ""),
+            "markdown": s.get("markdown", ""),
+            "metadata": meta,
+        })
+    return out
+
+
+def _log_paddle_fallback(filepath, reason, error, events):
+    """Append a fallback audit record to logs/paddle_fallback_<YYYYMMDD>.json."""
+    import json
+    import logging
+    from datetime import datetime
+    from pathlib import Path as _Path
+
+    logger = logging.getLogger(__name__)
+    try:
+        log_dir = _Path("/Users/jarvis/tailor/logs")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"paddle_fallback_{datetime.now().strftime('%Y%m%d')}.json"
+
+        entry = {
+            "ts": datetime.now().isoformat(),
+            "filepath": str(filepath),
+            "reason": reason,
+            "error": error,
+            "events": events,
+        }
+
+        existing = []
+        if log_file.exists():
+            try:
+                existing = json.loads(log_file.read_text())
+                if not isinstance(existing, list):
+                    existing = [existing]
+            except Exception:
+                existing = []
+
+        existing.append(entry)
+        log_file.write_text(json.dumps(existing, indent=2, ensure_ascii=False))
+    except Exception as e:
+        logger.error("Failed to write fallback audit log: %s", e)
+
+
 # Folder → readable label map (built from cloud_sync config)
 def _build_folder_labels():
     try:
@@ -235,7 +359,187 @@ def _ocr_vision(page):
 
 
 def extract_pdf(filepath):
-    """Estrae testo da PDF. Pipeline: testo nativo -> Tesseract -> Apple Vision."""
+    """Estrae testo da PDF. Routing v1.2.4: PaddleOCR per doc strutturati o low-text, altrimenti pipeline nativa."""
+    if cfg("paddleocr", "enabled", False):
+        doc_type = infer_doc_type(os.path.basename(filepath))
+        route, reason = _route_to_paddle(filepath, doc_type)
+        if route:
+            return _extract_pdf_paddle(filepath, doc_type, reason)
+    return _extract_pdf_legacy(filepath)
+
+
+def _route_to_paddle(filepath, doc_type):
+    """True if PaddleOCR should handle this PDF, with reason ('doc_type'|'low_text'|None)."""
+    # v1.2.4 gestionale guard
+    if _is_bilancio_gestionale(filepath):
+        return False, "gestionale_blocklist"
+
+    structured = cfg("paddleocr", "structured_doc_types", []) or []
+    if doc_type in structured:
+        return True, "doc_type"
+
+    min_text = cfg("paddleocr", "min_text_threshold", 100)
+    try:
+        import fitz
+        with fitz.open(filepath) as probe:
+            if sum(len(p.get_text()) for p in probe) < min_text:
+                return True, "low_text"
+    except Exception:
+        pass  # Probe failure: legacy handler will retry with its own error handling
+    return False, None
+
+
+def _extract_pdf_paddle(filepath, doc_type, reason):
+    """Extract PDF via PaddleOCR PPStructureV3 with per-page legacy fallback.
+
+    Schema: returns list of sections, one per page (page number 1-indexed):
+        [
+            {
+                "text": <flat text, backward-compat>,
+                "markdown": <HTML/markdown with table structure, may be empty>,
+                "metadata": {
+                    "page": <1-indexed>,
+                    "total_pages": <int>,
+                    "ocr": True,
+                    "extractor": "paddleocr" | "legacy_fallback" | ...,
+                },
+            },
+            ...
+        ]
+
+    Per-page failure (paddle predict raises) -> fallback to legacy for that page,
+    logged in logs/paddle_fallback_<ts>.json.
+    Whole-doc failure (init or top-level predict raises) -> fallback to legacy
+    for entire doc, normalized via _normalize_legacy_sections().
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    print(f"    [paddle] {os.path.basename(filepath)} (doc_type={doc_type or 'unknown'}; reason={reason})")
+
+    fallback_events = []
+    sections = []
+
+    try:
+        pipeline = _get_paddle_ocr()
+    except Exception as e:
+        logger.error("PaddleOCR init failed for %s: %s", filepath, e)
+        _log_paddle_fallback(filepath, "init_failure", str(e), [])
+        return _normalize_legacy_sections(_extract_pdf_legacy(filepath))
+
+    try:
+        pages = list(pipeline.predict(input=filepath))
+    except Exception as e:
+        logger.error("PaddleOCR predict failed for %s: %s", filepath, e)
+        _log_paddle_fallback(filepath, "whole_doc_predict_failure", str(e), [])
+        return _normalize_legacy_sections(_extract_pdf_legacy(filepath))
+
+    total_pages = len(pages)
+    if total_pages == 0:
+        logger.warning("PaddleOCR returned 0 pages for %s, falling back", filepath)
+        _log_paddle_fallback(filepath, "zero_pages", "no pages returned", [])
+        return _normalize_legacy_sections(_extract_pdf_legacy(filepath))
+
+    # For per-page fallback: extract legacy sections lazily, lookup by page number.
+    legacy_sections_cache = None
+
+    def _legacy_for_page(page_1indexed):
+        nonlocal legacy_sections_cache
+        if legacy_sections_cache is None:
+            legacy_sections_cache = _extract_pdf_legacy(filepath)
+        for ls in legacy_sections_cache:
+            if isinstance(ls, dict) and (ls.get("metadata") or {}).get("page") == page_1indexed:
+                return ls
+        return None
+
+    for idx, page_obj in enumerate(pages):
+        page_1indexed = idx + 1
+        try:
+            md_text = ""
+            if hasattr(page_obj, "markdown"):
+                md = page_obj.markdown
+                if isinstance(md, dict):
+                    md_text = md.get("markdown_texts", "") or ""
+                elif isinstance(md, str):
+                    md_text = md
+
+            flat_text = ""
+            try:
+                if "overall_ocr_res" in page_obj:
+                    ocr_res = page_obj["overall_ocr_res"]
+                    if ocr_res is not None and "rec_texts" in ocr_res:
+                        rec_texts = ocr_res["rec_texts"]
+                        if isinstance(rec_texts, (list, tuple)):
+                            flat_text = "\n".join(str(t) for t in rec_texts)
+            except Exception:
+                pass
+
+            if not flat_text and md_text:
+                flat_text = re.sub(r"<[^>]+>", " ", md_text)
+                flat_text = re.sub(r"\s+", " ", flat_text).strip()
+
+            sections.append({
+                "text": flat_text,
+                "markdown": md_text,
+                "metadata": {
+                    "page": page_1indexed,
+                    "total_pages": total_pages,
+                    "ocr": True,
+                    "extractor": "paddleocr",
+                },
+            })
+        except Exception as e:
+            logger.warning(
+                "PaddleOCR page-level failure for %s page %d: %s, falling back",
+                filepath, page_1indexed, e,
+            )
+            fallback_events.append({
+                "page": page_1indexed,
+                "error_type": type(e).__name__,
+                "error": str(e),
+            })
+            try:
+                leg = _legacy_for_page(page_1indexed)
+                if leg is not None:
+                    leg_meta = dict(leg.get("metadata") or {})
+                    leg_meta["extractor"] = "legacy_fallback"
+                    sections.append({
+                        "text": leg.get("text", ""),
+                        "markdown": "",
+                        "metadata": leg_meta,
+                    })
+                else:
+                    sections.append({
+                        "text": "",
+                        "markdown": "",
+                        "metadata": {
+                            "page": page_1indexed,
+                            "total_pages": total_pages,
+                            "ocr": True,
+                            "extractor": "legacy_fallback_empty",
+                        },
+                    })
+            except Exception as e2:
+                logger.error("Legacy fallback also failed for %s page %d: %s",
+                             filepath, page_1indexed, e2)
+                sections.append({
+                    "text": "",
+                    "markdown": "",
+                    "metadata": {
+                        "page": page_1indexed,
+                        "total_pages": total_pages,
+                        "ocr": True,
+                        "extractor": "double_failure",
+                    },
+                })
+
+    if fallback_events:
+        _log_paddle_fallback(filepath, "per_page_fallback", "see events", fallback_events)
+
+    return sections
+
+def _extract_pdf_legacy(filepath):
+    """Pipeline pre-v1.2.4: testo nativo -> Tesseract -> Apple Vision."""
     import fitz
     sections = []
     ocr_used = False

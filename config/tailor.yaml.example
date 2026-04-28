@@ -82,6 +82,16 @@ ingest:
     #   source_dir: gemini_export
     #   enabled: false
 
+# ── PaddleOCR (PDF routing) ──────────────────────────────────
+# Routes PDFs to PaddleOCR when doc_type is in structured_doc_types
+# OR whole-document native text length is below min_text_threshold.
+# Leave enabled: false until validated against your document set.
+paddleocr:
+  enabled: false
+  structured_doc_types: []
+  min_text_threshold: 100        # whole-doc native chars
+  language: it                   # PaddleOCR language code
+
 # ── LLM Backend ───────────────────────────────────────────────
 # Supported providers: anthropic, openai, google, ollama
 # Tier 1 (tool use): anthropic, openai, google

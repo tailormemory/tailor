@@ -20,6 +20,30 @@ Template for upcoming changes. Move entries under a new version heading on relea
 
 ---
 
+## [1.2.4] — 2026-04-28
+
+### Added
+
+- **PaddleOCR backend for structured PDF extraction** (`PPStructureV3`). Optional second extractor pipeline for PDFs in configured `structured_doc_types` or with low native text. Produces table-aware HTML/markdown output alongside flat text. See `docs/v1.2.4_paddleocr_comparison.md` for full validation report and per-doctype verdicts.
+- **Lazy module-level singleton** for the PaddleOCR pipeline (`_get_paddle_ocr()` in `scripts/ingest/ingest_docs.py`), avoiding re-init across multiple PDFs in the same process.
+- **Content-based negative whitelist** for `bilancio gestionale centro-di-costo` templates (Sistemi/AGO ledger family). Detected via first-page text patterns; routed to legacy regardless of doctype config because PaddleOCR's table recognizer fails on this layout family (see report).
+- **Fallback hierarchy**: per-page legacy fallback on PaddleOCR predict failures, with audit trail in `logs/paddle_fallback_<YYYYMMDD>.json`.
+- **Section schema extension**: `sections[]` returned by `extract_pdf()` now include `markdown` field (HTML table structure when available) and `metadata.extractor` field (`"paddleocr"` / `"legacy_fallback"` / etc.) for downstream retrieval-quality analysis.
+- **Validation report** at `docs/v1.2.4_paddleocr_comparison.md` documenting cross-doctype binding-ratio analysis on real Italian financial documents.
+
+### Changed
+
+- `_extract_pdf_legacy()` retains 1-indexed page numbering; `_extract_pdf_paddle()` matches this convention. New `_normalize_legacy_sections()` helper ensures schema consistency when whole-doc fallback occurs.
+- `requirements.txt`: added `paddleocr>=3.0` and `paddlex[ocr]>=3.5`.
+
+### Notes
+
+- First PaddleOCR invocation triggers a one-time ~1 GB model download from Paddle's CDN (~52 minutes on residential bandwidth in our validation). Subsequent runs use the local cache in `~/.paddlex/official_models/`.
+- Per-page predict latency on Apple Silicon CPU: ~19–32 s/page (mobile recognizer). Plan nightly batch budgets accordingly.
+- v1.2.4 ships PaddleOCR as a backend, not as a structured extractor for all doctypes. AdE forms and similar binding-critical documents require post-processing not included in this release.
+
+---
+
 ## [1.2.3] - 2026-04-27 — Post-ingest HNSW verifier + auto-persist after repair
 
 Patch release that closes the chromadb 1.x persist-on-shutdown gap at write time, complementing the audit-and-fix utility shipped in v1.2.2. Two independent components.
