@@ -554,7 +554,7 @@ if os.path.exists(db):
     cc = chromadb.PersistentClient(path=os.path.join('$TAILOR_DIR', 'db', 'chroma'))
     total_chunks = cc.get_collection('tailor_kb').count()
     sup = c.execute('SELECT COUNT(*) FROM facts WHERE superseded_by IS NOT NULL').fetchone()[0]
-    chunks = c.execute('SELECT COUNT(DISTINCT chunk_id) FROM facts').fetchone()[0]
+    chunks = c.execute('SELECT COUNT(*) FROM extraction_log').fetchone()[0]
     remaining = total_chunks - chunks
     c.close()
     print(f'{total}|{sup}|{chunks}|{remaining}')
