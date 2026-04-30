@@ -210,6 +210,66 @@ if _configured_public_base_url:
     )
 
 
+def _compute_dashboard_stats():
+    """Compute the full Stats payload used by /api/dashboard/stats and
+    /api/dashboard/bulk. Returns a dict with keys: chunks, facts,
+    entities, documents, db_size_mb. Caller is responsible for wrapping
+    in JSON response.
+
+    facts.covered counts only chunks with at least one EXTRACTED fact
+    (relation_type='extracted'); derived facts have synthetic chunk_ids
+    not present in ChromaDB and would inflate the metric.
+    """
+    import sqlite3 as _sq3
+    import json as _json_mod
+
+    collection = get_collection()
+    total_chunks = collection.count()
+    source_counts = {}
+    for src in ["document", "email", "claude", "chatgpt"]:
+        try:
+            r = collection.get(where={"source": src}, include=[])
+            source_counts[src] = len(r["ids"])
+        except Exception:
+            source_counts[src] = 0
+
+    facts_data = {"total": 0, "extracted": 0, "derived": 0, "superseded": 0, "covered": 0}
+    if os.path.exists(FACTS_DB_PATH):
+        fc = _sq3.connect(f"file:{FACTS_DB_PATH}?mode=ro", uri=True)
+        facts_data["total"]      = fc.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+        facts_data["extracted"]  = fc.execute("SELECT COUNT(*) FROM facts WHERE relation_type = 'extracted'").fetchone()[0]
+        facts_data["derived"]    = fc.execute("SELECT COUNT(*) FROM facts WHERE relation_type = 'derived'").fetchone()[0]
+        facts_data["superseded"] = fc.execute("SELECT COUNT(*) FROM facts WHERE superseded_by IS NOT NULL").fetchone()[0]
+        facts_data["covered"]    = fc.execute("SELECT COUNT(DISTINCT chunk_id) FROM facts WHERE relation_type = 'extracted'").fetchone()[0]
+        fc.close()
+
+    entity_count = 0
+    epath = os.path.join(DB_DIR, "entity_index.sqlite3")
+    if os.path.exists(epath):
+        ec = _sq3.connect(f"file:{epath}?mode=ro", uri=True)
+        entity_count = ec.execute("SELECT COUNT(DISTINCT entity) FROM entity_index").fetchone()[0]
+        ec.close()
+
+    doc_count = 0
+    reg_path = os.path.join(DB_DIR, "doc_registry.json")
+    if os.path.exists(reg_path):
+        doc_count = len(_json_mod.load(open(reg_path)))
+
+    db_size_mb = 0
+    for fname in os.listdir(DB_DIR):
+        fpath = os.path.join(DB_DIR, fname)
+        if os.path.isfile(fpath):
+            db_size_mb += os.path.getsize(fpath) / (1024 * 1024)
+
+    return {
+        "chunks": {"total": total_chunks, **source_counts},
+        "facts": facts_data,
+        "entities": entity_count,
+        "documents": doc_count,
+        "db_size_mb": round(db_size_mb),
+    }
+
+
 # ============================================================
 # MIDDLEWARE AUTENTICAZIONE
 # ============================================================
@@ -353,52 +413,7 @@ class BearerAuthMiddleware:
 
             # ── Dashboard API ──
             elif path == "/api/dashboard/stats":
-                import sqlite3 as _sq3
-                collection = get_collection()
-                total_chunks = collection.count()
-                # Source breakdown
-                source_counts = {}
-                for src in ["document", "email", "claude", "chatgpt"]:
-                    try:
-                        r = collection.get(where={"source": src}, include=[])
-                        source_counts[src] = len(r["ids"])
-                    except Exception:
-                        source_counts[src] = 0
-                # Facts
-                facts_data = {"total": 0, "superseded": 0, "derived": 0, "covered": 0}
-                if os.path.exists(FACTS_DB_PATH):
-                    fc = _sq3.connect(f"file:{FACTS_DB_PATH}?mode=ro", uri=True)
-                    facts_data["total"] = fc.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
-                    facts_data["superseded"] = fc.execute("SELECT COUNT(*) FROM facts WHERE superseded_by IS NOT NULL").fetchone()[0]
-                    facts_data["derived"] = fc.execute("SELECT COUNT(*) FROM facts WHERE relation_type = 'derived'").fetchone()[0]
-                    facts_data["covered"] = fc.execute("SELECT COUNT(DISTINCT chunk_id) FROM facts").fetchone()[0]
-                    fc.close()
-                # Entities
-                entity_count = 0
-                epath = os.path.join(DB_DIR, "entity_index.sqlite3")
-                if os.path.exists(epath):
-                    ec = _sq3.connect(f"file:{epath}?mode=ro", uri=True)
-                    entity_count = ec.execute("SELECT COUNT(DISTINCT entity) FROM entity_index").fetchone()[0]
-                    ec.close()
-                # Documents
-                doc_count = 0
-                reg_path = os.path.join(DB_DIR, "doc_registry.json")
-                if os.path.exists(reg_path):
-                    import json as _j2
-                    doc_count = len(_j2.load(open(reg_path)))
-                # DB size
-                db_size_mb = 0
-                for fname in os.listdir(DB_DIR):
-                    fpath = os.path.join(DB_DIR, fname)
-                    if os.path.isfile(fpath):
-                        db_size_mb += os.path.getsize(fpath) / (1024 * 1024)
-                return _json_response({
-                    "chunks": {"total": total_chunks, **source_counts},
-                    "facts": facts_data,
-                    "entities": entity_count,
-                    "documents": doc_count,
-                    "db_size_mb": round(db_size_mb),
-                })
+                return _json_response(_compute_dashboard_stats())
 
             elif path == "/api/dashboard/services":
                 import socket as _sock
@@ -757,50 +772,13 @@ class BearerAuthMiddleware:
 
             elif path == "/api/dashboard/bulk":
                 # Single endpoint returning all dashboard data in one call
-                import sqlite3 as _sq3b
                 import json as _jb
                 bulk = {}
 
                 # --- Stats ---
                 try:
-                    collection = get_collection()
-                    total_chunks = collection.count()
-                    source_counts = {}
-                    for src in ["document", "email", "claude", "chatgpt"]:
-                        try:
-                            r = collection.get(where={"source": src}, include=[])
-                            source_counts[src] = len(r["ids"])
-                        except Exception:
-                            source_counts[src] = 0
-                    facts_data = {"total": 0, "superseded": 0, "derived": 0, "covered": 0}
-                    if os.path.exists(FACTS_DB_PATH):
-                        fc = _sq3b.connect(f"file:{FACTS_DB_PATH}?mode=ro", uri=True)
-                        facts_data["total"] = fc.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
-                        facts_data["superseded"] = fc.execute("SELECT COUNT(*) FROM facts WHERE superseded_by IS NOT NULL").fetchone()[0]
-                        facts_data["derived"] = fc.execute("SELECT COUNT(*) FROM facts WHERE relation_type = 'derived'").fetchone()[0]
-                        facts_data["covered"] = fc.execute("SELECT COUNT(DISTINCT chunk_id) FROM facts").fetchone()[0]
-                        fc.close()
-                    entity_count = 0
-                    epath = os.path.join(DB_DIR, "entity_index.sqlite3")
-                    if os.path.exists(epath):
-                        ec = _sq3b.connect(f"file:{epath}?mode=ro", uri=True)
-                        entity_count = ec.execute("SELECT COUNT(DISTINCT entity) FROM entity_index").fetchone()[0]
-                        ec.close()
-                    doc_count = 0
-                    reg_path = os.path.join(DB_DIR, "doc_registry.json")
-                    if os.path.exists(reg_path):
-                        doc_count = len(_jb.load(open(reg_path)))
-                    db_size_mb = 0
-                    for fname in os.listdir(DB_DIR):
-                        fpath = os.path.join(DB_DIR, fname)
-                        if os.path.isfile(fpath):
-                            db_size_mb += os.path.getsize(fpath) / (1024 * 1024)
-                    bulk["stats"] = {
-                        "chunks": {"total": total_chunks, **source_counts},
-                        "facts": facts_data, "entities": entity_count,
-                        "documents": doc_count, "db_size_mb": round(db_size_mb),
-                    }
-                except Exception as e:
+                    bulk["stats"] = _compute_dashboard_stats()
+                except Exception:
                     bulk["stats"] = None
 
                 # --- Services ---
