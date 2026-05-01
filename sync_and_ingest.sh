@@ -44,17 +44,21 @@ OS_TYPE="$(uname -s)"
 MCP_PLIST="/Library/LaunchDaemons/com.tailor.mcp.plist"
 MCP_SERVICE="tailor-mcp"  # systemd service name for Linux
 
-# Load API keys from LaunchDaemon (macOS) or keep from environment
+# Load API keys: env → /etc/tailor/env → plist (legacy fallback)
+if [ -r /etc/tailor/env ]; then
+    set -a
+    . /etc/tailor/env
+    set +a
+fi
+# Legacy plist fallback (deprecated — kept for environments not yet
+# migrated to /etc/tailor/env)
 if command -v plutil &>/dev/null && [ -f "$MCP_PLIST" ]; then
     export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-$(/usr/bin/plutil -extract EnvironmentVariables.ANTHROPIC_API_KEY raw "$MCP_PLIST" 2>/dev/null)}"
     export OPENAI_API_KEY="${OPENAI_API_KEY:-$(/usr/bin/plutil -extract EnvironmentVariables.OPENAI_API_KEY raw "$MCP_PLIST" 2>/dev/null)}"
     export GOOGLE_API_KEY="${GOOGLE_API_KEY:-$(/usr/bin/plutil -extract EnvironmentVariables.GOOGLE_API_KEY raw "$MCP_PLIST" 2>/dev/null)}"
-    TG_TOKEN="${TELEGRAM_BOT_TOKEN:-$(/usr/bin/plutil -extract EnvironmentVariables.TELEGRAM_BOT_TOKEN raw "$MCP_PLIST" 2>/dev/null)}"
-    TG_CHAT="${TELEGRAM_CHAT_ID:-$(/usr/bin/plutil -extract EnvironmentVariables.TELEGRAM_CHAT_ID raw "$MCP_PLIST" 2>/dev/null)}"
-else
-    TG_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
-    TG_CHAT="${TELEGRAM_CHAT_ID:-}"
 fi
+TG_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+TG_CHAT="${TELEGRAM_CHAT_ID:-}"
 
 # Contatori
 SYNC_ERRORS=0

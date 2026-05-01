@@ -6,7 +6,14 @@ TAILOR_DIR="${TAILOR_HOME:-$(cd "$(dirname "$0")" && pwd)}"
 LOG="$TAILOR_DIR/logs/sync_email.log"
 PY="$TAILOR_DIR/.venv/bin/python3"
 
-# Load API keys from LaunchDaemon (macOS) or keep from environment
+# Load API keys: env → /etc/tailor/env → plist (legacy fallback)
+if [ -r /etc/tailor/env ]; then
+    set -a
+    . /etc/tailor/env
+    set +a
+fi
+# Legacy plist fallback (deprecated — kept for environments not yet
+# migrated to /etc/tailor/env)
 if command -v plutil &>/dev/null && [ -f /Library/LaunchDaemons/com.tailor.mcp.plist ]; then
     export OPENAI_API_KEY="${OPENAI_API_KEY:-$(plutil -extract EnvironmentVariables.OPENAI_API_KEY raw /Library/LaunchDaemons/com.tailor.mcp.plist 2>/dev/null)}"
     export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-$(plutil -extract EnvironmentVariables.ANTHROPIC_API_KEY raw /Library/LaunchDaemons/com.tailor.mcp.plist 2>/dev/null)}"
