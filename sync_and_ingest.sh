@@ -222,7 +222,7 @@ log "ChromaDB integrity check..."
 CHROMA_CHECK=$("$PYTHON" -c "
 import chromadb, sys
 try:
-    client = chromadb.PersistentClient(path='$TAILOR_DIR/db/chroma')
+    client = chromadb.PersistentClient(path='$TAILOR_DIR/db')
     col = client.get_collection('$(python3 -c "import yaml; c=yaml.safe_load(open('$TAILOR_DIR/config/tailor.yaml')); print(c.get('kb',{}).get('collection','tailor_kb'))" 2>/dev/null || echo tailor_kb)')
     count = col.count()
     if count == 0:
@@ -244,7 +244,7 @@ if [ "$CHROMA_STATUS" != "OK" ]; then
     LATEST_BACKUP=$(ls -t "$TAILOR_DIR/backups"/chroma_*.sqlite3.gz 2>/dev/null | head -1)
     if [ -n "$LATEST_BACKUP" ]; then
         log "Restoring from $LATEST_BACKUP"
-        gunzip -k "$LATEST_BACKUP" -c > "$TAILOR_DIR/db/chroma/chroma.sqlite3"
+        gunzip -k "$LATEST_BACKUP" -c > "$TAILOR_DIR/db/chroma.sqlite3"
         log "Backup restored"
     else
         log "ERROR: No backup found!"
