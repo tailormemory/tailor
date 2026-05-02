@@ -14,6 +14,10 @@ import os, sys, json, subprocess, requests
 from datetime import datetime, timedelta
 from filelock import FileLock
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+from env_loader import load_env
+load_env()
+
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))

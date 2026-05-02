@@ -16,6 +16,9 @@ import os, sys, json, subprocess, socket, requests
 from datetime import datetime
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 from config import get as cfg
+from i18n import t
+from env_loader import load_env
+load_env()
 APP_NAME = cfg("branding", "app_name") or "TAILOR"
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

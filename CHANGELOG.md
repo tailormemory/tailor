@@ -20,6 +20,47 @@ Template for upcoming changes. Move entries under a new version heading on relea
 
 ---
 
+## [1.2.5] — 2026-05-02 — Daemon secrets hardening + cron classifier fix
+
+Security-debt cleanup: removes plaintext API keys from `/Library/LaunchDaemons/` plists, unifies the daemon-secrets pattern across Telegram + MCP via shell wrappers that source `/etc/tailor/env` (the same file `sync_and_ingest.sh` and other cron wrappers already use since v1.2.4.2). Cron-driven Python scripts (`heartbeat.py`, `reminder_checker.py`) gain a small loader so they can self-source the same file once the inline `TELEGRAM_*=` cron-level env vars are retired. Includes a 1-line classifier perf fix unrelated to the hardening work but caught during validation.
+
+### Security
+
+- **Telegram daemon: secrets removed from `com.tailor.telegram.plist`.** Previously `EnvironmentVariables` held `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` in plaintext (file mode `644 root:wheel`, world-readable). New plist runs `scripts/services/run_telegram_bot.sh` under `UserName=jarvis`; the wrapper sources `/etc/tailor/env` (mode `640 root:staff`, group-readable by `jarvis`) and `exec`s the bot. Daemon process now runs as uid 501 instead of root. Backup kept at `*.backup-20260502-123307`.
+- **MCP daemon: same wrapper pattern.** `com.tailor.mcp.plist` previously used inline `/bin/sh -c "set -a; . /etc/tailor/env; exec ..."` (already non-leaking since v1.2.4.2 but inconsistent with the rest of the fleet). Now executes `scripts/services/run_mcp_server.sh`. `UserName=jarvis` was already in place; no behavioural change beyond pattern unification.
+- Both plists now also declare `GroupName=staff` explicitly (was implicit on MCP, missing on Telegram).
+
+### Added
+
+- **`scripts/services/run_telegram_bot.sh`** + **`scripts/services/run_mcp_server.sh`** (28 lines each, `750 jarvis:staff`). Identical structure modulo the final `exec` target. Fail-loud if `/etc/tailor/env` is missing/unreadable — no silent fallback to a cron-level env.
+- **`scripts/lib/env_loader.py`** (28 lines). Tiny `load_env(path="/etc/tailor/env")` helper using `os.environ.setdefault()` so a pre-set key (e.g. legacy crontab `TELEGRAM_BOT_TOKEN=` line) is preserved — backward-compatible during the migration window. Imported by `heartbeat.py` and `reminder_checker.py`.
+
+### Changed
+
+- **`scripts/services/heartbeat.py`** (+2 lines): `from env_loader import load_env; load_env()` after the existing `sys.path` insert. No semantic change when env vars are already present (the cron-level case today).
+- **`scripts/services/reminder_checker.py`** (+4 lines): same pattern, plus the `sys.path` insert that this file lacked.
+
+### Fixed
+
+- **qwen3 classifier extended-thinking regression in `scripts/lib/llm_client.py`** (+3 lines, line 663). `OllamaClient.chat()` now appends an empty `<think>\n\n</think>\n\n` block right after the `<|im_start|>assistant\n` marker, suppressing qwen3.5's default chain-of-thought reasoning. Empirical impact: classifier latency drops from ~31s to ~0.5s per call, validated in vivo with intent classification on saluto/reminder messages. The pre-existing `"think": False` API parameter is silently ignored under `"raw": True` mode and is left in place as future-proofing if Ollama starts honouring it.
+- **Heartbeat: missing `t` import in recovery branch.** `scripts/services/heartbeat.py` calls `t()` from `lib.i18n` for recovery alerts (line 131), but the import was never added. Latent until 2026-05-01 ~20:00, when MCP went down and back up: the next run hit the recovery path and crashed with `NameError`. Cron silently re-fired every 5 min for ~20 hours, each crash before writing log or state. Caught during v1.2.5 soak verification. +1 line: `from i18n import t`.
+- **Telegram daemon now runs under `jarvis` uid**, restoring the principle of least privilege for a network-facing process. Previously ran as root with no operational reason.
+
+### Known issues / deferred
+
+- **`/var/at/tabs/jarvis` (the user's crontab) still contains plaintext `TELEGRAM_BOT_TOKEN=...` and `TELEGRAM_CHAT_ID=...`.** File mode is `600 root:wheel` so the leak is contained (root-only), but the lines are live cron-level env vars at every scheduled job. Editing the crontab via `crontab(1)` is currently blocked on macOS Tahoe 26.1 by what appears to be a kernel-level sandbox restriction on `/var/at/` (EINTR injected on `rename(2)` regardless of binary; even `sudo cp` and `install` fail; FDA grant on Terminal does not unblock — TCC is a separate denial layer). Investigated extensively during this release; no userland workaround found short of Recovery Mode + SIP-disable.
+- **Tracked as v1.2.6: cron→launchd migration.** Once all cron entries become `LaunchDaemon` plists with `UserName=jarvis`, the inert `/var/at/tabs/jarvis` file no longer drives execution and its plaintext content becomes dead.
+- **Telegram token rotation** intentionally deferred until **after** v1.2.6 lands. Reason: `env_loader.load_env()` uses `setdefault`, so as long as cron sets `TELEGRAM_BOT_TOKEN=<old>` in a child process's env, that value wins over `/etc/tailor/env`. Rotating the token while the cron lines remain would silently break heartbeat/reminder Telegram alerts.
+
+### Stats
+
+- 2 new shell wrappers (`run_telegram_bot.sh`, `run_mcp_server.sh`) + 1 new Python helper (`env_loader.py`)
+- 3 files modified (`heartbeat.py`, `reminder_checker.py`, `llm_client.py`)
+- 2 LaunchDaemon plists rewritten to wrapper pattern
+- 2 bugs fixed: qwen3 classifier extended-thinking (~31s → ~0.5s), heartbeat `NameError` on recovery branch (silent crash loop, ~20 h)
+
+---
+
 ## [1.2.4] — 2026-04-28
 
 ### Added

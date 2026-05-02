@@ -660,7 +660,10 @@ class OllamaClient(LLMClient):
             role = m["role"]
             content = m["content"] if isinstance(m["content"], str) else str(m["content"])
             prompt += f"<|im_start|>{role}\n{content}<|im_end|>\n"
-        prompt += "<|im_start|>assistant\n"
+        # Suppress qwen3 extended thinking by injecting an empty <think> block:
+        # `think: False` below is ignored in raw mode, and `/no_think` directives
+        # are not honoured either. Empty-block injection cuts classify ~31s → ~0.5s.
+        prompt += "<|im_start|>assistant\n<think>\n\n</think>\n\n"
         
         try:
             resp = requests.post(
