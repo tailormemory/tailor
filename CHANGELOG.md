@@ -20,6 +20,31 @@ Template for upcoming changes. Move entries under a new version heading on relea
 
 ---
 
+## [1.2.5.1] — 2026-05-02 — Token rotation hygiene
+
+Patch release: scopes the API keys used by TAILOR to dedicated, project-specific keys, separating them from the general-purpose keys used by unrelated systems. Removes an obsolete plist backup that still contained pre-v1.2.5 plaintext secrets.
+
+### Security
+
+- **TAILOR now uses dedicated, project-scoped API keys** for Anthropic, OpenAI, and `TAILOR_API_KEY`. All three were rotated and updated in `/etc/tailor/env` and the encrypted secrets DB. Validated end-to-end via natural-language exchange with the Telegram bot (Brain call against the new Anthropic key succeeded).
+  - **Anthropic**: previous key promoted to general-purpose for use in unrelated systems; new dedicated key (`tailor-prod`) provisioned and installed.
+  - **OpenAI**: previous key revoked at provider console; new dedicated key installed.
+  - **TAILOR_API_KEY**: regenerated; MCP daemon force-restarted via dashboard; claude.ai connector URL updated.
+- **Removed `/Library/LaunchDaemons/com.tailor.mcp.plist.backup-20260430-181921`**, which still contained the pre-v1.2.5 plaintext secrets in `EnvironmentVariables`. Now that those secrets are dead, the file was deleted to reduce on-disk residual leak surface.
+
+### Known issues / deferred (carried over from v1.2.5)
+
+- **Telegram bot token NOT rotated.** Same blocker as v1.2.5: the legacy crontab still injects `TELEGRAM_BOT_TOKEN=<old>` as env var into `heartbeat.py`/`reminder_checker.py`, and `env_loader.load_env()` uses `setdefault` which won't override. Rotating now would silently break Telegram alerts. Deferred until v1.2.6 (cron→launchd migration).
+- **TAILOR_API_KEY still leaks via URL query string.** claude.ai's custom MCP connector UI accepts only a URL field — no separate Bearer header config — so the token must be passed as `?token=<value>`, exposing it in browser history, server access logs, and conversation transcripts. The TAILOR MCP server already supports `Authorization: Bearer` headers, but claude.ai doesn't use them. Tracked as a v1.3.0 sub-feature: implement OAuth provider in MCP server (the same flow used by other claude.ai connectors).
+
+### Stats
+
+- 3 API keys rotated to dedicated TAILOR-scoped keys (Anthropic, OpenAI, TAILOR_API_KEY)
+- 1 obsolete plist backup removed
+- 0 source files modified
+
+---
+
 ## [1.2.5] — 2026-05-02 — Daemon secrets hardening + cron classifier fix
 
 Security-debt cleanup: removes plaintext API keys from `/Library/LaunchDaemons/` plists, unifies the daemon-secrets pattern across Telegram + MCP via shell wrappers that source `/etc/tailor/env` (the same file `sync_and_ingest.sh` and other cron wrappers already use since v1.2.4.2). Cron-driven Python scripts (`heartbeat.py`, `reminder_checker.py`) gain a small loader so they can self-source the same file once the inline `TELEGRAM_*=` cron-level env vars are retired. Includes a 1-line classifier perf fix unrelated to the hardening work but caught during validation.
