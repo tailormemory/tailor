@@ -20,6 +20,49 @@ Template for upcoming changes. Move entries under a new version heading on relea
 
 ---
 
+## [1.2.6] — 2026-05-03 — Cron→Launchd migration
+
+Migrates all 6 TAILOR cron jobs to LaunchDaemons, the modern macOS scheduling subsystem. Resolves the Tahoe-26.1 block on `crontab(1)` editing (encountered during v1.2.5) by sidestepping cron entirely. The cron daemon is left in place but sent SIGSTOP, freezing it without removing it (SIP-protected service). Includes Telegram bot token rotation, now unblocked since cron-level env injection is gone.
+
+### Added
+
+- **6 new shell wrappers in `scripts/services/`** (`750 jarvis:staff`, same pattern as v1.2.5: source `/etc/tailor/env`, cd, exec): `run_backup_db.sh`, `run_sync_and_ingest.sh`, `run_sync_email.sh`, `run_heartbeat.sh`, `run_reminder_checker.sh`, `run_model_advisor.sh`.
+- **6 new LaunchDaemon plists in `/Library/LaunchDaemons/`**: `com.tailor.{backup_db,sync_and_ingest,sync_email,heartbeat,reminder_checker,model_advisor}.plist`. All with `UserName=jarvis`, `GroupName=staff`, `RunAtLoad=false`, `KeepAlive=false`. Daily jobs use `StartCalendarInterval`; recurring jobs use `StartInterval` (heartbeat 300s, reminder_checker 60s).
+
+### Changed
+
+- **Cron daemon (PID 553) sent SIGSTOP** to freeze scheduling without uninstalling. SIP prevents `bootout` of `com.vix.cron`. Reversible with `kill -CONT 553` if rollback needed (not advisable: would cause double-execution with the new LaunchDaemons).
+- **`ip-monitor.sh` cron job (out-of-TAILOR-scope, pointed to a non-existent `~/cerebro-bi/`)** is now also frozen as a side effect of SIGSTOP. The script was failing silently every 5 min for an undetermined period.
+
+### Security
+
+- **Telegram bot token rotated.** New token issued via @BotFather, installed via dashboard (`config/tailor.yaml`), Telegram daemon restarted manually. Old token in `/var/at/tabs/jarvis` is now invalidated — the file remains physically on disk but its contents are inert.
+
+### Validation
+
+24h soak validated end-to-end:
+- All 6 new daemons triggered at their schedules with exit code 0
+- sync_and_ingest 4h 28m runtime, fact derivation completed normally
+- heartbeat / reminder_checker continued via launchd post-SIGSTOP, no lapse (state.json and reminders.json mtimes confirm regular ticks)
+- Telegram bot smoke-tested with new token, natural-language reply OK
+
+### Known issues / deferred
+
+- **`/var/at/tabs/jarvis` cannot be removed from userland.** Tahoe 26.1 enforces Data Vault on `/System/Volumes/Data` (mount flag `protect`), blocking modify/delete syscalls on `/var/at/` to any non-Apple-signed process — even root + sudo. Diagnostic ruled out sandbox profiles (no cron-specific profile loaded, no deny entries in logs), BSD flags (file is clean), kqueue watchers (cron PID 553 has no FDs on `/var/at/tabs`). Workarounds tried: `rm`, `cp`, `install`, FDA grants, `launchctl bootout` (SIP-blocked) — all fail. The file is now inert (cron stopped) and contains an invalidated token. Removal requires Recovery Mode + rm against the mounted Data volume; deferred until next physical session at the Mac mini.
+- **TAILOR_API_KEY URL exposure** unchanged from v1.2.5.1. Tracked as v1.3.0 sub-feature: OAuth provider in MCP server.
+- **Dashboard `/api/dashboard/config/restart` only restarts MCP**, not other TAILOR daemons (Telegram, heartbeat, etc.). Discovered during this release while applying the Telegram token rotation. Tracked as v1.2.6.x bug fix: extend the endpoint to support per-service restart (Telegram, heartbeat, reminder_checker, model_advisor, sync_and_ingest, sync_email, backup_db). Currently restart of non-MCP daemons requires TTY: `sudo launchctl bootout/bootstrap`.
+
+### Stats
+
+- 6 new shell wrappers + 6 new LaunchDaemon plists
+- 0 source files modified (pure scheduling-layer migration)
+- 1 cron daemon stopped (PID 553, STAT=Ts)
+- 1 Telegram bot token rotated
+- 24h soak with all 6 jobs validated end-to-end
+- 1 dashboard restart bug discovered (tracked for v1.2.6.x)
+
+---
+
 ## [1.2.5.1] — 2026-05-02 — Token rotation hygiene
 
 Patch release: scopes the API keys used by TAILOR to dedicated, project-specific keys, separating them from the general-purpose keys used by unrelated systems. Removes an obsolete plist backup that still contained pre-v1.2.5 plaintext secrets.
