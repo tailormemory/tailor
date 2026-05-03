@@ -225,11 +225,16 @@ def verified_upsert(
         documents=list(documents),
         metadatas=list(metadatas),
     )
-    drift = _vector_path_drift(collection, ids, embeddings)
-    if not drift:
-        return True
+    # v1.2.6.1: chromadb 1.5.5 SIGSEGVs in collection.query() when called
+    # immediately after upsert() of fresh ids (chroma-core/chroma#6975).
+    # The kill is at the C/Rust level — uncatchable from Python — and takes
+    # the whole ingest process with it, losing buffered stdout and the final
+    # save_registry() call. Skip the inline drift verifier; nightly
+    # repair_hnsw_index.py (--apply) is the canonical drift detector per
+    # this module's docstring. Re-enable once chromadb is pinned past 1.5.5.
+    return True
 
-    if retry_delay > 0:
+    if retry_delay > 0:  # pragma: no cover — disabled above
         time.sleep(retry_delay)
     drift = _vector_path_drift(collection, ids, embeddings)
     if not drift:

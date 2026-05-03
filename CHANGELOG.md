@@ -20,6 +20,37 @@ Template for upcoming changes. Move entries under a new version heading on relea
 
 ---
 
+## [1.2.6.1] — 2026-05-04 — Bug fix release: nightly pipeline silent failure
+
+The nightly pipeline had been silently null-op since 2026-05-01 (`Ingest completed: 0 chunks from 0 files` every night). Two compounding defects masked the failure mode in logs:
+
+1. `scripts/maintenance/garbage_collect.py` referenced an undefined `CLOUD_LOCAL_ROOT` and crashed on every run; the cron parser swallowed the traceback and reported "GC: 0 removed".
+2. `scripts/lib/ingest_helpers.verified_upsert` called `collection.query()` immediately after `collection.upsert()` to detect HNSW drift. On `chromadb==1.5.5` this query SIGSEGVs at the C/Rust level (uncatchable in Python), killing the ingest process mid-iteration. Default-buffered stdout was lost, so cron logs showed only Tesseract OCR noise (unbuffered C stderr) between "Starting document ingest" and "Ingest completed: 0 chunks from 0 files". `doc_registry.json` was never reached, so each subsequent run retried the same files, accumulating duplicate chunks for whatever upserts did persist before the kill.
+
+### Fixed
+
+- **`scripts/maintenance/garbage_collect.py`**: define `CLOUD_LOCAL_ROOT` by reading `cloud_sync[0].local_root` from `tailor.yaml` (with fallback to `ingest.document_root`). Removes the longstanding `NameError: name 'CLOUD_LOCAL_ROOT' is not defined` traceback that hid behind the cron's "Garbage collection completed:  removed" log line.
+- **`scripts/lib/ingest_helpers.py`**: short-circuit `verified_upsert` to return True immediately after `collection.upsert()`. The post-upsert `_vector_path_drift` query (the SIGSEGV trigger on chromadb 1.5.5) is bypassed. HNSW drift detection / repair is deferred to `scripts/maintenance/repair_hnsw_index.py`, which is the canonical drift authority per this module's own docstring. Re-enable verifier inline once chromadb is pinned past 1.5.5 (track [chroma-core/chroma#6975](https://github.com/chroma-core/chroma/issues/6975)).
+
+### Changed
+
+- **`sync_and_ingest.sh`**: each subprocess step (`garbage_collect`, `ingest_docs`, `create_missing_summaries`, `extract_entities`, `build_entity_index`, `generate_user_profile`) now captures `$?` and accumulates non-zero exits into `$ERRORS` with step name + rc — surfaced in the closing Telegram message. Previously these failures were silent: the pipeline only flagged its own bash-level errors (rclone, MCP toggle, fact-extraction timeouts) and ignored every Python step's exit code.
+- **`sync_and_ingest.sh`**: ingest step now runs with `PYTHONUNBUFFERED=1`. Per-file progress (`[N/63] filename.pdf (N KB)`) reaches the log in real time instead of being lost in stdout buffers when the script is killed mid-run. Adds a soft-check: if ingest exits 0 but never printed the `File processati:` result block, that's flagged as `ingest_docs no result block` in `$ERRORS` (the segfault fingerprint).
+
+### Validation
+
+- Pre-fix reproduction: `verified_upsert` of 8 real Credem-extracted chunks → `exit code 139` (SIGSEGV) on the post-upsert query, after a clean `collection.upsert()` call.
+- Post-fix smoke test: garbage_collect `--stats` runs to completion, reports `Registry: 3168 file | Orfani: 47 file (~865 chunk)` without traceback.
+- `sync_and_ingest.sh` syntax-validated (`bash -n`).
+- End-to-end nightly run pending operator launch (cron 03:00 or manual).
+
+### Known issues / deferred
+
+- **15 Credem RPV monthly statements** (Gen2025–Mar2026, 100–300 KB each) discovered un-ingested during diagnosis. Not fixed inline because chromadb writes silently no-op when the MCP daemon holds the database concurrently (separate from the SIGSEGV). The cron pipeline avoids this via SIGUSR1 maintenance toggle, so these files should ingest normally on the next nightly run with this release applied. A misleading registry update from a manual oneshot was rolled back to keep registry/KB consistent.
+- chromadb 1.5.5 silent-write-while-MCP-holds-lock is unrelated to the verifier SIGSEGV but worth tracking. Not in scope for v1.2.6.1.
+
+---
+
 ## [1.2.6] — 2026-05-03 — Cron→Launchd migration
 
 Migrates all 6 TAILOR cron jobs to LaunchDaemons, the modern macOS scheduling subsystem. Resolves the Tahoe-26.1 block on `crontab(1)` editing (encountered during v1.2.5) by sidestepping cron entirely. The cron daemon is left in place but sent SIGSTOP, freezing it without removing it (SIP-protected service). Includes Telegram bot token rotation, now unblocked since cron-level env injection is gone.

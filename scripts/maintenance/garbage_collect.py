@@ -20,6 +20,23 @@ REGISTRY_FILE = os.path.join(DB_DIR, "doc_registry.json")
 LOG_PATH = os.path.join(BASE_DIR, "logs", "garbage_collect.log")
 COLLECTION_NAME = "tailor_kb"
 
+sys.path.insert(0, os.path.join(BASE_DIR, "scripts", "lib"))
+from config import get as cfg
+
+
+def _resolve_cloud_local_root():
+    """Read local_root from cloud_sync[0] in tailor.yaml (fallback: ingest.document_root)."""
+    cs = cfg("cloud_sync") or []
+    if isinstance(cs, dict):
+        cs = [cs]
+    for entry in cs:
+        if isinstance(entry, dict) and entry.get("local_root"):
+            return entry["local_root"]
+    return cfg("ingest", "document_root") or ""
+
+
+CLOUD_LOCAL_ROOT = _resolve_cloud_local_root()
+
 
 def log(msg):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

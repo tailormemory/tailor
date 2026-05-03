@@ -274,28 +274,49 @@ log "Log rotation completed: $ROTATED files truncated"
 # ── 3. GARBAGE COLLECTION ──
 log "Starting garbage collection"
 GC_OUTPUT=$("$PYTHON" scripts/maintenance/garbage_collect.py 2>&1)
+GC_RC=$?
 echo "$GC_OUTPUT" >> "$LOG_FILE"
 GC_REMOVED=$(echo "$GC_OUTPUT" | sed -n 's/.*\([0-9][0-9]*\) file rimossi.*/\1/p' || echo "0")
+if [ "$GC_RC" -ne 0 ]; then
+    ERRORS="${ERRORS}garbage_collect rc=$GC_RC. "
+    log "ERROR: garbage_collect exited with rc=$GC_RC"
+fi
 log "Garbage collection completed: $GC_REMOVED removed"
 
 # ── 4. INGEST DOCUMENTI ──
 log "Starting document ingest"
 cd "$TAILOR_DIR"
-INGEST_OUTPUT=$("$PYTHON" scripts/ingest/ingest_docs.py 2>&1)
+# PYTHONUNBUFFERED=1 so per-file progress lines reach the log in real time
+# instead of being lost in stdout buffers when the script is killed/timed out.
+INGEST_OUTPUT=$(PYTHONUNBUFFERED=1 "$PYTHON" scripts/ingest/ingest_docs.py 2>&1)
+INGEST_RC=$?
 echo "$INGEST_OUTPUT" >> "$LOG_FILE"
 CHUNKS_ADDED=$(echo "$INGEST_OUTPUT" | grep "Chunk aggiunti:" | awk '{print $3}')
 CHUNKS_ADDED=${CHUNKS_ADDED:-0}
 FILES_PROCESSED=$(echo "$INGEST_OUTPUT" | grep "File processati:" | awk '{print $3}')
 FILES_PROCESSED=${FILES_PROCESSED:-0}
+if [ "$INGEST_RC" -ne 0 ]; then
+    ERRORS="${ERRORS}ingest_docs rc=$INGEST_RC. "
+    log "ERROR: ingest_docs exited with rc=$INGEST_RC"
+elif ! echo "$INGEST_OUTPUT" | grep -q "File processati:"; then
+    # Script exited 0 but never printed the result block — likely killed mid-run.
+    ERRORS="${ERRORS}ingest_docs no result block. "
+    log "ERROR: ingest_docs produced no 'File processati' line — likely truncated"
+fi
 log "Ingest completed: $CHUNKS_ADDED chunks from $FILES_PROCESSED files"
 
 # ── 5. GENERATE MISSING DOC_SUMMARY ──
 if [ -n "$ANTHROPIC_API_KEY" ]; then
     log "Starting missing doc_summary generation"
     SUMMARY_OUTPUT=$("$PYTHON" scripts/enrichment/create_missing_summaries.py --workers 2 2>&1)
+    SUMMARY_RC=$?
     echo "$SUMMARY_OUTPUT" >> "$LOG_FILE"
     SUMMARIES_CREATED=$(echo "$SUMMARY_OUTPUT" | sed -n 's/.*\([0-9][0-9]*\) summary creati.*/\1/p' || echo "0")
     SUMMARY_ERRORS=$(echo "$SUMMARY_OUTPUT" | sed -n 's/.*\([0-9][0-9]*\) errori.*/\1/p' || echo "0")
+    if [ "$SUMMARY_RC" -ne 0 ]; then
+        ERRORS="${ERRORS}create_missing_summaries rc=$SUMMARY_RC. "
+        log "ERROR: create_missing_summaries exited with rc=$SUMMARY_RC"
+    fi
     log "Summaries completed: $SUMMARIES_CREATED created, $SUMMARY_ERRORS errors"
 else
     log "WARNING: ANTHROPIC_API_KEY not found, skipping summary"
@@ -306,9 +327,14 @@ fi
 if [ -n "$OPENAI_API_KEY" ]; then
     log "Starting entity extraction (incremental)"
     ENTITY_OUTPUT=$("$PYTHON" scripts/enrichment/extract_entities.py --workers 10 2>&1)
+    ENTITY_RC=$?
     echo "$ENTITY_OUTPUT" >> "$LOG_FILE"
     ENTITIES_EXTRACTED=$(echo "$ENTITY_OUTPUT" | grep "Chunks processed:" | awk '{print $3}' | tr -d ',')
     ENTITIES_EXTRACTED=${ENTITIES_EXTRACTED:-0}
+    if [ "$ENTITY_RC" -ne 0 ]; then
+        ERRORS="${ERRORS}extract_entities rc=$ENTITY_RC. "
+        log "ERROR: extract_entities exited with rc=$ENTITY_RC"
+    fi
     log "Entity extraction completed: $ENTITIES_EXTRACTED chunks"
 else
     log "WARNING: OPENAI_API_KEY not found, skipping entity extraction"
@@ -317,20 +343,30 @@ fi
 # ── 5c. REBUILD ENTITY INDEX ──
 log "Rebuild entity index"
 INDEX_OUTPUT=$("$PYTHON" scripts/enrichment/build_entity_index.py 2>&1)
+INDEX_RC=$?
 echo "$INDEX_OUTPUT" >> "$LOG_FILE"
 INDEX_ENTITIES=$(echo "$INDEX_OUTPUT" | grep "Entities indexed:" | awk '{print $3}' | tr -d ',')
 INDEX_ENTITIES=${INDEX_ENTITIES:-0}
+if [ "$INDEX_RC" -ne 0 ]; then
+    ERRORS="${ERRORS}build_entity_index rc=$INDEX_RC. "
+    log "ERROR: build_entity_index exited with rc=$INDEX_RC"
+fi
 log "Entity index: $INDEX_ENTITIES entities indexed"
 
 # ── 5d. RIGENERA USER PROFILE ──
 if [ -n "$ANTHROPIC_API_KEY" ]; then
     log "Rigenerazione user profile"
     PROFILE_OUTPUT=$("$PYTHON" scripts/enrichment/generate_user_profile.py 2>&1)
+    PROFILE_RC=$?
     echo "$PROFILE_OUTPUT" >> "$LOG_FILE"
-    if echo "$PROFILE_OUTPUT" | grep -q 'PROFILO GENERATO'; then
+    if [ "$PROFILE_RC" -ne 0 ]; then
+        ERRORS="${ERRORS}generate_user_profile rc=$PROFILE_RC. "
+        log "ERROR: generate_user_profile exited with rc=$PROFILE_RC"
+    elif echo "$PROFILE_OUTPUT" | grep -q 'PROFILO GENERATO'; then
         log "User profile rigenerato"
     else
         log "WARNING: rigenerazione profilo fallita"
+        ERRORS="${ERRORS}generate_user_profile no PROFILO GENERATO marker. "
     fi
 fi
 
