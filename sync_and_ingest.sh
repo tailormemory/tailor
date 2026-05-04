@@ -1,4 +1,5 @@
 #!/bin/bash
+set -uo pipefail
 # sync_and_ingest.sh — Pipeline notturna completa TAILOR
 # Executed by cron every night at 3:00
 #
@@ -35,7 +36,7 @@ if [ ! -f "$TAILOR_DIR/mcp_server.py" ]; then
     exit 1
 fi
 cd "$TAILOR_DIR"
-export PYTHONPATH="$TAILOR_DIR:$PYTHONPATH"
+export PYTHONPATH="$TAILOR_DIR:${PYTHONPATH:-}"
 LOG_FILE="$TAILOR_DIR/logs/sync_and_ingest.log"
 RCLONE="${RCLONE_PATH:-$(command -v rclone 2>/dev/null || echo /opt/homebrew/bin/rclone)}"
 PYTHON="$TAILOR_DIR/.venv/bin/python3"
@@ -87,11 +88,57 @@ print(t(sys.stdin.read().strip()))
 }
 
 send_telegram() {
-    if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
-        curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-            -H "Content-Type: application/json" \
-            -d "{\"chat_id\": \"${TG_CHAT}\", \"text\": \"$1\", \"parse_mode\": \"Markdown\"}" > /dev/null 2>&1
+    # v1.2.6.2: build body via python json.dumps (avoids newline-in-string
+    # JSON corruption that silently 400'd every nightly send), capture HTTP
+    # code, retry without parse_mode on 400 markdown errors, log all
+    # outcomes (was previously silenced via > /dev/null 2>&1).
+    if [ -z "${TG_TOKEN:-}" ] || [ -z "${TG_CHAT:-}" ]; then
+        log "Telegram skipped: TG_TOKEN or TG_CHAT empty"
+        return 0
     fi
+    local text="$1"
+    local url="https://api.telegram.org/bot${TG_TOKEN}/sendMessage"
+    local resp_file payload http_code body
+    resp_file=$(mktemp -t tailor_tg.XXXXXX)
+    payload=$("$PYTHON" -c '
+import json, sys
+chat_id, text, parse_mode = sys.argv[1], sys.argv[2], sys.argv[3]
+body = {"chat_id": chat_id, "text": text}
+if parse_mode:
+    body["parse_mode"] = parse_mode
+sys.stdout.write(json.dumps(body))
+' "$TG_CHAT" "$text" "Markdown")
+    http_code=$(curl -s -o "$resp_file" -w "%{http_code}" \
+        -X POST "$url" \
+        -H "Content-Type: application/json" \
+        --data-binary @- <<< "$payload")
+    body=$(cat "$resp_file")
+    if [ "$http_code" = "200" ]; then
+        log "Telegram sent OK"
+        rm -f "$resp_file"
+        return 0
+    fi
+    if [ "$http_code" = "400" ] && echo "$body" | grep -qi "can't parse"; then
+        log "Telegram retry without markdown (400 parse error)"
+        payload=$("$PYTHON" -c '
+import json, sys
+chat_id, text = sys.argv[1], sys.argv[2]
+sys.stdout.write(json.dumps({"chat_id": chat_id, "text": text}))
+' "$TG_CHAT" "$text")
+        http_code=$(curl -s -o "$resp_file" -w "%{http_code}" \
+            -X POST "$url" \
+            -H "Content-Type: application/json" \
+            --data-binary @- <<< "$payload")
+        body=$(cat "$resp_file")
+        if [ "$http_code" = "200" ]; then
+            log "Telegram sent OK (plain)"
+            rm -f "$resp_file"
+            return 0
+        fi
+    fi
+    log "Telegram FAILED: http=$http_code body=$body"
+    rm -f "$resp_file"
+    return 1
 }
 
 # Safety net: exit maintenance mode on ANY exit (crash, kill, timeout, success)
@@ -591,7 +638,7 @@ if os.path.exists(db):
     c = sqlite3.connect(db)
     total = c.execute('SELECT COUNT(*) FROM facts').fetchone()[0]
     import chromadb
-    cc = chromadb.PersistentClient(path=os.path.join('$TAILOR_DIR', 'db', 'chroma'))
+    cc = chromadb.PersistentClient(path=os.path.join('$TAILOR_DIR', 'db'))
     total_chunks = cc.get_collection('tailor_kb').count()
     sup = c.execute('SELECT COUNT(*) FROM facts WHERE superseded_by IS NOT NULL').fetchone()[0]
     chunks = c.execute('SELECT COUNT(*) FROM extraction_log').fetchone()[0]
