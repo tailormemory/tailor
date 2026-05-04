@@ -219,8 +219,9 @@ def verified_upsert(
     `run_id` is the caller-supplied identifier shared across all batches in
     one ingest run; use `make_run_id(source)` at the top of the script.
     """
+    id_list = list(ids)
     collection.upsert(
-        ids=list(ids),
+        ids=id_list,
         embeddings=list(embeddings),
         documents=list(documents),
         metadatas=list(metadatas),
@@ -232,6 +233,38 @@ def verified_upsert(
     # save_registry() call. Skip the inline drift verifier; nightly
     # repair_hnsw_index.py (--apply) is the canonical drift detector per
     # this module's docstring. Re-enable once chromadb is pinned past 1.5.5.
+    #
+    # v1.2.6.3: chromadb 1.5.8 introduced a NEW silent-drop mode unrelated
+    # to the 1.5.5 SIGSEGV: bindings.upsert() returns True even when nothing
+    # is persisted (collection in "frozen" state — repro: audit forense BIS
+    # 2026-05-04). The previous return-True-unconditional left this drop
+    # invisible. Replace it with a cheap post-upsert get() of the first id
+    # in the batch: if the just-upserted id is not readable, the entire
+    # batch is treated as failed (caller increments errors, surfacing the
+    # condition in the nightly log + Telegram). This is a safer substitute
+    # for _vector_path_drift (which still SIGSEGVs on 1.5.5) — get() is
+    # the simplest read path that doesn't trigger the Rust query() bug.
+    if id_list:
+        try:
+            sample_id = id_list[0]
+            result = collection.get(ids=[sample_id])
+            if not result.get("ids") or sample_id not in result["ids"]:
+                print(
+                    f"[ingest_helpers] SILENT DROP detected: upsert returned "
+                    f"OK but get(ids=[{sample_id!r}]) is empty "
+                    f"(run_id={run_id}, source={source}, batch_size={len(id_list)}). "
+                    f"chromadb 1.5.8 frozen-collection bug — see audit forense BIS.",
+                    file=sys.stderr,
+                )
+                return False
+        except Exception as e:
+            print(
+                f"[ingest_helpers] post-upsert sample check raised "
+                f"{type(e).__name__}: {e} (run_id={run_id}, source={source}). "
+                f"Treating batch as failed.",
+                file=sys.stderr,
+            )
+            return False
     return True
 
     if retry_delay > 0:  # pragma: no cover — disabled above
