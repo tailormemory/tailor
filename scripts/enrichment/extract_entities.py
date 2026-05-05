@@ -399,7 +399,12 @@ def get_chunks_to_process(collection, full_mode=False, source_filter="", limit=N
 
     offset = 0
     while offset < total:
-        batch = collection.get(include=["documents", "metadatas", "embeddings"], limit=READ_BATCH_SIZE, offset=offset)
+        try:
+            batch = collection.get(include=["documents", "metadatas", "embeddings"], limit=READ_BATCH_SIZE, offset=offset)
+        except chromadb.errors.InternalError as e:
+            print(f"\n  WARNING: skipping corrupted batch at offset {offset}: {e}")
+            offset += READ_BATCH_SIZE
+            continue
         if not batch["ids"]:
             break
         all_ids.extend(batch["ids"])
