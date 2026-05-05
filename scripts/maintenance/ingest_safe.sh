@@ -19,6 +19,7 @@
 #   3. Stop MCP (sudo launchctl bootout)
 #   4. Run ingest_docs.py [--full]
 #   4b. Run extract_entities.py (incremental, skipped with --no-entities)
+#   4c. Run create_missing_summaries.py (incremental, skipped with --no-summaries)
 #   5. Audit post-ingest (count delta + repair_hnsw_index.py --audit)
 #   6. Restart MCP (sudo launchctl bootstrap)
 #   7. Smoke test (HTTP 200 on /api/dashboard/stats)
@@ -26,10 +27,12 @@
 #   9. Log to logs/ingest_safe_TIMESTAMP.log
 #
 # Usage:
-#   ./ingest_safe.sh                  # incremental safe ingest + entity tagging (default)
+#   ./ingest_safe.sh                  # full safe pipeline: ingest + entities + summaries (default)
 #   ./ingest_safe.sh --dry-run        # pre-flight + status only, no changes
 #   ./ingest_safe.sh --no-backup      # skip rsync (expert use)
-#   ./ingest_safe.sh --no-entities    # skip step 4b extract_entities (ingest only)
+#   ./ingest_safe.sh --no-entities    # skip step 4b extract_entities
+#   ./ingest_safe.sh --no-summaries   # skip step 4c create_missing_summaries
+#   ./ingest_safe.sh --ingest-only    # only step 4 ingest_docs (= --no-entities --no-summaries)
 #   ./ingest_safe.sh --full           # pass --full to ingest_docs.py + extract_entities.py
 
 set -uo pipefail
@@ -65,13 +68,16 @@ TG_CHAT="${TELEGRAM_CHAT_ID:-}"
 DRY_RUN=0
 NO_BACKUP=0
 NO_ENTITIES=0
+NO_SUMMARIES=0
 FULL=0
 for arg in "$@"; do
     case "$arg" in
-        --dry-run)     DRY_RUN=1 ;;
-        --no-backup)   NO_BACKUP=1 ;;
-        --no-entities) NO_ENTITIES=1 ;;
-        --full)        FULL=1 ;;
+        --dry-run)      DRY_RUN=1 ;;
+        --no-backup)    NO_BACKUP=1 ;;
+        --no-entities)  NO_ENTITIES=1 ;;
+        --no-summaries) NO_SUMMARIES=1 ;;
+        --ingest-only)  NO_ENTITIES=1; NO_SUMMARIES=1 ;;
+        --full)         FULL=1 ;;
         -h|--help)
             sed -n '1,/^set -uo pipefail$/p' "$0" | sed -e '$d' -e 's/^# \?//'
             exit 0
@@ -323,6 +329,40 @@ else
     fi
 fi
 
+# ── 4c. CREATE MISSING SUMMARIES (incremental) ──
+# Generate doc_summary chunks for files in registry that don't have one yet.
+# Same MCP-down window as ingest + entities. Anthropic Haiku via API.
+# Each summary = 1 col.add() — chromadb write, hence kept in MCP-down window.
+log "── STEP 4c: create_missing_summaries.py (incremental) ──"
+SUMMARIES_CREATED=0
+SUMMARIES_FAILED=0
+if [ "$INGEST_FAILED" = "1" ] || [ "$ENTITIES_FAILED" = "1" ]; then
+    log "  SKIPPED: prior step failed (rc=139), not running summaries to avoid compounding"
+elif [ "$NO_SUMMARIES" = "1" ]; then
+    log "  SKIPPED: --no-summaries flag"
+elif [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+    log "  SKIPPED: ANTHROPIC_API_KEY not set in env"
+else
+    SUMMARIES_START=$(date +%s)
+    SUMMARIES_OUTPUT=$(PYTHONUNBUFFERED=1 "$PYTHON" scripts/enrichment/create_missing_summaries.py --workers 2 2>&1)
+    SUMMARIES_RC=$?
+    SUMMARIES_DURATION=$(( $(date +%s) - SUMMARIES_START ))
+    echo "--- create_missing_summaries.py output ---" >> "$LOG_FILE"
+    echo "$SUMMARIES_OUTPUT" >> "$LOG_FILE"
+    echo "--- end create_missing_summaries.py ---" >> "$LOG_FILE"
+    log "  summaries finished: rc=$SUMMARIES_RC duration=${SUMMARIES_DURATION}s"
+    # Extract count: script prints "DONE: N summary creati, M errori"
+    SUMMARIES_CREATED=$(echo "$SUMMARIES_OUTPUT" | sed -n 's/.*DONE: \([0-9][0-9]*\) summary creati.*/\1/p' | tail -1)
+    SUMMARIES_CREATED=${SUMMARIES_CREATED:-0}
+    log "  summaries: $SUMMARIES_CREATED created"
+    if [ "$SUMMARIES_RC" = "139" ]; then
+        log "  CRITICAL: SIGSEGV in create_missing_summaries — chromadb #6975 cascade"
+        SUMMARIES_FAILED=1
+    elif [ "$SUMMARIES_RC" -ne 0 ]; then
+        log "  WARNING: create_missing_summaries rc=$SUMMARIES_RC"
+    fi
+fi
+
 # ── 5. AUDIT POST-INGEST ──
 log "── STEP 5: audit drift HNSW vs SQL ──"
 COUNT_POST=$(sql_count "SELECT COUNT(*) FROM embeddings;")
@@ -393,7 +433,7 @@ log "  final embeddings count: $COUNT_FINAL"
 END_TIME=$(date +%s)
 TOTAL_DURATION=$(( END_TIME - START_TIME ))
 
-if [ "$INGEST_FAILED" = "1" ] || [ "$ENTITIES_FAILED" = "1" ]; then
+if [ "$INGEST_FAILED" = "1" ] || [ "$ENTITIES_FAILED" = "1" ] || [ "$SUMMARIES_FAILED" = "1" ]; then
     ICON="🚨"
     STATUS="FAILED (SIGSEGV)"
 elif [ "$SMOKE_OK" = "0" ]; then
@@ -412,6 +452,16 @@ else
     ENTITIES_LINE="🏷 Entities: ${ENTITIES_PROCESSED} chunks tagged"
 fi
 
+if [ "$NO_SUMMARIES" = "1" ]; then
+    SUMMARIES_LINE="📝 Summaries: SKIPPED (--no-summaries)"
+elif [ "$INGEST_FAILED" = "1" ] || [ "$ENTITIES_FAILED" = "1" ]; then
+    SUMMARIES_LINE="📝 Summaries: SKIPPED (prior step failed)"
+elif [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+    SUMMARIES_LINE="📝 Summaries: SKIPPED (ANTHROPIC_API_KEY not set)"
+else
+    SUMMARIES_LINE="📝 Summaries: ${SUMMARIES_CREATED} created"
+fi
+
 TG_MSG="${ICON} *ingest_safe ${STATUS}*
 
 ⏱ Duration: ${TOTAL_DURATION}s
@@ -419,6 +469,7 @@ TG_MSG="${ICON} *ingest_safe ${STATUS}*
 📄 Files processed: ${FILES_PROCESSED}
 📥 Chunks added: ${CHUNKS_ADDED}
 ${ENTITIES_LINE}
+${SUMMARIES_LINE}
 📊 Embeddings: ${COUNT_BASELINE} → ${COUNT_FINAL} (Δ$((COUNT_FINAL - COUNT_BASELINE)))
 🧷 Queue: ${QUEUE_BASELINE} → ${QUEUE_POST}
 🔍 Audit: ${AUDIT_SUMMARY}
@@ -431,7 +482,7 @@ send_telegram "$TG_MSG"
 log "END ingest_safe (${TOTAL_DURATION}s)"
 log "================================================================"
 
-if [ "$INGEST_FAILED" = "1" ]; then
+if [ "$INGEST_FAILED" = "1" ] || [ "$ENTITIES_FAILED" = "1" ] || [ "$SUMMARIES_FAILED" = "1" ]; then
     exit 1
 elif [ "$SMOKE_OK" = "0" ]; then
     exit 2
