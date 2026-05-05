@@ -93,26 +93,50 @@ Log: $LOG_FILE"
 }
 
 send_telegram() {
+    # Send via Telegram, retry without Markdown on 400 (avoids underscore-
+    # in-path parse errors). Pattern matches sync_and_ingest.sh.
     if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT" ]; then
         log "Telegram skipped: TG_TOKEN or TG_CHAT empty"
         return 0
     fi
     local text="$1"
     local url="https://api.telegram.org/bot${TG_TOKEN}/sendMessage"
-    local payload http_code
+    local payload http_code resp_file body
+    resp_file=$(mktemp -t tailor_tg.XXXXXX)
     payload=$("$PYTHON" -c '
 import json, sys
 sys.stdout.write(json.dumps({"chat_id": sys.argv[1], "text": sys.argv[2], "parse_mode": "Markdown"}))
-' "$TG_CHAT" "$text" 2>/dev/null) || return 1
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+' "$TG_CHAT" "$text" 2>/dev/null) || { rm -f "$resp_file"; return 1; }
+    http_code=$(curl -s -o "$resp_file" -w "%{http_code}" \
         -X POST "$url" \
         -H "Content-Type: application/json" \
         --data-binary @- <<< "$payload" 2>/dev/null)
+    body=$(cat "$resp_file" 2>/dev/null)
     if [ "$http_code" = "200" ]; then
         log "Telegram sent OK"
-    else
-        log "Telegram FAILED: http=$http_code"
+        rm -f "$resp_file"
+        return 0
     fi
+    if [ "$http_code" = "400" ]; then
+        log "Telegram retry without markdown (400 parse error)"
+        payload=$("$PYTHON" -c '
+import json, sys
+sys.stdout.write(json.dumps({"chat_id": sys.argv[1], "text": sys.argv[2]}))
+' "$TG_CHAT" "$text" 2>/dev/null) || { rm -f "$resp_file"; return 1; }
+        http_code=$(curl -s -o "$resp_file" -w "%{http_code}" \
+            -X POST "$url" \
+            -H "Content-Type: application/json" \
+            --data-binary @- <<< "$payload" 2>/dev/null)
+        body=$(cat "$resp_file" 2>/dev/null)
+        if [ "$http_code" = "200" ]; then
+            log "Telegram sent OK (plain)"
+            rm -f "$resp_file"
+            return 0
+        fi
+    fi
+    log "Telegram FAILED: http=$http_code body=$body"
+    rm -f "$resp_file"
+    return 1
 }
 
 mcp_pid() {
@@ -228,12 +252,14 @@ fi
 
 # ── 4. INGEST ──
 log "── STEP 4: ingest_docs.py (full=$FULL) ──"
-INGEST_ARGS=()
-if [ "$FULL" = "1" ]; then
-    INGEST_ARGS+=("--full")
-fi
 INGEST_START=$(date +%s)
-INGEST_OUTPUT=$(PYTHONUNBUFFERED=1 "$PYTHON" scripts/ingest/ingest_docs.py "${INGEST_ARGS[@]}" 2>&1)
+# NB: bash 3.2 (macOS default) errors on `"${arr[@]}"` when arr is empty
+# under `set -u`. Branch on FULL flag instead of using an array.
+if [ "$FULL" = "1" ]; then
+    INGEST_OUTPUT=$(PYTHONUNBUFFERED=1 "$PYTHON" scripts/ingest/ingest_docs.py --full 2>&1)
+else
+    INGEST_OUTPUT=$(PYTHONUNBUFFERED=1 "$PYTHON" scripts/ingest/ingest_docs.py 2>&1)
+fi
 INGEST_RC=$?
 INGEST_DURATION=$(( $(date +%s) - INGEST_START ))
 echo "--- ingest_docs.py output ---" >> "$LOG_FILE"
