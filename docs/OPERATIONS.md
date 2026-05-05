@@ -124,6 +124,66 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/com.tailor.sync_and_inges
 sudo launchctl bootout system/com.tailor.sync_and_ingest
 ```
 
+### NOPASSWD setup for ingest_safe.sh (optional)
+
+`ingest_safe.sh` invokes `sudo` twice per run (bootout + bootstrap of MCP).
+By default this triggers two interactive password prompts. For autonomous
+operation (Claude Code launching the script directly without TTY, or
+scheduled cron-style runs), grant NOPASSWD on those two specific commands.
+
+**File**: `/etc/sudoers.d/tailor` (mode `0440 root:wheel`)
+
+```
+# TAILOR — ingest_safe.sh autonomous mode
+# Allows ingest_safe.sh to bootout+bootstrap the MCP daemon without
+# password prompt. Scope: 2 fixed launchctl invocations on
+# com.tailor.mcp ONLY. Worst-case abuse: kill+restart MCP loop = DoS,
+# recoverable. Does NOT grant arbitrary root.
+# Remove this file when migrating off chromadb 1.5.8 + ingest_safe.sh.
+jarvis ALL=(root) NOPASSWD: /bin/launchctl bootout system/com.tailor.mcp
+jarvis ALL=(root) NOPASSWD: /bin/launchctl bootstrap system /Library/LaunchDaemons/com.tailor.mcp.plist
+```
+
+**Install** (atomic via temp + validate + rename):
+
+```bash
+sudo tee /etc/sudoers.d/tailor.tmp > /dev/null <<'EOF'
+# TAILOR — ingest_safe.sh autonomous mode
+jarvis ALL=(root) NOPASSWD: /bin/launchctl bootout system/com.tailor.mcp
+jarvis ALL=(root) NOPASSWD: /bin/launchctl bootstrap system /Library/LaunchDaemons/com.tailor.mcp.plist
+EOF
+sudo chmod 0440 /etc/sudoers.d/tailor.tmp
+sudo visudo -c -f /etc/sudoers.d/tailor.tmp \
+  && sudo mv /etc/sudoers.d/tailor.tmp /etc/sudoers.d/tailor \
+  || sudo rm /etc/sudoers.d/tailor.tmp
+```
+
+**Verify** (does NOT take MCP down):
+
+```bash
+# List NOPASSWD-allowed commands for current user
+sudo -nl 2>&1 | grep -A1 launchctl
+# Expected output: shows the 2 launchctl rules above
+```
+
+**Removal** (when migration kicks in):
+
+```bash
+sudo rm /etc/sudoers.d/tailor
+# Removes NOPASSWD authorization. Does NOT affect MCP daemon or any other
+# system state. After removal, ingest_safe.sh reverts to interactive
+# password prompts.
+```
+
+**Threat model.** The two NOPASSWD entries are scoped to exact, hardcoded
+arguments (no wildcards, no glob, no path injection). Worst-case abuse
+of the credentials is unauthorized bootout/bootstrap of the MCP daemon
+(denial-of-service against TAILOR itself, not privilege escalation
+beyond TAILOR scope). The `bootstrap` rule references a fixed plist
+path under `/Library/LaunchDaemons/` which is root-owned (only root can
+modify the plist content), so the bootstrap target is immutable from
+attacker perspective.
+
 ### Long-term strategy candidates (NOT decided yet)
 
 - **Qdrant migration** — replace chromadb entirely. Largest scope, cleanest
