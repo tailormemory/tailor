@@ -18,6 +18,7 @@
 #   2. Backup db/ via rsync (skipped with --no-backup)
 #   3. Stop MCP (sudo launchctl bootout)
 #   4. Run ingest_docs.py [--full]
+#   4b. Run extract_entities.py (incremental, skipped with --no-entities)
 #   5. Audit post-ingest (count delta + repair_hnsw_index.py --audit)
 #   6. Restart MCP (sudo launchctl bootstrap)
 #   7. Smoke test (HTTP 200 on /api/dashboard/stats)
@@ -25,10 +26,11 @@
 #   9. Log to logs/ingest_safe_TIMESTAMP.log
 #
 # Usage:
-#   ./ingest_safe.sh                  # incremental safe ingest (default)
+#   ./ingest_safe.sh                  # incremental safe ingest + entity tagging (default)
 #   ./ingest_safe.sh --dry-run        # pre-flight + status only, no changes
 #   ./ingest_safe.sh --no-backup      # skip rsync (expert use)
-#   ./ingest_safe.sh --full           # pass --full to ingest_docs.py
+#   ./ingest_safe.sh --no-entities    # skip step 4b extract_entities (ingest only)
+#   ./ingest_safe.sh --full           # pass --full to ingest_docs.py + extract_entities.py
 
 set -uo pipefail
 
@@ -62,12 +64,14 @@ TG_CHAT="${TELEGRAM_CHAT_ID:-}"
 # CLI parsing
 DRY_RUN=0
 NO_BACKUP=0
+NO_ENTITIES=0
 FULL=0
 for arg in "$@"; do
     case "$arg" in
-        --dry-run)   DRY_RUN=1 ;;
-        --no-backup) NO_BACKUP=1 ;;
-        --full)      FULL=1 ;;
+        --dry-run)     DRY_RUN=1 ;;
+        --no-backup)   NO_BACKUP=1 ;;
+        --no-entities) NO_ENTITIES=1 ;;
+        --full)        FULL=1 ;;
         -h|--help)
             sed -n '1,/^set -uo pipefail$/p' "$0" | sed -e '$d' -e 's/^# \?//'
             exit 0
@@ -282,6 +286,43 @@ FILES_PROCESSED=$(echo "$INGEST_OUTPUT" | grep "File processati:" | awk '{print 
 FILES_PROCESSED=${FILES_PROCESSED:-0}
 log "  chunks added: $CHUNKS_ADDED, files processed: $FILES_PROCESSED"
 
+# ── 4b. EXTRACT ENTITIES (incremental) ──
+# Run extract_entities on the chunks just added so they're searchable by
+# entity filter (kb_search_by_entity etc.) immediately. Same MCP-down
+# window — no extra coordination needed. Uses defensive try/except on
+# paginated read (commit 9b2e2bc) so corrupted batches skip gracefully.
+log "── STEP 4b: extract_entities.py (incremental) ──"
+ENTITIES_PROCESSED=0
+ENTITIES_FAILED=0
+if [ "$INGEST_FAILED" = "1" ]; then
+    log "  SKIPPED: ingest failed (rc=139), not running entities to avoid compounding"
+elif [ "$NO_ENTITIES" = "1" ]; then
+    log "  SKIPPED: --no-entities flag"
+else
+    ENTITIES_START=$(date +%s)
+    if [ "$FULL" = "1" ]; then
+        ENTITIES_OUTPUT=$(PYTHONUNBUFFERED=1 "$PYTHON" scripts/enrichment/extract_entities.py --full 2>&1)
+    else
+        ENTITIES_OUTPUT=$(PYTHONUNBUFFERED=1 "$PYTHON" scripts/enrichment/extract_entities.py 2>&1)
+    fi
+    ENTITIES_RC=$?
+    ENTITIES_DURATION=$(( $(date +%s) - ENTITIES_START ))
+    echo "--- extract_entities.py output ---" >> "$LOG_FILE"
+    echo "$ENTITIES_OUTPUT" >> "$LOG_FILE"
+    echo "--- end extract_entities.py ---" >> "$LOG_FILE"
+    log "  entities finished: rc=$ENTITIES_RC duration=${ENTITIES_DURATION}s"
+    # Extract count of processed chunks (script prints "Chunks processed: N")
+    ENTITIES_PROCESSED=$(echo "$ENTITIES_OUTPUT" | grep -E "Chunks processed:" | tail -1 | awk '{print $3}' | tr -d ',')
+    ENTITIES_PROCESSED=${ENTITIES_PROCESSED:-0}
+    log "  entities: $ENTITIES_PROCESSED chunks tagged"
+    if [ "$ENTITIES_RC" = "139" ]; then
+        log "  CRITICAL: SIGSEGV in extract_entities — chromadb #6975 cascade"
+        ENTITIES_FAILED=1
+    elif [ "$ENTITIES_RC" -ne 0 ]; then
+        log "  WARNING: extract_entities rc=$ENTITIES_RC (defensive try/except on read may have triggered)"
+    fi
+fi
+
 # ── 5. AUDIT POST-INGEST ──
 log "── STEP 5: audit drift HNSW vs SQL ──"
 COUNT_POST=$(sql_count "SELECT COUNT(*) FROM embeddings;")
@@ -352,7 +393,7 @@ log "  final embeddings count: $COUNT_FINAL"
 END_TIME=$(date +%s)
 TOTAL_DURATION=$(( END_TIME - START_TIME ))
 
-if [ "$INGEST_FAILED" = "1" ]; then
+if [ "$INGEST_FAILED" = "1" ] || [ "$ENTITIES_FAILED" = "1" ]; then
     ICON="🚨"
     STATUS="FAILED (SIGSEGV)"
 elif [ "$SMOKE_OK" = "0" ]; then
@@ -363,12 +404,21 @@ else
     STATUS="completed"
 fi
 
+if [ "$NO_ENTITIES" = "1" ]; then
+    ENTITIES_LINE="🏷 Entities: SKIPPED (--no-entities)"
+elif [ "$INGEST_FAILED" = "1" ]; then
+    ENTITIES_LINE="🏷 Entities: SKIPPED (ingest failed)"
+else
+    ENTITIES_LINE="🏷 Entities: ${ENTITIES_PROCESSED} chunks tagged"
+fi
+
 TG_MSG="${ICON} *ingest_safe ${STATUS}*
 
 ⏱ Duration: ${TOTAL_DURATION}s
 📦 Backup: ${BACKUP_DIR}
 📄 Files processed: ${FILES_PROCESSED}
 📥 Chunks added: ${CHUNKS_ADDED}
+${ENTITIES_LINE}
 📊 Embeddings: ${COUNT_BASELINE} → ${COUNT_FINAL} (Δ$((COUNT_FINAL - COUNT_BASELINE)))
 🧷 Queue: ${QUEUE_BASELINE} → ${QUEUE_POST}
 🔍 Audit: ${AUDIT_SUMMARY}
