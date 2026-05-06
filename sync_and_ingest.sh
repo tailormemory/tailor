@@ -61,6 +61,15 @@ fi
 TG_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TG_CHAT="${TELEGRAM_CHAT_ID:-}"
 
+# Nightly mode toggle: full | facts_only
+# - full (default): runs all steps (rclone sync + ingest + summaries + entities
+#   + entity_index + profile + facts pipeline + supersession + derivation)
+# - facts_only: skips chromadb-write steps (rclone sync, ingest_docs,
+#   create_missing_summaries, extract_entities) to avoid the chromadb 1.5.8
+#   #6975 bug class. Runs only SQLite-read-only steps + facts pipeline.
+#   Use ingest_safe.sh manually for ingest+entities while in this mode.
+NIGHTLY_MODE="${TAILOR_NIGHTLY_MODE:-full}"
+
 # Contatori
 SYNC_ERRORS=0
 GC_REMOVED=0
@@ -164,7 +173,7 @@ ensure_mcp_exit_maintenance() {
 trap ensure_mcp_exit_maintenance EXIT
 
 echo "========================================" >> "$LOG_FILE"
-log "START sync_and_ingest v9"
+log "START sync_and_ingest v9 (mode=$NIGHTLY_MODE)"
 START_TIME=$(date +%s)
 RUN_START=$(date -u +"%Y-%m-%dT%H:%M:%S")
 # Read pipeline config from YAML (with defaults)
@@ -331,29 +340,35 @@ fi
 log "Garbage collection completed: $GC_REMOVED removed"
 
 # ── 4. INGEST DOCUMENTI ──
-log "Starting document ingest"
-cd "$TAILOR_DIR"
-# PYTHONUNBUFFERED=1 so per-file progress lines reach the log in real time
-# instead of being lost in stdout buffers when the script is killed/timed out.
-INGEST_OUTPUT=$(PYTHONUNBUFFERED=1 "$PYTHON" scripts/ingest/ingest_docs.py 2>&1)
-INGEST_RC=$?
-echo "$INGEST_OUTPUT" >> "$LOG_FILE"
-CHUNKS_ADDED=$(echo "$INGEST_OUTPUT" | grep "Chunk aggiunti:" | awk '{print $3}')
-CHUNKS_ADDED=${CHUNKS_ADDED:-0}
-FILES_PROCESSED=$(echo "$INGEST_OUTPUT" | grep "File processati:" | awk '{print $3}')
-FILES_PROCESSED=${FILES_PROCESSED:-0}
-if [ "$INGEST_RC" -ne 0 ]; then
-    ERRORS="${ERRORS}ingest_docs rc=$INGEST_RC. "
-    log "ERROR: ingest_docs exited with rc=$INGEST_RC"
-elif ! echo "$INGEST_OUTPUT" | grep -q "File processati:"; then
-    # Script exited 0 but never printed the result block — likely killed mid-run.
-    ERRORS="${ERRORS}ingest_docs no result block. "
-    log "ERROR: ingest_docs produced no 'File processati' line — likely truncated"
+if [ "$NIGHTLY_MODE" = "facts_only" ]; then
+    log "STEP 4 SKIPPED (mode=facts_only): no ingest_docs (run ingest_safe.sh manually)"
+else
+    log "Starting document ingest"
+    cd "$TAILOR_DIR"
+    # PYTHONUNBUFFERED=1 so per-file progress lines reach the log in real time
+    # instead of being lost in stdout buffers when the script is killed/timed out.
+    INGEST_OUTPUT=$(PYTHONUNBUFFERED=1 "$PYTHON" scripts/ingest/ingest_docs.py 2>&1)
+    INGEST_RC=$?
+    echo "$INGEST_OUTPUT" >> "$LOG_FILE"
+    CHUNKS_ADDED=$(echo "$INGEST_OUTPUT" | grep "Chunk aggiunti:" | awk '{print $3}')
+    CHUNKS_ADDED=${CHUNKS_ADDED:-0}
+    FILES_PROCESSED=$(echo "$INGEST_OUTPUT" | grep "File processati:" | awk '{print $3}')
+    FILES_PROCESSED=${FILES_PROCESSED:-0}
+    if [ "$INGEST_RC" -ne 0 ]; then
+        ERRORS="${ERRORS}ingest_docs rc=$INGEST_RC. "
+        log "ERROR: ingest_docs exited with rc=$INGEST_RC"
+    elif ! echo "$INGEST_OUTPUT" | grep -q "File processati:"; then
+        # Script exited 0 but never printed the result block — likely killed mid-run.
+        ERRORS="${ERRORS}ingest_docs no result block. "
+        log "ERROR: ingest_docs produced no 'File processati' line — likely truncated"
+    fi
+    log "Ingest completed: $CHUNKS_ADDED chunks from $FILES_PROCESSED files"
 fi
-log "Ingest completed: $CHUNKS_ADDED chunks from $FILES_PROCESSED files"
 
 # ── 5. GENERATE MISSING DOC_SUMMARY ──
-if [ -n "$ANTHROPIC_API_KEY" ]; then
+if [ "$NIGHTLY_MODE" = "facts_only" ]; then
+    log "STEP 5 SKIPPED (mode=facts_only): no create_missing_summaries"
+elif [ -n "$ANTHROPIC_API_KEY" ]; then
     log "Starting missing doc_summary generation"
     SUMMARY_OUTPUT=$("$PYTHON" scripts/enrichment/create_missing_summaries.py --workers 2 2>&1)
     SUMMARY_RC=$?
@@ -371,7 +386,9 @@ else
 fi
 
 # ── 5b. ENTITY EXTRACTION (incremental) ──
-if [ -n "$OPENAI_API_KEY" ]; then
+if [ "$NIGHTLY_MODE" = "facts_only" ]; then
+    log "STEP 5b SKIPPED (mode=facts_only): no extract_entities (handled by ingest_safe.sh)"
+elif [ -n "$OPENAI_API_KEY" ]; then
     log "Starting entity extraction (incremental)"
     ENTITY_OUTPUT=$("$PYTHON" scripts/enrichment/extract_entities.py --workers 10 2>&1)
     ENTITY_RC=$?
@@ -655,14 +672,22 @@ FACTS_DB_CHUNKS=$(echo "$FACTS_TOTAL" | cut -d'|' -f3)
 FACTS_DB_REMAINING=$(echo "$FACTS_TOTAL" | cut -d'|' -f4)
 
 # Compose message in English, then translate
-MSG_EN="${ICON} *Nightly pipeline ${STATUS}* (v9)
+if [ "$NIGHTLY_MODE" = "facts_only" ]; then
+    MODE_TAG="facts-only"
+    INGEST_LINE="🚫 Ingest + summaries + entities: SKIPPED (facts_only mode — run ingest_safe.sh manually)"
+else
+    MODE_TAG="v9"
+    INGEST_LINE="📄 Ingest: ${CHUNKS_ADDED} chunks (${FILES_PROCESSED} files)
+🏷 Entities: ${ENTITIES_EXTRACTED} chunks extracted
+📝 Summary: ${SUMMARIES_CREATED} created"
+fi
+
+MSG_EN="${ICON} *Nightly pipeline ${STATUS}* (${MODE_TAG})
 
 ⏱ Duration: ${DURATION}s
 📥 Sync: ${SYNC_ERRORS} errors
 🗑 GC: ${GC_REMOVED} orphans removed
-📄 Ingest: ${CHUNKS_ADDED} chunks (${FILES_PROCESSED} files)
-🏷 Entities: ${ENTITIES_EXTRACTED} chunks extracted
-📝 Summary: ${SUMMARIES_CREATED} created
+${INGEST_LINE}
 🧠 Facts: +${FACTS_EXTRACTED} facts (${FACTS_CHUNKS} chunks)
 🔄 Supersession: ${FACTS_SUPERSEDED} facts superseded (${FACTS_COMPARED} comparisons)
 🔗 Derives: ${FACTS_DERIVED} inferred from ${DERIVES_ENTITIES} entities
