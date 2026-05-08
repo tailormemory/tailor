@@ -105,8 +105,7 @@
     const API_TOKEN = new URLSearchParams(window.location.search).get("token") || "";
 
     async function apiFetch(endpoint) {
-      const sep = endpoint.includes("?") ? "&" : "?";
-      const url = `${API_BASE}/api/dashboard/${endpoint}${API_TOKEN ? `${sep}token=${API_TOKEN}` : ""}`;
+      const url = `${API_BASE}/api/dashboard/${endpoint}`;
       try {
         const r = await fetch(url, { credentials: "include" });
         if (!r.ok) {
@@ -129,8 +128,7 @@
           opts.headers["Content-Type"] = "application/json";
           opts.body = JSON.stringify(body);
         }
-        const sep = path.includes("?") ? "&" : "?";
-        const url = `${API_BASE}${path}${API_TOKEN ? `${sep}token=${API_TOKEN}` : ""}`;
+        const url = `${API_BASE}${path}`;
         const r = await fetch(url, opts);
         let data = null;
         try { data = await r.json(); } catch {}
@@ -868,14 +866,14 @@
       function isOllamaModel(a) { return a.provider === "ollama" || (a.detail || "").indexOf("[on Ollama]") !== -1; }
       function installModel(mid) {
         setJobs(function(p) { var n = Object.assign({}, p); n[mid] = { status: "starting", progress: "Sending..." }; return n; });
-        fetch(API_BASE + "/api/dashboard/model-advisor/install" + (API_TOKEN ? "?token=" + API_TOKEN : ""), { method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include", body: JSON.stringify({ model: mid }) }).then(function(r) { return r.json(); }).then(function(d) {
+        fetch(API_BASE + "/api/dashboard/model-advisor/install", { method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include", body: JSON.stringify({ model: mid }) }).then(function(r) { return r.json(); }).then(function(d) {
           if (d.ok) { setJobs(function(p) { var n = Object.assign({}, p); n[mid] = { status: "pulling", progress: "Downloading...", job_id: d.job_id }; return n; }); pollInstall(mid, d.job_id); }
           else { setJobs(function(p) { var n = Object.assign({}, p); n[mid] = { status: "error", progress: d.error || "Failed" }; return n; }); }
         }).catch(function(e) { setJobs(function(p) { var n = Object.assign({}, p); n[mid] = { status: "error", progress: e.message }; return n; }); });
       }
       function pollInstall(key, jid) {
         var iv = setInterval(function() {
-          fetch(API_BASE + "/api/dashboard/model-advisor/status/" + jid + (API_TOKEN ? "?token=" + API_TOKEN : ""), { credentials: "include" }).then(function(r) { return r.json(); }).then(function(d) {
+          fetch(API_BASE + "/api/dashboard/model-advisor/status/" + jid, { credentials: "include" }).then(function(r) { return r.json(); }).then(function(d) {
             setJobs(function(p) { var n = Object.assign({}, p); n[key] = { status: d.status, progress: d.progress || d.error || "", job_id: jid }; return n; });
             if (d.status === "done" || d.status === "error") clearInterval(iv);
           }).catch(function() { clearInterval(iv); });
@@ -1050,8 +1048,7 @@
         fd.append("file", file);
         fd.append("source", source);
         try {
-          const sep = "/api/dashboard/upload";
-          const url = `${API_BASE}${sep}${API_TOKEN ? `?token=${API_TOKEN}` : ""}`;
+          const url = `${API_BASE}/api/dashboard/upload`;
           const r = await fetch(url, { method: "POST", body: fd, credentials: "include" });
           const d = await r.json();
           if (d.ok) { setJob({ ...d, status: "running", progress_pct: 0, message: "Starting..." }); pollJob(d.job_id); }
@@ -1062,7 +1059,7 @@
       const pollJob = async (jid) => {
         const poll = async () => {
           try {
-            const url = `${API_BASE}/api/dashboard/upload/status?job=${jid}${API_TOKEN ? `&token=${API_TOKEN}` : ""}`;
+            const url = `${API_BASE}/api/dashboard/upload/status?job=${jid}`;
             const r = await fetch(url, { credentials: "include" });
             const d = await r.json();
             setJob(d);
@@ -2703,12 +2700,11 @@
         }
       };
 
-      // Same-origin link with token query string; the browser sends the
-      // session cookie automatically so this works under normal auth.
-      const downloadHref = (fname) => {
-        const tok = API_TOKEN ? `&token=${encodeURIComponent(API_TOKEN)}` : "";
-        return `${API_BASE}/api/dashboard/config/backups/download?filename=${encodeURIComponent(fname)}${tok}`;
-      };
+      // Same-origin <a href> link. The browser sends the tailor_session
+      // cookie automatically (samesite=lax, path=/) on top-level navigation,
+      // so the request authenticates without exposing the token in the URL.
+      const downloadHref = (fname) =>
+        `${API_BASE}/api/dashboard/config/backups/download?filename=${encodeURIComponent(fname)}`;
 
       const rows = (backups || []).map(b =>
         React.createElement("div", { key: b.filename,
@@ -4038,8 +4034,7 @@
       const count = backups === null ? "…" : backups.length;
 
       const handleDownload = async (filename) => {
-        const sep = "?";
-        const url = `${API_BASE}/api/secrets/backups/download${sep}filename=${encodeURIComponent(filename)}${API_TOKEN ? `&token=${API_TOKEN}` : ""}`;
+        const url = `${API_BASE}/api/secrets/backups/download?filename=${encodeURIComponent(filename)}`;
         try {
           const r = await fetch(url, { credentials: "include" });
           if (!r.ok) {

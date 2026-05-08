@@ -123,6 +123,8 @@ URL: https://your-domain.com/mcp?token=YOUR_TAILOR_API_KEY
 Set the `TAILOR_API_KEY` environment variable to enable authentication for remote access.
 Without it, the server runs open (suitable for local-only use).
 
+> **Auth model — asymmetric.** The `?token=` query parameter is accepted only on the `/mcp` MCP transport, because the Claude.ai cloud connector UI offers no field to configure an `Authorization` header. REST endpoints under `/api/*` accept `Authorization: Bearer <token>` (programmatic clients) or the `tailor_session` cookie set by `POST /api/auth/login` (browser dashboard) — `?token=` on `/api/*` returns `401`. The `/mcp` exception will be removed when the OAuth provider lands (v1.3.0).
+
 ---
 
 ## Features

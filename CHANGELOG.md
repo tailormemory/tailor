@@ -7,16 +7,19 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-<!--
-Template for upcoming changes. Move entries under a new version heading on release.
-
-### Added
-### Changed
-### Fixed
-### Removed
 ### Security
+
+- **BREAKING (REST API only)**: `?token=` query parameter is no longer accepted on `/api/*` endpoints. Remote callers must use the `Authorization: Bearer <token>` header (programmatic clients) or the `tailor_session` cookie set by `POST /api/auth/login` (browser dashboard). Mitigates token leak via Cloudflare access logs, browser history, and HTTP `Referer` headers.
+- `/mcp` transport still accepts `?token=` because the Claude.ai cloud MCP connector UI provides no field to configure an `Authorization` header. Asymmetric on purpose — to be removed when the OAuth provider lands (tracked as v1.3.0). Token redaction in uvicorn access logs continues to cover the log-leak vector for `/mcp`.
+
+### Changed
+
+- `dashboard/index.html`: 8 `fetch()` and `<a href>` call sites no longer append `?token=${API_TOKEN}` to URLs. They now rely solely on the `tailor_session` cookie (`SameSite=Lax`, `HttpOnly`, `Path=/`).
+- `BearerAuthMiddleware` docstring updated to spell out the asymmetric auth model per path.
+
 ### Docs
--->
+
+- Module header in `mcp_server.py` documents the asymmetric auth split: `/api/*` → header/cookie only; `/mcp` → header or `?token=`.
 
 ---
 

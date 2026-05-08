@@ -39,7 +39,9 @@ Changes v4:
 - Parametro source in kb_add e kb_update_session ("claude", "chatgpt", "manual")
 
 Changes v3:
-- Autenticazione via API key (Bearer header o query param ?token=)
+- Autenticazione via API key:
+    - /api/* : Bearer header o cookie tailor_session (NO ?token=)
+    - /mcp   : Bearer header o ?token= (asimmetrico, in attesa di OAuth v1.3.0)
 - Environment variable: TAILOR_API_KEY
 
 Tools di lettura (Claude):
@@ -275,7 +277,15 @@ def _compute_dashboard_stats():
 # ============================================================
 
 class BearerAuthMiddleware:
-    """ASGI middleware: verify Bearer token or query param ?token=."""
+    """ASGI middleware: asymmetric auth.
+
+    /api/*  : Authorization: Bearer <token> OR tailor_session cookie.
+              ?token= query param NOT accepted (leaks via logs/history/Referer).
+    /mcp    : Authorization: Bearer <token> OR ?token= query param.
+              ?token= still accepted because Claude.ai cloud MCP connector UI
+              has no Bearer header config field. To be removed when OAuth
+              provider lands (tracked as v1.3.0).
+    """
 
     PUBLIC_PATHS = {"/health", "/", "/dashboard"}
 
@@ -1239,20 +1249,16 @@ class BearerAuthMiddleware:
                 if not is_localhost and path not in ("/api/auth/login", "/api/dashboard/setup"):
                     token_ok = False
                     hdrs = dict(scope.get("headers", []))
+                    # NOTE: ?token= query param NOT accepted on /api/*.
+                    # Use Authorization header (programmatic clients) or
+                    # tailor_session cookie (browser dashboard).
+                    # /mcp transport keeps ?token= until OAuth lands (v1.3.0).
                     # Check Bearer token
                     auth_val = hdrs.get(b"authorization", b"").decode("utf-8", errors="ignore")
                     _resolved_token = ""
                     if auth_val.startswith("Bearer ") and _token_auth.authenticate(auth_val[7:]):
                         _resolved_token = auth_val[7:]
                         token_ok = True
-                    # Check query string token
-                    if not token_ok:
-                        qs = scope.get("query_string", b"").decode()
-                        for param in qs.split("&"):
-                            if param.startswith("token=") and _token_auth.authenticate(param[6:]):
-                                _resolved_token = param[6:]
-                                token_ok = True
-                                break
                     # Check session cookie (stored as SHA-256 hash)
                     if not token_ok:
                         cookie_header = hdrs.get(b"cookie", b"").decode("utf-8", errors="ignore")
@@ -1310,6 +1316,12 @@ class BearerAuthMiddleware:
                 await response(scope, receive, send)
                 return
 
+        # NOTE: ?token= query param accepted here ONLY because Claude.ai
+        # cloud MCP connector UI doesn't support Authorization header
+        # configuration. Will be removed when OAuth provider is implemented
+        # (v1.3.0). Token redaction in uvicorn access logs covers leak via
+        # access logs; remaining leak vectors (browser history, Referer)
+        # are accepted until OAuth.
         headers = dict(scope.get("headers", []))
         auth_value = headers.get(b"authorization", b"").decode("utf-8", errors="ignore")
         _mcp_token = ""
