@@ -108,13 +108,13 @@ def save_reminders(rem):
 
 def add_reminder(text, remind_at):
     rem = load_reminders()
-    r = {"id": int(datetime.now().timestamp()*1000), "text": text, "remind_at": remind_at,
+    r = {"id": time.time_ns(), "text": text, "remind_at": remind_at,
          "created_at": datetime.now().isoformat(), "sent": False}
     rem.append(r); save_reminders(rem); return r
 
 def add_recurring_reminder(text, days, time_str):
     rem = load_reminders()
-    r = {"id": int(datetime.now().timestamp()*1000), "type": "recurring", "label": text[:60],
+    r = {"id": time.time_ns(), "type": "recurring", "label": text[:60],
          "action": "send_text", "message": f"\u23f0 *Reminder*\n\n{text}",
          "days": days, "time": time_str, "last_sent": ""}
     rem.append(r); save_reminders(rem); return r

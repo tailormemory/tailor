@@ -2909,8 +2909,9 @@ def create_reminder(
         Confirmation with reminder details
     """
     from datetime import datetime as dt
+    from time import time_ns as _time_ns
     rem_list = _load_reminders()
-    rid = int(dt.now().timestamp() * 1000)
+    rid = _time_ns()
 
     if recurring:
         if not days or not time:
