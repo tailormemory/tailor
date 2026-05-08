@@ -117,6 +117,40 @@ def _guess_mime(path: str) -> str:
     return guess or "application/octet-stream"
 
 
+class DocPathError(Exception):
+    """Raised by validate_doc_path when rel_path fails validation.
+
+    `reason` is one of: "empty", "absolute", "is_root", "outside_root".
+    Callers map reason → HTTP status / error string.
+    """
+    def __init__(self, reason: str, message: str = ""):
+        self.reason = reason
+        super().__init__(message or f"Invalid path: {reason}")
+
+
+def validate_doc_path(rel_path: str, document_root: str) -> str:
+    """Validate rel_path is a safe relative path under document_root.
+
+    Returns the resolved absolute path (post-realpath) on success.
+    Raises DocPathError(reason=...) on failure.
+
+    Does NOT check existence or file type — caller handles those, since
+    they require I/O and may want different policies (e.g. follow vs
+    reject symlinked targets, read text vs return bytes).
+    """
+    if not rel_path:
+        raise DocPathError("empty")
+    if os.path.isabs(rel_path):
+        raise DocPathError("absolute")
+    real_root = os.path.realpath(document_root)
+    abs_path = os.path.realpath(os.path.join(document_root, rel_path))
+    if abs_path == real_root:
+        raise DocPathError("is_root")
+    if not abs_path.startswith(real_root + os.sep):
+        raise DocPathError("outside_root")
+    return abs_path
+
+
 def handle_kb_document_request(
     query_string: str,
     document_root: str | None,
@@ -145,22 +179,15 @@ def handle_kb_document_request(
         k, v = part.split("=", 1)
         params[k] = unquote(v)
     rel_path = params.get("path", "")
-    if not rel_path:
-        return _json_response({"error": "Missing query param: path"}, 400, cors)
 
-    # Absolute paths are rejected outright — the KB only stores relative paths.
-    if os.path.isabs(rel_path):
-        return _json_response({"error": "Absolute paths are not allowed"}, 403, cors)
-
-    real_root = os.path.realpath(document_root)
-    abs_path = os.path.realpath(os.path.join(document_root, rel_path))
-
-    # Reject the root itself (empty relative path would resolve to it).
-    if abs_path == real_root:
-        return _json_response({"error": "Forbidden"}, 403, cors)
-
-    # Containment check: realpath must live strictly under the root.
-    if not abs_path.startswith(real_root + os.sep):
+    try:
+        abs_path = validate_doc_path(rel_path, document_root)
+    except DocPathError as e:
+        if e.reason == "empty":
+            return _json_response({"error": "Missing query param: path"}, 400, cors)
+        if e.reason == "absolute":
+            return _json_response({"error": "Absolute paths are not allowed"}, 403, cors)
+        # "is_root" or "outside_root" — same opaque "Forbidden" as before
         return _json_response({"error": "Forbidden"}, 403, cors)
 
     if not os.path.exists(abs_path):
