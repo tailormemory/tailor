@@ -118,9 +118,16 @@ def _guess_mime(path: str) -> str:
 
 
 class DocPathError(Exception):
-    """Raised by validate_doc_path when rel_path fails validation.
+    """Raised by validate_doc_path / validate_in_whitelist on validation failure.
 
-    `reason` is one of: "empty", "absolute", "is_root", "outside_root".
+    `reason` is one of:
+      - "empty"            : rel_path is empty / missing
+      - "absolute"         : rel_path is an absolute path
+      - "is_root"          : rel_path resolves to document_root itself
+      - "outside_root"     : rel_path escapes document_root via '..' or symlinks
+      - "whitelist_empty"  : whitelist (e.g. ingest.document_paths) is empty/missing
+      - "not_whitelisted"  : abs_path is under root but not under any whitelisted folder
+
     Callers map reason → HTTP status / error string.
     """
     def __init__(self, reason: str, message: str = ""):
@@ -149,6 +156,31 @@ def validate_doc_path(rel_path: str, document_root: str) -> str:
     if not abs_path.startswith(real_root + os.sep):
         raise DocPathError("outside_root")
     return abs_path
+
+
+def validate_in_whitelist(abs_path: str, document_paths) -> None:
+    """Validate abs_path is under at least one whitelisted folder.
+
+    abs_path: already resolved absolute path (e.g. via validate_doc_path).
+    document_paths: iterable of absolute paths from config (e.g.
+        ingest.document_paths in tailor.yaml). Each entry is realpath'd
+        before comparison so symlinked entries match correctly.
+
+    Raises:
+        DocPathError("whitelist_empty"): document_paths is empty/None.
+        DocPathError("not_whitelisted"): abs_path does not match any entry.
+
+    A match means abs_path equals a whitelisted folder OR sits strictly
+    under it (containment check via startswith(p + os.sep), same shape
+    as validate_doc_path's outside_root check). Recursive by design.
+    """
+    if not document_paths:
+        raise DocPathError("whitelist_empty")
+    for p in document_paths:
+        p_real = os.path.realpath(p)
+        if abs_path == p_real or abs_path.startswith(p_real + os.sep):
+            return
+    raise DocPathError("not_whitelisted")
 
 
 def handle_kb_document_request(

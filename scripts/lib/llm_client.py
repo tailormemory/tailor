@@ -156,6 +156,30 @@ TOOLS = [
             "required": ["reminder_id"]
         }
     },
+    {
+        "name": "read_personal_doc",
+        "description": "Read the textual content of a personal document from the user's whitelisted folders. Supports .txt .md .csv .pdf .docx .xlsx (binary formats are text-extracted via the ingest pipeline). Use offset/length to paginate large files. Returns a JSON object with content, total_chars, truncated, extension, path. On error returns a JSON object with error and detail fields (e.g. folder_not_allowed, unsupported_extension, file_not_found).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "relative_path": {
+                    "type": "string",
+                    "description": "Path relative to the document root (e.g. 'Tasse/2025/F24.pdf'). Must be inside a whitelisted folder configured in tailor.yaml."
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Starting character offset into the extracted text. Default 0.",
+                    "default": 0
+                },
+                "length": {
+                    "type": "integer",
+                    "description": "Maximum characters to return. Default 50000 chars is suitable for most files. For very large documents, use offset to paginate rather than increasing length.",
+                    "default": 50000
+                }
+            },
+            "required": ["relative_path"]
+        }
+    },
 ]
 
 # ═══════════════════════════════════════════════════════════════

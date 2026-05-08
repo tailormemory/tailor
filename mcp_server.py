@@ -3008,6 +3008,110 @@ def delete_reminder(reminder_id: int) -> str:
     return f"Reminder id:{reminder_id} deleted."
 
 
+@mcp.tool()
+def read_personal_doc(
+    relative_path: str,
+    offset: int = 0,
+    length: int = 50000,
+) -> dict:
+    """Read a personal document from the user's whitelisted folders.
+
+    Returns content[offset:offset+length] with metadata. Use offset/length
+    to paginate large files.
+
+    Supported extensions: .txt .md .csv .pdf .docx .xlsx
+    Whitelisted folders: configured in tailor.yaml under ingest.document_paths.
+
+    Args:
+        relative_path: path relative to ingest.document_root (e.g. "Tasse/2025/F24.pdf").
+        offset: starting character offset (default 0).
+        length: max characters to return (default 50000).
+
+    Returns:
+        On success, dict with keys:
+            content (str)        — text slice [offset:offset+length]
+            total_chars (int)    — full extracted text length
+            truncated (bool)     — True if more content exists past offset+length
+            extension (str)      — file extension (lowercase, with dot)
+            path (str)           — relative_path echoed back
+
+        On error, dict with keys:
+            error (str)          — short machine-readable code
+            detail (str)         — human-readable explanation
+    """
+    from scripts.lib.kb_document_api import (
+        validate_doc_path, validate_in_whitelist, DocPathError,
+    )
+    from scripts.lib.config import get as _cfg_get
+
+    document_root = _cfg_get("ingest", "document_root") or ""
+    if not document_root:
+        return {
+            "error": "document_root_not_configured",
+            "detail": "ingest.document_root is not set in tailor.yaml",
+        }
+    document_paths = _cfg_get("ingest", "document_paths") or []
+
+    try:
+        abs_path = validate_doc_path(relative_path, document_root)
+        validate_in_whitelist(abs_path, document_paths)
+    except DocPathError as e:
+        mapping = {
+            "empty":            ("missing_path",            "relative_path is required"),
+            "absolute":         ("absolute_paths_forbidden","absolute paths are not allowed; pass a path relative to document_root"),
+            "is_root":          ("path_forbidden",          "path resolves to document_root itself"),
+            "outside_root":     ("path_forbidden",          "path escapes document_root via '..' or symlink"),
+            "whitelist_empty":  ("whitelist_not_configured","ingest.document_paths is empty or missing in tailor.yaml"),
+            "not_whitelisted":  ("folder_not_allowed",      "path is under document_root but not in any folder listed in ingest.document_paths"),
+        }
+        err_key, default_detail = mapping.get(e.reason, ("invalid_path", str(e)))
+        return {"error": err_key, "detail": default_detail}
+
+    SUPPORTED = {".txt", ".md", ".csv", ".pdf", ".docx", ".xlsx"}
+    ext = os.path.splitext(abs_path)[1].lower()
+    if ext not in SUPPORTED:
+        return {
+            "error": "unsupported_extension",
+            "detail": f"extension {ext!r} not supported. Allowed: {sorted(SUPPORTED)}",
+        }
+
+    if not os.path.exists(abs_path):
+        return {"error": "file_not_found", "detail": f"no file at {relative_path!r}"}
+    if not os.path.isfile(abs_path):
+        return {"error": "not_a_regular_file", "detail": f"{relative_path!r} is not a regular file"}
+
+    try:
+        if ext in (".txt", ".md"):
+            with open(abs_path, encoding="utf-8", errors="replace") as f:
+                full_text = f.read()
+        else:
+            # .csv .pdf .docx .xlsx — reuse ingest extractors. They return
+            # list[{"text": ..., "metadata": ...}]; we concat the .text fields.
+            from scripts.ingest.ingest_docs import extract_text as _extract_text
+            sections = _extract_text(abs_path)
+            full_text = "\n\n".join(s.get("text", "") for s in sections)
+    except Exception as e:
+        return {
+            "error": "extraction_failed",
+            "detail": f"{type(e).__name__}: {e}",
+        }
+
+    total_chars = len(full_text)
+    offset = max(0, int(offset))
+    length = max(0, int(length))
+    end = offset + length
+    content = full_text[offset:end]
+    truncated = end < total_chars
+
+    return {
+        "content": content,
+        "total_chars": total_chars,
+        "truncated": truncated,
+        "extension": ext,
+        "path": relative_path,
+    }
+
+
 # ============================================================
 
 # ============================================================

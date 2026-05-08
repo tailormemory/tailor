@@ -179,6 +179,15 @@ def _call_delete_reminder(args: dict) -> str:
     m = _get_mcp()
     return m.delete_reminder(reminder_id=int(args["reminder_id"]))
 
+def _call_read_personal_doc(args: dict) -> str:
+    m = _get_mcp()
+    result = m.read_personal_doc(
+        relative_path=args["relative_path"],
+        offset=int(args.get("offset", 0)),
+        length=int(args.get("length", 50000)),
+    )
+    return json.dumps(result, ensure_ascii=False) if isinstance(result, dict) else str(result)
+
 
 TOOL_HANDLERS = {
     "kb_hybrid_search": _call_kb_hybrid_search,
@@ -190,7 +199,13 @@ TOOL_HANDLERS = {
     "create_recurring_reminder": _call_create_recurring_reminder,
     "list_reminders": _call_list_reminders,
     "delete_reminder": _call_delete_reminder,
+    "read_personal_doc": _call_read_personal_doc,
 }
+
+# Tools that paginate via their own offset/length arguments. These bypass
+# the default output cap because the caller is responsible for sizing the
+# response — the default cap would silently corrupt their pagination.
+SELF_PAGINATED_TOOLS = {"read_personal_doc"}
 
 def execute_tool(name: str, args: dict) -> str:
     """Execute a tool by name. Returns string result."""
@@ -199,6 +214,11 @@ def execute_tool(name: str, args: dict) -> str:
         return f"Unknown tool: {name}. Available: {list(TOOL_HANDLERS.keys())}"
     try:
         result = handler(args)
+        # Self-paginated tools opt out of the cap.
+        if name in SELF_PAGINATED_TOOLS:
+            if isinstance(result, str):
+                return result
+            return json.dumps(result, ensure_ascii=False)
         # Truncate for context window sanity
         if isinstance(result, str) and len(result) > 6000:
             return result[:6000] + "\n\n[truncated]"
