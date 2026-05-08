@@ -153,12 +153,43 @@ def _call_system_status(args: dict) -> str:
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 
+def _call_create_reminder(args: dict) -> str:
+    m = _get_mcp()
+    return m.create_reminder(
+        text=args["text"],
+        remind_at=args["remind_at"],
+        recurring=False,
+    )
+
+def _call_create_recurring_reminder(args: dict) -> str:
+    m = _get_mcp()
+    return m.create_reminder(
+        text=args["text"],
+        recurring=True,
+        days=args["days"],
+        time=args["time"],
+        label=args.get("label", ""),
+    )
+
+def _call_list_reminders(args: dict) -> str:
+    m = _get_mcp()
+    return m.list_reminders(include_sent=args.get("include_sent", False))
+
+def _call_delete_reminder(args: dict) -> str:
+    m = _get_mcp()
+    return m.delete_reminder(reminder_id=int(args["reminder_id"]))
+
+
 TOOL_HANDLERS = {
     "kb_hybrid_search": _call_kb_hybrid_search,
     "kb_search_docs": _call_kb_search_docs,
     "get_user_profile": _call_get_user_profile,
     "kb_add": _call_kb_add,
     "system_status": _call_system_status,
+    "create_reminder": _call_create_reminder,
+    "create_recurring_reminder": _call_create_recurring_reminder,
+    "list_reminders": _call_list_reminders,
+    "delete_reminder": _call_delete_reminder,
 }
 
 def execute_tool(name: str, args: dict) -> str:

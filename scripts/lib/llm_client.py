@@ -84,6 +84,78 @@ TOOLS = [
         "description": "Get system operational status: KB stats, fact extraction progress (coverage %, nights remaining), pipeline last run, services health. Use this when the user asks about system state, pipeline progress, or operational metrics.",
         "input_schema": {"type": "object", "properties": {}}
     },
+    {
+        "name": "create_reminder",
+        "description": "Schedule a one-time reminder for a specific datetime. Use when the user asks to be reminded at a precise moment (e.g., 'remind me tomorrow at 9am to call mom'). For recurring reminders, use create_recurring_reminder instead.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "The reminder message text shown to the user when triggered."
+                },
+                "remind_at": {
+                    "type": "string",
+                    "description": "ISO 8601 datetime (e.g., '2026-05-08T09:00:00'). Must be in the future."
+                }
+            },
+            "required": ["text", "remind_at"]
+        }
+    },
+    {
+        "name": "create_recurring_reminder",
+        "description": "Schedule a reminder that repeats weekly on selected weekdays at a fixed time. Use for habits, periodic checks, supplement schedules. For one-time reminders, use create_reminder instead.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "The reminder message text shown to the user when triggered."
+                },
+                "days": {
+                    "type": "string",
+                    "description": "Comma-separated weekday indices, 0=Monday ... 6=Sunday. E.g. '0,1,2,3,4' for weekdays, '5,6' for weekends, '0,2,4' for Mon/Wed/Fri."
+                },
+                "time": {
+                    "type": "string",
+                    "description": "Time of day in 24h format HH:MM (e.g., '08:30')."
+                },
+                "label": {
+                    "type": "string",
+                    "description": "Optional short label (max ~40 chars) used in lists. If omitted, derived from text."
+                }
+            },
+            "required": ["text", "days", "time"]
+        }
+    },
+    {
+        "name": "list_reminders",
+        "description": "List all active reminders (one-shot pending and recurring). Returns a formatted text with reminder IDs, useful before calling delete_reminder.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "include_sent": {
+                    "type": "boolean",
+                    "description": "If true, include already-sent one-shot reminders. Default false."
+                }
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "delete_reminder",
+        "description": "Delete a reminder by its numeric ID. Call list_reminders first to find the ID.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reminder_id": {
+                    "type": "integer",
+                    "description": "The numeric reminder ID as returned by list_reminders."
+                }
+            },
+            "required": ["reminder_id"]
+        }
+    },
 ]
 
 # ═══════════════════════════════════════════════════════════════
