@@ -7,19 +7,189 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Security
+<!--
+Template for upcoming changes. Move entries under a new version heading on release.
 
-- **BREAKING (REST API only)**: `?token=` query parameter is no longer accepted on `/api/*` endpoints. Remote callers must use the `Authorization: Bearer <token>` header (programmatic clients) or the `tailor_session` cookie set by `POST /api/auth/login` (browser dashboard). Mitigates token leak via Cloudflare access logs, browser history, and HTTP `Referer` headers.
-- `/mcp` transport still accepts `?token=` because the Claude.ai cloud MCP connector UI provides no field to configure an `Authorization` header. Asymmetric on purpose — to be removed when the OAuth provider lands (tracked as v1.3.0). Token redaction in uvicorn access logs continues to cover the log-leak vector for `/mcp`.
+### Added
+### Changed
+### Fixed
+### Removed
+### Security
+### Docs
+-->
+
+---
+
+## [1.2.8] — 2026-05-08 — Roadmap #0: chat dashboard as control plane
+
+Five commits land the next phase of the dashboard-as-control-plane roadmap: the chat-side LLM can now manage reminders and read whitelisted personal documents end-to-end, plus a tightening of the REST API auth model. Internal cleanup: `validate_doc_path` extracted as a shared helper and a `SELF_PAGINATED_TOOLS` opt-out added to `tool_executor` for tools that handle their own pagination.
+
+### Added
+
+- **Reminder tools in the chat dashboard**: `create_reminder`, `create_recurring_reminder`, `list_reminders`, `delete_reminder` exposed via `scripts/lib/tool_executor.py` and `scripts/lib/llm_client.py`. Wrappers delegate directly to `mcp_server.*` (no HTTP hop, since the chat dashboard imports the MCP server as a Python module). The LLM can now create one-shot or weekly-recurring reminders, list them, and delete them by id without leaving the conversation.
+- **`read_personal_doc` MCP tool**: read text content from whitelisted personal documents. Extensions: `.txt .md .csv .pdf .docx .xlsx`. Plain text via `open(encoding="utf-8", errors="replace")`; binary formats text-extracted by reusing `extract_text()` from `scripts/ingest/ingest_docs.py` (direct import, no refactor). Pagination via `offset` / `length` (default `length=50000`). Whitelist via `ingest.document_paths` in `tailor.yaml`; refuse-all if empty/missing. Wired through to the chat dashboard alongside the reminder tools.
+- **`SELF_PAGINATED_TOOLS` set** in `tool_executor.py`. Tools that paginate via their own `offset`/`length` arguments (currently only `read_personal_doc`) bypass the default 6000-char output cap, avoiding silent corruption of paginated payloads. The default cap stays in place for all other tools.
+- **`validate_in_whitelist()` helper** in `scripts/lib/kb_document_api.py`. Validates a resolved abs_path is under at least one whitelisted folder; raises `DocPathError(reason="whitelist_empty"|"not_whitelisted")`. Used by `read_personal_doc` after `validate_doc_path()`.
 
 ### Changed
 
-- `dashboard/index.html`: 8 `fetch()` and `<a href>` call sites no longer append `?token=${API_TOKEN}` to URLs. They now rely solely on the `tailor_session` cookie (`SameSite=Lax`, `HttpOnly`, `Path=/`).
-- `BearerAuthMiddleware` docstring updated to spell out the asymmetric auth model per path.
+- **`DocPathError` reasons extended** to cover the new whitelist checks. Set is now `{"empty", "absolute", "is_root", "outside_root", "whitelist_empty", "not_whitelisted"}`, all on a single exception class with a `reason` discriminator.
+- **`dashboard/index.html`**: 8 `fetch()` and `<a href>` call sites no longer append `?token=${API_TOKEN}` to URLs. They now rely solely on the `tailor_session` cookie (`SameSite=Lax`, `HttpOnly`, `Path=/`).
+- **`BearerAuthMiddleware` docstring** rewritten to spell out the asymmetric auth model per path.
+
+### Fixed
+
+- **Reminder ID collision** (`mcp_server.create_reminder`, `telegram_bot.add_reminder`/`add_recurring_reminder`). The previous `int(datetime.now().timestamp() * 1000)` produced colliding ids when two reminders were created within the same millisecond — common with rapid LLM tool calls. `delete_reminder` (id-equality filter) was non-idempotent on collisions. Switched to `time.time_ns()` (nanosecond resolution, chronological ordering preserved, zero collisions in practice). In `mcp_server.create_reminder` the public parameter `time` shadowed the module, so used a local `from time import time_ns as _time_ns` to avoid renaming the API.
+
+### Security
+
+- **BREAKING (REST API only)**: the `?token=` query parameter is no longer accepted on `/api/*` endpoints. Remote callers must use the `Authorization: Bearer <token>` header (programmatic clients) or the `tailor_session` cookie set by `POST /api/auth/login` (browser dashboard). Mitigates token leak via Cloudflare access logs, browser history, and HTTP `Referer` headers.
+- The `/mcp` transport still accepts `?token=` because the Claude.ai cloud MCP connector UI provides no field to configure an `Authorization` header. Asymmetric on purpose — to be removed when the OAuth provider lands (tracked as v1.3.0). Token redaction in uvicorn access logs continues to cover the log-leak vector for `/mcp`.
+
+### Internal
+
+- **`validate_doc_path()` helper extracted** from `handle_kb_document_request` into `scripts/lib/kb_document_api.py` as a module-level function. Pure path-resolution: rejects empty / absolute paths, applies realpath containment under document root. Behavior diff = zero on the HTTP handler; the existing `tests/test_kb_document_api.py` (7 tests) pass invariant. Sets up the reuse by `read_personal_doc`.
 
 ### Docs
 
 - Module header in `mcp_server.py` documents the asymmetric auth split: `/api/*` → header/cookie only; `/mcp` → header or `?token=`.
+- `README.md` adds an "Auth model — asymmetric" callout under the remote-access setup section, explaining the `?token=` carve-out for `/mcp`.
+
+### Stats
+
+- 5 commits since v1.2.7
+- 1 new MCP tool (`read_personal_doc`) + 4 chat-side wrappers (reminder family)
+- 1 security regression closed (`?token=` URL exposure on REST API)
+- 0 behavior changes on existing HTTP endpoint paths (the `validate_doc_path` refactor is zero-diff)
+
+---
+
+## [1.2.7] — 2026-05-06 — Operational hardening for chromadb 1.5.8 frozen-state recovery
+
+Operational hardening release following the May 5 incident, where the chromadb 1.5.8 collection re-entered a "frozen state" 8 hours after the May 4 dump+restore (Fase C in v1.2.6.3). Adds tooling for safe manual ingest, a defensive try/except in entity extraction, NOPASSWD sudoers documentation for autonomous operation, and a `TAILOR_NIGHTLY_MODE=facts_only` env var to keep the nightly facts pipeline running while skipping chromadb-write steps. Rolls up 8 commits since v1.2.6.3.
+
+The combination of upstream issues #6975 (HNSW persist threshold) and #6852 (Rust bindings SIGSEGV on macOS ARM64) makes write-path failures more frequent on macOS ARM64 self-hosted deployments with long-lived chromadb 1.5.8 collections. The tooling here is platform-agnostic and works correctly when the underlying issues don't manifest. The included `chromadb_version_check` daemon will notify when 1.5.9+ ships upstream with a potential fix.
+
+### Added
+
+- **`scripts/maintenance/ingest_safe.sh`** — manual ingest workaround that bypasses the chromadb 1.5.8 compactor concurrency window. Pattern: backup `db/` via rsync → stop MCP via `launchctl bootout` → run `ingest_docs.py` with no concurrent writers → audit drift → restart MCP → Telegram summary. Bail-outs on rsync fail, MCP not down within 30s, ingest rc=139 SIGSEGV, restart failure. Extended in subsequent commits with optional entity extraction (`extract_entities.py`) and doc summary generation (`create_missing_summaries.py`) to consolidate everything in a single MCP-down window. Flags: `--dry-run`, `--no-backup`, `--no-entities`, `--no-summaries`, `--ingest-only`, `--full`.
+- **`TAILOR_NIGHTLY_MODE` env var** in `sync_and_ingest.sh`. Values: `full` (default, retrocompatible) — runs the full pipeline as before; `facts_only` — skips the three chromadb-write steps (`ingest_docs.py`, `create_missing_summaries.py`, `extract_entities.py`) while running the rest (rclone sync, GC, build_entity_index, generate_user_profile, extract_facts_nightly, fact_supersession, derive_facts). Activation via plist `EnvironmentVariables`. End-to-end validated: 5h57m run, +43,558 facts total, MCP stable throughout via SIGUSR1/2 maintenance mode (no hard down).
+- **Defensive try/except on paginated read** in `scripts/enrichment/extract_entities.py:402`. The recurring "Error finding id" that affected 13 nightlies (Apr 14 – May 4) was caused by 98 corrupted chunk IDs, removed by Fase F. This patch ensures any future similar corruption events do not take down the entire entity extraction step. The script logs a warning, increments offset, and continues.
+- **`docs/OPERATIONS.md`** — operational documentation for `ingest_safe.sh` usage, NOPASSWD sudoers setup (`/etc/sudoers.d/tailor` granting `launchctl bootout/bootstrap` on `com.tailor.mcp` only), removal procedure, and trade-off discussion.
+
+### Changed
+
+- **`ingest_safe.sh` Telegram delivery** — bash 3.2 array expansion bug fixed; retry-without-parse_mode pattern ported from v1.2.6.2 to handle markdown parse errors on paths with underscores.
+- **`scripts/services/chromadb_version_check.py` + LaunchDaemon** — biweekly check (`StartInterval=1209600`) against PyPI for chromadb 1.5.9+ availability. Reads pinned version from `requirements.txt` (single source of truth), sends Telegram alert only on update available (zero noise on no-update or network error).
+
+### Operational architecture (post-release)
+
+| Component | Trigger | Mode |
+|---|---|---|
+| Nightly facts pipeline | LaunchDaemon `com.tailor.sync_and_ingest` at 03:00 | `TAILOR_NIGHTLY_MODE=facts_only` (skip chromadb writes) |
+| Manual ingest + entities + summaries | `~/tailor/scripts/maintenance/ingest_safe.sh` on demand | MCP bootouted via NOPASSWD sudoers |
+| Chromadb upstream monitor | LaunchDaemon `com.tailor.chromadb_version_check` biweekly | Telegram alert on 1.5.9+ |
+
+Manual ingest is the workaround for the chromadb 1.5.8 #6975 risk; cadence is operator-driven (typically weekly when OneDrive backlog accumulates). When a stable upstream fix or a backend migration lands, the manual workaround can be deprecated by re-enabling step 4 in nightly mode.
+
+### Validation
+
+- Defensive try/except in `extract_entities.py`: `--stats` run completes in 19s, 152k entities aggregated, zero new WARNING entries (collection clean post-Fase-F).
+- `TAILOR_NIGHTLY_MODE=facts_only` end-to-end: 21,408s wall-clock, +43,558 facts, +3,470 derived facts. Chromadb embeddings count delta +11 (live chat ingest from extension during the run, NOT pipeline writes — pipeline correctly skipped writes).
+- `ingest_safe.sh` extended run: 204 files re-ingested, +2,199 chunks persisted, 0 SILENT DROP detections by the v1.2.6.3 sentinel. MCP HTTP 200 latency back to ~0.6s post-run (was ~10.3s with 41 sql_only_orphans pre-Fase-F).
+- NOPASSWD sudoers: `visudo -c` validation OK, `sudo -n /bin/launchctl bootout system/com.tailor.mcp` returns expected error without password prompt.
+
+### Known issues / deferred
+
+- **chromadb 1.5.8 still pinned** (no 1.5.9 on PyPI as of release date). The biweekly monitor will surface upstream releases automatically. Issues #6975, #6926 (pickle deserialization CVE), #6852 (Rust SIGSEGV on macOS ARM64) all remain open upstream.
+- **Manual ingest is operator-driven**, not automated. Auto-scheduling `ingest_safe.sh` would require additional hardening (lock file, silent-drop ratio guard, smoke-fail recovery with `KeepAlive=false`). Tracked for a future release if the manual cadence proves insufficient.
+- **Chromadb migration strategy** (Qdrant self-hosted, pgvector, or stay on chromadb with current workarounds) is the next architectural decision and remains in backlog.
+- **HNSW pickle persistence at 1000-write threshold** (#6975 root cause). The repair utility from v1.2.2 still works as fallback; the operational architecture in this release reduces but does not eliminate exposure.
+
+### Stats
+
+- 8 commits since v1.2.6.3
+- 2 chromadb frozen-state events surfaced and recovered (May 5 morning + afternoon)
+- 1 dump+restore execution on production (Fase F, ~10 min wall-clock, 154,079 chunks)
+- 204 registry desync entries identified and cleaned
+- 2,199 chunks re-ingested via `ingest_safe.sh`, 0 silent drops
+- 43,558 facts added in the first `TAILOR_NIGHTLY_MODE=facts_only` validation run
+- 0 permanent data loss beyond 27 ephemeral live-chat chunks
+
+---
+
+## [1.2.6.3] — 2026-05-04 — ChromaDB 1.5.8 silent drop: surface, resolve, recover
+
+Critical hardening release closing the post-incident loop opened on 1 May. Surfaces and resolves a ChromaDB 1.5.8 collection-state bug (silent drop) that caused the nightly pipeline to log success while writing nothing to the vector DB. Includes the post-upsert sentinel that finally caught the underlying issue, plus the operational dump+restore run that recovered the production collection.
+
+### The bug
+
+The 1 May incident left collection `tailor_kb` in a state where ChromaDB 1.5.8 Rust bindings would return success on `upsert()` but **silently no-op the write**. Symptoms:
+
+- Nightly logs reported `Ingest completed: N chunks from M files` ✅
+- `count(*) FROM embeddings` did not move
+- Files appeared in `doc_registry.json` with no chunks behind them
+- A new collection on the same SQLite DB worked perfectly — the issue was scoped to the specific collection's HNSW state
+
+The first diagnosis (4 May morning) blamed the MCP `_enter_maintenance` signal handler for not releasing the SQLite lock. That hypothesis led to v1.2.6.2 (real correctness bugs fixed, but did not stop the silent drop). A second forensic audit, triggered by an attempted manual ingest with MCP fully booted out, isolated the bug to the collection itself.
+
+### Added
+
+- **`verified_upsert()` post-upsert sentinel** in `scripts/lib/ingest_helpers.py`. After every batch upsert, samples a chunk ID with `col.get(ids=[sample])` and verifies persistence. On silent drop: logs `SILENT DROP detected: chunk_id=X file=Y` to stderr, returns `False`, propagates failure into `$ERRORS` for Telegram surfacing. Tested on a frozen collection clone (returns False ✅) and on a healthy clone (returns True ✅).
+- **Maintenance utility `scripts/maintenance/dump_restore_collection.py`**: reads all chunks from a frozen collection via paginated `get()`, drops the collection, recreates it empty, restores all chunks via `add()` in batches. Validated via PoC on a 1,000-chunk clone before being run in production on the 156,307-chunk collection (25 min total: 45s dump + 18s drop + 177s restore + verification).
+
+### Recovery procedure (production, 4 May 17:30–18:00)
+
+1. **Backup**: `chroma_pre_fase_C_20260504_173928.sqlite3.gz` (862 MB) + `hnsw_pre_fase_C_20260504_174009.tar.gz` (416 MB)
+2. **Stop MCP**: `sudo launchctl bootout system/com.tailor.mcp` (releases SQLite write lock)
+3. **Dump**: 155,000 of 156,307 chunks recovered in 45s via paginated `get()`. The 1,307 unrecoverable rows were ghost entries from the original 1 May incident — `get()` returned `Error finding id` for them, confirming they were already dead pre-Fase-C.
+4. **Drop + recreate** collection `tailor_kb`: 18s
+5. **Restore**: 155,000 chunks in 177s via batched `add()`, 0 errors
+6. **Test write**: pre 155,000 → post 155,001 → cleanup → 155,000 ✅
+7. **Restart MCP**: clean.
+
+Post-recovery: a stray `ingest_docs.py` run (later isolated and cleaned up via `col.delete(where={"file_path": ...})` for 164 orphan files) wrote 1,903 chunks across 164 files, all of which **persisted correctly** — empirical confirmation that the silent-drop bug is resolved at the collection level.
+
+### Validation
+
+- Sentinel tested on frozen-collection clone: returns `False` + stderr log ✅
+- Sentinel tested on healthy clone: returns `True` (no false positive) ✅
+- Production write delta after dump+restore: +1 (test write) ✅
+- 1,903-chunk batch ingest in cleanup phase: full persistence ✅
+- Registry vs ChromaDB coherence post-cleanup: 3,009 file_paths in both, 0 orphans, 81 zombies (pre-1-May, separately tracked).
+
+### Known issues / deferred
+
+- **ChromaDB 1.5.8 still pinned.** The frozen-collection bug appears to be triggered by abnormal shutdown during HNSW write (the 1 May incident). A clean collection on 1.5.8 has not reproduced the bug post-recovery. **Decision pending**: pin to 1.4.x (last known good) vs. wait for upstream fix in 1.5.9+. Tracked for v1.2.7.
+- **`extract_entities rc=1`** observed during the 4 May audit. Orthogonal to silent drop; investigation deferred to v1.2.7.
+- **81 zombie entries** in `doc_registry.json` (registry has them, ChromaDB doesn't) — pre-1-May residue, isolated and tracked but not cleaned in this release.
+
+### Stats
+
+- 1 critical bug surfaced + resolved (ChromaDB 1.5.8 silent drop)
+- 156,307 → 155,000 chunks during dump+restore (1,307 ghost rows isolated)
+- 1,903 chunks validated as written + persistent in post-recovery cleanup
+- 11h continuous incident-response session (4 May 07:00–18:00)
+- 0 data loss beyond the 1,307 pre-existing ghosts
+
+---
+
+## [1.2.6.2] — 2026-05-04 — Telegram delivery + strict mode + facts path
+
+Pipeline-correctness patch in the post-1-May diagnostic chain. Did not stop the silent drop (which v1.2.6.3 nailed) but fixed three real correctness bugs surfaced during the audit: garbled Telegram messages on dollar-sign content, wrong sqlite path for the FACTS_TOTAL summary, and a `set -uo pipefail` upgrade for the orchestrator script.
+
+### Added
+
+- **`send_telegram()` rewrite** in `sync_and_ingest.sh`. Replaces shell-quoted JSON with `python3 json.dumps()` to handle dollar signs, quotes, and newlines correctly. Falls back to plain text on Markdown parse error 400. Logs delivery outcome explicitly (no more silent failures on token / chat_id mismatch).
+- **`set -uo pipefail`** in `sync_and_ingest.sh`. Strict mode minus `-e` (too many steps tolerate failures). Adds `${PYTHONPATH:-}` guard and similar defensive expansions to coexist with `set -u`.
+
+### Changed
+
+- **`FACTS_TOTAL` query path corrected** from `db/chroma/facts.sqlite3` (vestigial pre-1-May path) to `db/facts.sqlite3` (active). The vestigial path silently returned 0, which made the Telegram summary always report `facts: 0` regardless of actual fact count.
+
+### Known issues / deferred
+
+- **Silent drop still active.** The audit assumed the SQLite-lock + maintenance-handler hypothesis was the cause; this release ships those fixes but does not address the underlying ChromaDB 1.5.8 collection-state bug. v1.2.6.3 closes that loop with the post-upsert sentinel and the production dump+restore.
 
 ---
 
@@ -606,7 +776,19 @@ First public release. Self-hosted AI memory framework with persistent, searchabl
 
 ---
 
-[Unreleased]: https://github.com/tailormemory/tailor/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/tailormemory/tailor/compare/v1.2.8...HEAD
+[1.2.8]: https://github.com/tailormemory/tailor/compare/v1.2.7...v1.2.8
+[1.2.7]: https://github.com/tailormemory/tailor/compare/v1.2.6.3...v1.2.7
+[1.2.6.3]: https://github.com/tailormemory/tailor/compare/v1.2.6.2...v1.2.6.3
+[1.2.6.2]: https://github.com/tailormemory/tailor/compare/v1.2.6.1...v1.2.6.2
+[1.2.6.1]: https://github.com/tailormemory/tailor/compare/v1.2.6...v1.2.6.1
+[1.2.6]: https://github.com/tailormemory/tailor/compare/v1.2.5.1...v1.2.6
+[1.2.5.1]: https://github.com/tailormemory/tailor/compare/v1.2.5...v1.2.5.1
+[1.2.5]: https://github.com/tailormemory/tailor/compare/v1.2.4...v1.2.5
+[1.2.4]: https://github.com/tailormemory/tailor/compare/v1.2.3...v1.2.4
+[1.2.3]: https://github.com/tailormemory/tailor/compare/v1.2.2...v1.2.3
+[1.2.2]: https://github.com/tailormemory/tailor/compare/v1.2.1...v1.2.2
+[1.2.1]: https://github.com/tailormemory/tailor/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/tailormemory/tailor/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/tailormemory/tailor/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/tailormemory/tailor/compare/v1.0.0...v1.1.0
