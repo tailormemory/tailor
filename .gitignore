@@ -8,6 +8,7 @@ db/*
 data/
 credentials/
 backups/
+.backups/
 logs/
 
 # ── Exceptions: SQL schema migrations SHOULD be tracked ──────
