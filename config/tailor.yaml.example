@@ -303,9 +303,9 @@ enrichment:
 # and stops gracefully if it would exceed the deadline.
 pipeline:
   deadline_hour: 8          # Hard stop: all processing must finish by this hour (local time)
-  extraction_max_min: 200   # Max minutes for fact extraction
+  extraction_max_min: 205   # Max minutes for fact extraction
   supersession_max_min: 90  # Max minutes for fact supersession
-  derivation_max_min: 60    # Max minutes for fact derivation
+  derivation_max_min: 55    # Max minutes for fact derivation
 
 
 # ── Model Advisor ─────────────────────────────────────────────
