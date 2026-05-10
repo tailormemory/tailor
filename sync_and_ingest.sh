@@ -445,7 +445,7 @@ while kill -0 $FACT_PID 2>/dev/null; do
     FACT_ELAPSED=$((FACT_ELAPSED + 10))
     REMAINING=$((DEADLINE - $(date +%s) - SUPERSESSION_MAX_SEC - DERIVATION_MAX_SEC))  # leave room for supersession+derivation
         if [ "$FACT_ELAPSED" -ge "$EXTRACTION_MAX_SEC" ] || [ "$REMAINING" -le 0 ]; then
-        log "TIMEOUT: fact extraction after $((FACT_ELAPSED/60)) min (deadline in $((REMAINING/60)) min) — killing"
+        log "TIMEOUT: fact extraction after $((FACT_ELAPSED/60)) min (step budget remaining: $((REMAINING/60)) min) — killing"
         kill -15 $FACT_PID 2>/dev/null
         sleep 15
         if kill -0 $FACT_PID 2>/dev/null; then
@@ -485,7 +485,7 @@ while kill -0 $SUP_PID 2>/dev/null; do
     SUP_ELAPSED=$((SUP_ELAPSED + 10))
     REMAINING=$((DEADLINE - $(date +%s) - DERIVATION_MAX_SEC))  # leave room for derivation
         if [ "$SUP_ELAPSED" -ge "$SUPERSESSION_MAX_SEC" ] || [ "$REMAINING" -le 0 ]; then
-        log "TIMEOUT: fact supersession after $((SUP_ELAPSED/60)) min (deadline in $((REMAINING/60)) min) — killing"
+        log "TIMEOUT: fact supersession after $((SUP_ELAPSED/60)) min (step budget remaining: $((REMAINING/60)) min) — killing"
         kill -15 $SUP_PID 2>/dev/null
         sleep 15
         if kill -0 $SUP_PID 2>/dev/null; then
@@ -521,7 +521,7 @@ while kill -0 $DER_PID 2>/dev/null; do
     DER_ELAPSED=$((DER_ELAPSED + 10))
     REMAINING=$((DEADLINE - $(date +%s) - 300))  # leave 5min for cleanup
         if [ "$DER_ELAPSED" -ge "$DERIVATION_MAX_SEC" ] || [ "$REMAINING" -le 0 ]; then
-        log "TIMEOUT: fact derivation after $((DER_ELAPSED/60)) min (deadline in $((REMAINING/60)) min) — killing"
+        log "TIMEOUT: fact derivation after $((DER_ELAPSED/60)) min (step budget remaining: $((REMAINING/60)) min) — killing"
         kill -15 $DER_PID 2>/dev/null
         sleep 15
         if kill -0 $DER_PID 2>/dev/null; then
