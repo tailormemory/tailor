@@ -3,6 +3,26 @@
 # Cron: 02:30 (prima del sync_and_ingest delle 03:00)
 # Tiene le ultime 3 copie compresse (~550MB ciascuna)
 
+# ── single-instance lock (cron + launchd condividono questo) ──────────────
+_LOCK_DIR="/tmp/tailor_backup_db.lock"
+_acquire() {
+    if mkdir "$_LOCK_DIR" 2>/dev/null; then echo $$ > "$_LOCK_DIR/pid"; return 0; fi
+    if [ -f "$_LOCK_DIR/pid" ]; then
+        _old=$(cat "$_LOCK_DIR/pid" 2>/dev/null || true)
+        if [ -n "$_old" ] && ! kill -0 "$_old" 2>/dev/null; then
+            rm -rf "$_LOCK_DIR"
+            mkdir "$_LOCK_DIR" 2>/dev/null && echo $$ > "$_LOCK_DIR/pid" && return 0
+        fi
+    fi
+    return 1
+}
+if ! _acquire; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] backup_db: another instance running, skipping" >&2
+    exit 0
+fi
+trap 'rm -rf "$_LOCK_DIR"' EXIT INT TERM HUP
+# ── end lock ──────────────────────────────────────────────────────────────
+
 TAILOR_DIR="${TAILOR_HOME:-$(cd "$(dirname "$0")/../.." && pwd)}"
 BACKUP_DIR="$TAILOR_DIR/backups"
 LOG_FILE="$TAILOR_DIR/logs/backup.log"

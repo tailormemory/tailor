@@ -2,6 +2,26 @@
 # sync_email.sh — Unified email sync: Gmail API or IMAP based on config
 # Replaces sync_gmail.sh in cron. Falls back gracefully.
 
+# ── single-instance lock (cron + launchd condividono questo) ──────────────
+_LOCK_DIR="/tmp/tailor_sync_email.lock"
+_acquire() {
+    if mkdir "$_LOCK_DIR" 2>/dev/null; then echo $$ > "$_LOCK_DIR/pid"; return 0; fi
+    if [ -f "$_LOCK_DIR/pid" ]; then
+        _old=$(cat "$_LOCK_DIR/pid" 2>/dev/null || true)
+        if [ -n "$_old" ] && ! kill -0 "$_old" 2>/dev/null; then
+            rm -rf "$_LOCK_DIR"
+            mkdir "$_LOCK_DIR" 2>/dev/null && echo $$ > "$_LOCK_DIR/pid" && return 0
+        fi
+    fi
+    return 1
+}
+if ! _acquire; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] sync_email: another instance running, skipping" >&2
+    exit 0
+fi
+trap 'rm -rf "$_LOCK_DIR"' EXIT INT TERM HUP
+# ── end lock ──────────────────────────────────────────────────────────────
+
 TAILOR_DIR="${TAILOR_HOME:-$(cd "$(dirname "$0")" && pwd)}"
 LOG="$TAILOR_DIR/logs/sync_email.log"
 PY="$TAILOR_DIR/.venv/bin/python3"

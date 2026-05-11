@@ -1,5 +1,26 @@
 #!/bin/bash
 set -uo pipefail
+
+# ── single-instance lock (cron + launchd condividono questo) ──────────────
+_LOCK_DIR="/tmp/tailor_sync_and_ingest.lock"
+_acquire() {
+    if mkdir "$_LOCK_DIR" 2>/dev/null; then echo $$ > "$_LOCK_DIR/pid"; return 0; fi
+    if [ -f "$_LOCK_DIR/pid" ]; then
+        _old=$(cat "$_LOCK_DIR/pid" 2>/dev/null || true)
+        if [ -n "$_old" ] && ! kill -0 "$_old" 2>/dev/null; then
+            rm -rf "$_LOCK_DIR"
+            mkdir "$_LOCK_DIR" 2>/dev/null && echo $$ > "$_LOCK_DIR/pid" && return 0
+        fi
+    fi
+    return 1
+}
+if ! _acquire; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] sync_and_ingest: another instance running, skipping" >&2
+    exit 0
+fi
+trap 'rm -rf "$_LOCK_DIR"' EXIT INT TERM HUP
+# ── end lock ──────────────────────────────────────────────────────────────
+
 # sync_and_ingest.sh — Pipeline notturna completa TAILOR
 # Executed by cron every night at 3:00
 #

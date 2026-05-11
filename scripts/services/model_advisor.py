@@ -9,6 +9,16 @@ Usage:
   python3 scripts/services/model_advisor.py --force   # ignore schedule_days
 """
 
+# ── single-instance lock (cron + launchd share this) ──────────────────────
+import fcntl, sys as _sys
+_LOCK_FD = open("/tmp/tailor_model_advisor.flock", "w")
+try:
+    fcntl.flock(_LOCK_FD, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    _sys.exit(0)
+# OS rilascia il lock automaticamente a chiusura FD / exit processo
+# ── end lock ──────────────────────────────────────────────────────────────
+
 import os, sys, json, sqlite3, subprocess, asyncio, logging, argparse, re
 from datetime import datetime, timezone, date
 from pathlib import Path
@@ -16,6 +26,8 @@ from pathlib import Path
 # ── Project imports ───────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from scripts.lib.config import get_model_advisor_config, get_model_advisor_max_size, get as cfg_get
+from scripts.lib.env_loader import load_env
+load_env()
 
 logging.basicConfig(
     level=logging.INFO,

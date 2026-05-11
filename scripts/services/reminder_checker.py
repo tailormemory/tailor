@@ -10,6 +10,16 @@ Runs every minute via cron. Handles:
 Reads db/reminders.json, sends due reminders via Telegram.
 """
 
+# ── single-instance lock (cron + launchd share this) ──────────────────────
+import fcntl, sys as _sys
+_LOCK_FD = open("/tmp/tailor_reminder_checker.flock", "w")
+try:
+    fcntl.flock(_LOCK_FD, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    _sys.exit(0)
+# OS rilascia il lock automaticamente a chiusura FD / exit processo
+# ── end lock ──────────────────────────────────────────────────────────────
+
 import os, sys, json, subprocess, requests
 from datetime import datetime, timedelta
 from filelock import FileLock

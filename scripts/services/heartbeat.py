@@ -12,6 +12,16 @@ Servizi monitorati:
 State file: db/checkpoints/heartbeat_state.json — avoids repeated alerts.
 """
 
+# ── single-instance lock (cron + launchd share this) ──────────────────────
+import fcntl, sys as _sys
+_LOCK_FD = open("/tmp/tailor_heartbeat.flock", "w")
+try:
+    fcntl.flock(_LOCK_FD, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    _sys.exit(0)
+# OS rilascia il lock automaticamente a chiusura FD / exit processo
+# ── end lock ──────────────────────────────────────────────────────────────
+
 import os, sys, json, subprocess, socket, requests
 from datetime import datetime
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
