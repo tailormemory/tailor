@@ -2795,6 +2795,82 @@
     }
 
 
+    // Helper components for the ConfigPage form view.
+    //
+    // CRITICAL: these MUST live at module scope, not inside
+    // ConfigPage. Defining them in the render body produced a fresh
+    // function reference on every render, which React treated as a
+    // new component type and responded by unmounting + remounting
+    // the underlying DOM <input>. Focus was dropped after every
+    // keystroke in every section's edit view (Intent Classifier,
+    // LLM Backend, Telegram, Identity, Enrichment, Pipeline
+    // Schedule). Same class of bug fixed in e400ac4 for
+    // RuntimeConfigEditor; do NOT inline these back into the parent.
+    //
+    // Closed-over state (themeName, editing, startEdit, saving,
+    // saveMsg) is passed via ConfigEditorCtx so callsites stay
+    // byte-identical — `React.createElement(Section, props, children)`
+    // resolves to the module-level component, picks up context, and
+    // reconciles in place instead of remounting.
+    const ConfigEditorCtx = React.createContext({
+      themeName: "dark",
+      editing: null,
+      startEdit: () => {},
+      saving: false,
+      saveMsg: "",
+    });
+
+    function Row({ label, value, mono, masked }) {
+      const { themeName } = React.useContext(ConfigEditorCtx);
+      const t = themes[themeName];
+      return React.createElement("div", { className: cl("flex items-center justify-between py-2.5 border-b last:border-0", t.borderLight) },
+        React.createElement("span", { className: cl("text-sm", t.textMuted) }, label),
+        React.createElement("span", { className: cl("text-sm", mono ? "font-mono" : "", masked ? t.textFaint : t.mono) }, masked ? "•".repeat(20) : String(value || "")),
+      );
+    }
+
+    function EditBtn({ onClick }) {
+      const { themeName } = React.useContext(ConfigEditorCtx);
+      return React.createElement("button", {
+        onClick,
+        className: cl("text-xs px-3 py-1.5 rounded-lg transition-all font-semibold",
+          themeName === "dark" ? "bg-zinc-800 text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200" : "bg-zinc-100 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-700"),
+      }, "✎ Edit");
+    }
+
+    function SaveBar({ onSave, onCancel }) {
+      const { themeName, saving, saveMsg } = React.useContext(ConfigEditorCtx);
+      const t = themes[themeName];
+      return React.createElement("div", { className: "flex items-center gap-3 mt-4" },
+        React.createElement("button", {
+          onClick: onSave, disabled: saving,
+          className: cl("px-4 py-2 rounded-xl text-sm font-semibold bg-teal-600 hover:bg-teal-500 text-white transition-all", saving && "opacity-50"),
+        }, saving ? "Saving..." : "Save"),
+        React.createElement("button", {
+          onClick: onCancel,
+          className: cl("px-4 py-2 rounded-xl text-sm font-semibold transition-all",
+            themeName === "dark" ? "bg-zinc-800 text-zinc-300 hover:bg-zinc-700" : "bg-zinc-100 text-zinc-600 hover:bg-zinc-200"),
+        }, "Cancel"),
+        saveMsg && React.createElement("span", { className: cl("text-sm", saveMsg.startsWith("Error") ? "text-red-400" : t.accent) }, saveMsg),
+      );
+    }
+
+    function Section({ icon, title, sectionId, editData, children, editContent }) {
+      const { themeName, editing, startEdit } = React.useContext(ConfigEditorCtx);
+      const t = themes[themeName];
+      return React.createElement(Tile, null,
+        React.createElement("div", { className: "flex items-center justify-between mb-3" },
+          React.createElement("div", { className: "flex items-center gap-2" },
+            React.createElement("span", { className: "text-lg" }, icon),
+            React.createElement("h3", { className: cl("text-sm font-semibold", t.text) }, title),
+          ),
+          editing !== sectionId && React.createElement(EditBtn, { onClick: () => startEdit(sectionId, editData) }),
+        ),
+        editing === sectionId ? editContent : children,
+      );
+    }
+
+
     function ConfigPage({ config, onConfigSaved, onDirtyChange }) {
       const t = useTheme();
       const mode = t === themes.dark ? "dark" : "light";
@@ -2841,40 +2917,10 @@
         setSaving(false);
       };
 
-      const Row = ({ label, value, mono, masked }) => React.createElement("div", { className: cl("flex items-center justify-between py-2.5 border-b last:border-0", t.borderLight) },
-        React.createElement("span", { className: cl("text-sm", t.textMuted) }, label),
-        React.createElement("span", { className: cl("text-sm", mono ? "font-mono" : "", masked ? t.textFaint : t.mono) }, masked ? "\u2022".repeat(20) : String(value || ""))
-      );
-
-      const EditBtn = ({ onClick }) => React.createElement("button", {
-        onClick,
-        className: cl("text-xs px-3 py-1.5 rounded-lg transition-all font-semibold",
-          mode === "dark" ? "bg-zinc-800 text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200" : "bg-zinc-100 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-700")
-      }, "\u270E Edit");
-
-      const SaveBar = ({ onSave, onCancel }) => React.createElement("div", { className: "flex items-center gap-3 mt-4" },
-        React.createElement("button", {
-          onClick: onSave, disabled: saving,
-          className: cl("px-4 py-2 rounded-xl text-sm font-semibold bg-teal-600 hover:bg-teal-500 text-white transition-all", saving && "opacity-50")
-        }, saving ? "Saving..." : "Save"),
-        React.createElement("button", {
-          onClick: onCancel,
-          className: cl("px-4 py-2 rounded-xl text-sm font-semibold transition-all",
-            mode === "dark" ? "bg-zinc-800 text-zinc-300 hover:bg-zinc-700" : "bg-zinc-100 text-zinc-600 hover:bg-zinc-200")
-        }, "Cancel"),
-        saveMsg && React.createElement("span", { className: cl("text-sm", saveMsg.startsWith("Error") ? "text-red-400" : t.accent) }, saveMsg)
-      );
-
-      const Section = ({ icon, title, sectionId, editData, children, editContent }) => React.createElement(Tile, null,
-        React.createElement("div", { className: "flex items-center justify-between mb-3" },
-          React.createElement("div", { className: "flex items-center gap-2" },
-            React.createElement("span", { className: "text-lg" }, icon),
-            React.createElement("h3", { className: cl("text-sm font-semibold", t.text) }, title)
-          ),
-          editing !== sectionId && React.createElement(EditBtn, { onClick: () => startEdit(sectionId, editData) })
-        ),
-        editing === sectionId ? editContent : children
-      );
+      // Row / EditBtn / SaveBar / Section are hoisted to module scope \u2014
+      // see the block above ConfigPage for why. They read themeName /
+      // editing / startEdit / saving / saveMsg from ConfigEditorCtx,
+      // which we wrap the render in at the bottom.
 
       // ── LLM Edit ──
       const llmEditContent = React.createElement("div", null,
@@ -3101,7 +3147,15 @@
         React.createElement(SaveBar, { onSave: saveEnrichment, onCancel: cancelEdit })
       );
 
-      return React.createElement("div", { className: "space-y-5" },
+      // Wrap in ConfigEditorCtx.Provider so the hoisted helpers
+      // (Row, EditBtn, SaveBar, Section — defined at module scope
+      // above) read themeName / editing / startEdit / saving /
+      // saveMsg from context instead of closing over our locals.
+      // Without the Provider the hoisted components get the default
+      // ctx values and nothing about the fix works.
+      return React.createElement(ConfigEditorCtx.Provider,
+        { value: { themeName: mode, editing, startEdit, saving, saveMsg } },
+        React.createElement("div", { className: "space-y-5" },
         // New unified runtime editor at the top. Covers the whitelisted
         // sections; legacy per-section cards below for Telegram / Enrichment /
         // Pipeline (not in the whitelist but still editable here).
@@ -3193,7 +3247,8 @@
           React.createElement(Row, { label: "Supersession max", value: (config.pipeline?.supersession_max_min ?? 90) + " min", mono: true }),
           React.createElement(Row, { label: "Derivation max", value: (config.pipeline?.derivation_max_min ?? 60) + " min", mono: true })
         )
-      );
+        ),   // close outer "div"
+      );     // close ConfigEditorCtx.Provider
     }
 
 
