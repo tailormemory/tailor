@@ -141,7 +141,9 @@ telegram:
 email:
   provider: gmail              # gmail | imap
   addresses:                   # your email addresses (for sent/received detection)
-    - user@gmail.com
+    - primary@example.com
+    - work@example.com
+    - work-alt@example.com
   gmail:
     credentials: ./credentials/gmail_credentials.json
     token: ./credentials/gmail_token.json
