@@ -50,10 +50,37 @@ cp "$TAILOR_DIR/db/doc_registry.json" "$BACKUP_DIR/doc_registry_${TIMESTAMP}.jso
 cp "$TAILOR_DIR/db/reminders.json" "$BACKUP_DIR/reminders_${TIMESTAMP}.json" 2>> "$LOG_FILE"
 log "OK doc_registry + reminders"
 
+# Full DB snapshot (chroma + HNSW segments + facts + entities + state json)
+# Complements chroma_*.sqlite3.gz above: needed for disaster recovery where
+# HNSW vector dirs and facts/entities SQLite would otherwise be lost.
+# sync_and_ingest.sh's auto-rollback still consumes chroma_*.sqlite3.gz —
+# migrating that to use the tar.gz is a separate task.
+HNSW_DIRS=$(cd "$TAILOR_DIR" && find db -maxdepth 1 -type d -regex 'db/[0-9a-f]\{8\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{12\}$' 2>/dev/null)
+FULL_BACKUP="$BACKUP_DIR/tailor_db_full_${TIMESTAMP}.tar.gz"
+if tar czf "$FULL_BACKUP" \
+    -C "$TAILOR_DIR" \
+    db/chroma.sqlite3 \
+    db/facts.sqlite3 \
+    db/entity_index.sqlite3 \
+    db/doc_registry.json \
+    db/reminders.json \
+    db/user_profile.json \
+    db/user_profile_overrides.json \
+    db/translations_it.json \
+    db/supplement_plan.json \
+    db/secrets.sqlite3 \
+    $HNSW_DIRS 2>> "$LOG_FILE"; then
+    SIZE=$(du -h "$FULL_BACKUP" | awk '{print $1}')
+    log "OK full snapshot -> tailor_db_full_${TIMESTAMP}.tar.gz ($SIZE)"
+else
+    log "ERROR full snapshot tar fallito"
+fi
+
 # Cleanup: keep only the last N copies
 ls -t "$BACKUP_DIR"/chroma_*.sqlite3.gz 2>/dev/null | tail -n +$((KEEP+1)) | xargs rm -f 2>/dev/null
 ls -t "$BACKUP_DIR"/doc_registry_*.json 2>/dev/null | tail -n +$((KEEP+1)) | xargs rm -f 2>/dev/null
 ls -t "$BACKUP_DIR"/reminders_*.json 2>/dev/null | tail -n +$((KEEP+1)) | xargs rm -f 2>/dev/null
+ls -t "$BACKUP_DIR"/tailor_db_full_*.tar.gz 2>/dev/null | tail -n +$((KEEP+1)) | xargs rm -f 2>/dev/null
 log "Pulizia: mantenute ultime $KEEP copie"
 
 log "END backup $TIMESTAMP"
