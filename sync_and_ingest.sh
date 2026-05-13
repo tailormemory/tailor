@@ -295,12 +295,16 @@ fi
 IN_MAINTENANCE=1
 
 # ── 2a. CHROMADB INTEGRITY CHECK ──
-log "ChromaDB integrity check..."
-CHROMA_CHECK=$("$PYTHON" -c "
+# Retries on SIGSEGV/SIGABRT (exit > 128): segfault in chromadb_rust_bindings
+# observed 5 times in 48h (incident 2026-05-13 01:31). Rollback fires only
+# after 3 consecutive signal-kills; deterministic errors (EMPTY/ERROR) fire
+# rollback immediately as before.
+CHROMA_COLLECTION=$(python3 -c "import yaml; c=yaml.safe_load(open('$TAILOR_DIR/config/tailor.yaml')); print(c.get('kb',{}).get('collection','tailor_kb'))" 2>/dev/null || echo tailor_kb)
+CHROMA_CHECK_PY=$(cat <<PYEOF
 import chromadb, sys
 try:
     client = chromadb.PersistentClient(path='$TAILOR_DIR/db')
-    col = client.get_collection('$(python3 -c "import yaml; c=yaml.safe_load(open('$TAILOR_DIR/config/tailor.yaml')); print(c.get('kb',{}).get('collection','tailor_kb'))" 2>/dev/null || echo tailor_kb)')
+    col = client.get_collection('$CHROMA_COLLECTION')
     count = col.count()
     if count == 0:
         print(f'EMPTY:0')
@@ -309,13 +313,47 @@ try:
 except Exception as e:
     print(f'ERROR:{e}')
     sys.exit(1)
-" 2>&1)
+PYEOF
+)
 
-CHROMA_STATUS=$(echo "$CHROMA_CHECK" | head -1 | cut -d: -f1)
-CHROMA_COUNT=$(echo "$CHROMA_CHECK" | head -1 | cut -d: -f2-)
+CHROMA_STATUS=""
+CHROMA_COUNT=""
+CHROMA_LAST_RC=0
+CHROMA_LAST_OUT=""
+for attempt in 1 2 3; do
+    log "ChromaDB integrity check (attempt $attempt/3)..."
+    CHROMA_LAST_OUT=$("$PYTHON" -c "$CHROMA_CHECK_PY" 2>&1)
+    CHROMA_LAST_RC=$?
+
+    if [ "$CHROMA_LAST_RC" -eq 0 ]; then
+        CHROMA_STATUS=$(echo "$CHROMA_LAST_OUT" | head -1 | cut -d: -f1)
+        CHROMA_COUNT=$(echo "$CHROMA_LAST_OUT" | head -1 | cut -d: -f2-)
+        if [ "$CHROMA_STATUS" = "OK" ]; then
+            break
+        fi
+        log "WARNING: integrity check exit 0 with unexpected output: $CHROMA_LAST_OUT"
+        break
+    fi
+
+    if [ "$CHROMA_LAST_RC" -gt 128 ]; then
+        SIGNUM=$((CHROMA_LAST_RC - 128))
+        log "WARNING: integrity check killed by signal $SIGNUM (exit $CHROMA_LAST_RC, attempt $attempt/3)"
+        if [ "$attempt" -lt 3 ]; then
+            sleep 5
+            continue
+        fi
+        log "CRITICAL: integrity check killed by signal $SIGNUM on 3 consecutive attempts"
+        CHROMA_STATUS="SIGNAL"
+        break
+    fi
+
+    CHROMA_STATUS=$(echo "$CHROMA_LAST_OUT" | head -1 | cut -d: -f1)
+    CHROMA_COUNT=$(echo "$CHROMA_LAST_OUT" | head -1 | cut -d: -f2-)
+    break
+done
 
 if [ "$CHROMA_STATUS" != "OK" ]; then
-    log "CRITICAL: ChromaDB integrity check FAILED — $CHROMA_CHECK"
+    log "CRITICAL: ChromaDB integrity check FAILED — rc=$CHROMA_LAST_RC status=$CHROMA_STATUS out=$CHROMA_LAST_OUT"
     log "Aborting pipeline to prevent data loss. Restoring from backup..."
     # Find latest backup
     LATEST_BACKUP=$(ls -t "$TAILOR_DIR/backups"/chroma_*.sqlite3.gz 2>/dev/null | head -1)
