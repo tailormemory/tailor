@@ -173,6 +173,7 @@ sys.stdout.write(json.dumps({"chat_id": chat_id, "text": text}))
 
 # Safety net: exit maintenance mode on ANY exit (crash, kill, timeout, success)
 IN_MAINTENANCE=0
+SNAPSHOT_DIR=""
 ensure_mcp_exit_maintenance() {
     if [ "$IN_MAINTENANCE" = "1" ]; then
         log "TRAP: exiting MCP maintenance mode..."
@@ -190,6 +191,7 @@ ensure_mcp_exit_maintenance() {
             rm -f "$TAILOR_DIR/maintenance.lock"
         fi
     fi
+    [ -n "$SNAPSHOT_DIR" ] && rm -rf "$SNAPSHOT_DIR" 2>/dev/null || true
 }
 trap ensure_mcp_exit_maintenance EXIT
 
@@ -295,15 +297,26 @@ fi
 IN_MAINTENANCE=1
 
 # ── 2a. CHROMADB INTEGRITY CHECK ──
-# Retries on SIGSEGV/SIGABRT (exit > 128): segfault in chromadb_rust_bindings
-# observed 5 times in 48h (incident 2026-05-13 01:31). Rollback fires only
-# after 3 consecutive signal-kills; deterministic errors (EMPTY/ERROR) fire
-# rollback immediately as before.
+# Runs against an APFS-COW snapshot of chroma.sqlite3 in /tmp, NOT the live
+# DB. Reason: chromadb_rust_bindings 1.5.8 segfaults deterministically when
+# a second PersistentClient opens the same path while MCP holds FDs on it
+# (reproduced 2026-05-13 P0bis, rc=139). Snapshot in isolated dir eliminates
+# the race; cp on APFS is ~1.5s for 2.5 GB (clone copy-on-write).
+# Retries on SIGSEGV/SIGABRT (exit > 128) preserved as defense-in-depth.
+SNAPSHOT_DIR="/tmp/chroma_check_$$"
+mkdir -p "$SNAPSHOT_DIR"
+if ! cp "$TAILOR_DIR/db/chroma.sqlite3" "$SNAPSHOT_DIR/chroma.sqlite3" 2>>"$LOG_FILE"; then
+    log "CRITICAL: integrity check snapshot copy failed (disk full? permissions?)"
+    ERRORS="${ERRORS}Snapshot copy failed — integrity check skipped. "
+    send_telegram "$(translate "🚨 *CRITICAL*: Integrity check snapshot failed — pipeline aborted, DB NOT rolled back. Manual review required.")"
+    exit 1
+fi
+
 CHROMA_COLLECTION=$(python3 -c "import yaml; c=yaml.safe_load(open('$TAILOR_DIR/config/tailor.yaml')); print(c.get('kb',{}).get('collection','tailor_kb'))" 2>/dev/null || echo tailor_kb)
 CHROMA_CHECK_PY=$(cat <<PYEOF
 import chromadb, sys
 try:
-    client = chromadb.PersistentClient(path='$TAILOR_DIR/db')
+    client = chromadb.PersistentClient(path='$SNAPSHOT_DIR')
     col = client.get_collection('$CHROMA_COLLECTION')
     count = col.count()
     if count == 0:
@@ -321,7 +334,7 @@ CHROMA_COUNT=""
 CHROMA_LAST_RC=0
 CHROMA_LAST_OUT=""
 for attempt in 1 2 3; do
-    log "ChromaDB integrity check (attempt $attempt/3)..."
+    log "ChromaDB integrity check (attempt $attempt/3, snapshot=$SNAPSHOT_DIR)..."
     CHROMA_LAST_OUT=$("$PYTHON" -c "$CHROMA_CHECK_PY" 2>&1)
     CHROMA_LAST_RC=$?
 
@@ -370,6 +383,9 @@ if [ "$CHROMA_STATUS" != "OK" ]; then
     exit 1
 fi
 log "ChromaDB OK: $CHROMA_COUNT chunks"
+# Snapshot no longer needed — free /tmp early (idempotent: trap re-cleans on exit)
+rm -rf "$SNAPSHOT_DIR"
+SNAPSHOT_DIR=""
 
 # ── 2b. LOG ROTATION ──
 log "Log rotation..."
