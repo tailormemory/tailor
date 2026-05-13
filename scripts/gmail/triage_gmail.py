@@ -21,6 +21,9 @@ import sys
 import json
 import time
 import glob
+import random
+import threading
+import concurrent.futures
 import requests
 from datetime import datetime
 
@@ -37,6 +40,13 @@ OPENAI_BASE = "https://api.openai.com/v1"
 
 BATCH_MAX = 5000  # ~1.45M token, sotto il limite di 2M enqueued token
 POLL_INTERVAL = 30  # seconds between each check
+
+# Sync path (run-sync subcommand) — usato per job piccoli (<~1000 email).
+SYNC_MAX_WORKERS = 5
+SYNC_MAX_RETRIES = 3
+SYNC_RETRY_BASE = 2.0  # backoff base in seconds (exponential + jitter)
+SYNC_PROGRESS_FILE = os.path.join(DATA_DIR, "gmail_triage_sync_progress.jsonl")
+_sync_progress_lock = threading.Lock()
 
 TRIAGE_SYSTEM = "Email classifier. Respond ONLY with valid JSON."
 
@@ -555,6 +565,166 @@ def run(resume=False):
 
 
 # ============================================================
+# RUN-SYNC — sync /v1/chat/completions per job piccoli (<~1000 email)
+# ============================================================
+
+def _sync_request_body(email):
+    # Stesso body usato da make_batch_line() (L84-L104). Tenere allineati o il
+    # confronto di output fra path sync e path batch divergera'.
+    prompt = TRIAGE_PROMPT_TEMPLATE.format(
+        sender=email.get("from", "")[:100],
+        subject=email.get("subject", "")[:200],
+        snippet=email.get("snippet", "")[:300],
+    )
+    return {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": TRIAGE_SYSTEM},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 20,
+        "response_format": {"type": "json_object"},
+    }
+
+
+def _parse_sync_response(resp_json):
+    try:
+        choices = resp_json.get("choices", [])
+        if not choices:
+            return {"useful": None, "error": "no choices"}
+        content = choices[0]["message"]["content"].strip()
+        parsed = json.loads(content)
+        return {"useful": parsed.get("useful", False)}
+    except Exception as e:
+        return {"useful": None, "error": str(e)}
+
+
+def _call_one_sync(email):
+    """POST a /v1/chat/completions con retry. Ritorna (custom_id, result_dict)."""
+    custom_id = email.get("id", "")
+    body = _sync_request_body(email)
+    last_err = None
+    for attempt in range(SYNC_MAX_RETRIES):
+        try:
+            resp = requests.post(
+                f"{OPENAI_BASE}/chat/completions",
+                headers=auth_headers(),
+                json=body,
+                timeout=60,
+            )
+            if resp.status_code == 200:
+                return custom_id, _parse_sync_response(resp.json())
+            if resp.status_code in (429, 500, 502, 503, 504):
+                last_err = f"HTTP {resp.status_code}"
+                time.sleep(SYNC_RETRY_BASE * (2 ** attempt) + random.uniform(0, 1))
+                continue
+            return custom_id, {"useful": None, "error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(SYNC_RETRY_BASE * (2 ** attempt) + random.uniform(0, 1))
+    return custom_id, {"useful": None, "error": f"max retries: {last_err}"}
+
+
+def _load_sync_progress():
+    if not os.path.exists(SYNC_PROGRESS_FILE):
+        return {}
+    progress = {}
+    with open(SYNC_PROGRESS_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                cid = rec.get("custom_id")
+                if cid:
+                    progress[cid] = {k: v for k, v in rec.items() if k != "custom_id"}
+            except json.JSONDecodeError:
+                continue
+    return progress
+
+
+def _append_sync_progress(custom_id, result):
+    rec = {"custom_id": custom_id, **result}
+    line = json.dumps(rec, ensure_ascii=False) + "\n"
+    with _sync_progress_lock:
+        with open(SYNC_PROGRESS_FILE, "a", encoding="utf-8") as f:
+            f.write(line)
+            f.flush()
+
+
+def run_sync(resume=False):
+    """Sync path: niente file upload, niente batch poll.
+    Output (gmail_triage.jsonl) identico al path batch per garantire compatibilita'
+    con chunk_gmail.py downstream.
+    """
+    emails = load_emails()
+    total = len(emails)
+    log(f"[sync] Email nel file export: {total:,}")
+
+    if not resume and os.path.exists(SYNC_PROGRESS_FILE):
+        os.remove(SYNC_PROGRESS_FILE)
+        log(f"[sync] Progress file precedente rimosso (fresh run)")
+
+    progress = _load_sync_progress() if resume else {}
+    if progress:
+        log(f"[sync] Resume: {len(progress):,} email gia' processate, skip")
+
+    todo = [e for e in emails if e.get("id", "") not in progress]
+    log(f"[sync] Da processare: {len(todo):,} (workers={SYNC_MAX_WORKERS})")
+
+    if todo:
+        t0 = time.time()
+        done = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=SYNC_MAX_WORKERS) as executor:
+            futures = {executor.submit(_call_one_sync, email): email for email in todo}
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    custom_id, result = future.result()
+                except Exception as e:
+                    email = futures[future]
+                    custom_id = email.get("id", "")
+                    result = {"useful": None, "error": f"executor exception: {e}"}
+                _append_sync_progress(custom_id, result)
+                progress[custom_id] = result
+                done += 1
+                if done % 20 == 0 or done == len(todo):
+                    elapsed = time.time() - t0
+                    rate = done / max(elapsed, 0.001)
+                    log(f"[sync] {done:,}/{len(todo):,} ({rate:.1f}/s)")
+        log(f"[sync] Completato in {time.time() - t0:.1f}s")
+
+    # Merge — stessa logica di merge() ma sorgente e' il dict progress in memoria.
+    useful_count = 0
+    noise_count = 0
+    error_count = 0
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        for email in emails:
+            email_id = email.get("id", "")
+            result = progress.get(email_id, {})
+            email["useful"] = result.get("useful")
+            if result.get("error"):
+                email["triage_error"] = result["error"]
+                error_count += 1
+            elif email["useful"] is True:
+                useful_count += 1
+            elif email["useful"] is False:
+                noise_count += 1
+            else:
+                error_count += 1
+            f.write(json.dumps(email, ensure_ascii=False) + "\n")
+
+    classified = useful_count + noise_count
+    log(f"[sync] Merge:")
+    log(f"  Utili: {useful_count:,} ({useful_count / max(1, classified) * 100:.1f}%)")
+    log(f"  Rumore: {noise_count:,}")
+    log(f"  Errori: {error_count:,}")
+    log(f"  Totale: {len(emails):,}")
+    log(f"  File: {OUTPUT_FILE}")
+
+
+# ============================================================
 # STATS
 # ============================================================
 
@@ -630,8 +800,10 @@ def show_stats():
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Uso:")
-        print("  python3 scripts/gmail/triage_gmail.py run              # Workflow completo")
-        print("  python3 scripts/gmail/triage_gmail.py run --resume     # Riprende da checkpoint")
+        print("  python3 scripts/gmail/triage_gmail.py run              # Batch API (per N grandi)")
+        print("  python3 scripts/gmail/triage_gmail.py run --resume     # Riprende batch da checkpoint")
+        print("  python3 scripts/gmail/triage_gmail.py run-sync         # Sync /v1/chat/completions (per N piccolo, <~1000)")
+        print("  python3 scripts/gmail/triage_gmail.py run-sync --resume # Riprende sync da progress file")
         print("  python3 scripts/gmail/triage_gmail.py prepare          # Only generate mini-batches")
         print("  python3 scripts/gmail/triage_gmail.py submit-next      # Submit next batch")
         print("  python3 scripts/gmail/triage_gmail.py retrieve         # Check running batch")
@@ -651,6 +823,9 @@ if __name__ == "__main__":
     if cmd == "run":
         resume = "--resume" in sys.argv
         run(resume=resume)
+    elif cmd == "run-sync":
+        resume = "--resume" in sys.argv
+        run_sync(resume=resume)
     elif cmd == "prepare":
         prepare()
     elif cmd == "submit-next":
