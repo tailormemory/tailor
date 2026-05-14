@@ -20,6 +20,51 @@ Template for upcoming changes. Move entries under a new version heading on relea
 
 ---
 
+## [1.2.9] — 2026-05-14 — Scheduler resilience & nightly hardening
+
+Reliability-focused release: four fixes on the ChromaDB integrity check and nightly pipeline, a scheduler refactor that lets cron and launchd coexist on the same host, and two new nightly safety nets (gitleaks secret scan + full-DB tar.gz backup). One UI focus-loss regression closed, plus a new sync path for small Gmail triage jobs that don't fit the OpenAI Batch API SLA.
+
+### Added
+
+- **`run-sync` subcommand for Gmail triage** (`scripts/enrichment/gmail_*`). Parallel to the existing Batch API path, this calls `/v1/chat/completions` directly with a 5-worker `ThreadPoolExecutor`, exponential backoff with jitter on 429/5xx (3 attempts), and append-only progress in `data/gmail_triage_sync_progress.jsonl` (thread-safe; `--resume` skips already-processed `custom_id`s). Output schema identical to the batch path — `chunk_gmail.py` parses both unchanged. Intended for jobs ≲ 1000 emails; the batch path remains the right choice for large historical runs. Validated on 221 emails: 62.1 s wall, 3.6 req/s, ~$0.022 vs ~$0.011 batch (50% batch discount lost — negligible at this scale). Triggered by 2026-05-13/14 incident where a 221-email batch stalled at 0/221 for 50+ minutes with status `in_progress`.
+- **Full-DB tar.gz disaster-recovery snapshot**. New `tailor_db_full_<TS>.tar.gz` on the 07:30 schedule, capturing everything needed for full restore: `chroma.sqlite3` + HNSW UUID segment dirs, `facts.sqlite3`, `entity_index.sqlite3`, `doc_registry.json`, `reminders.json`, user profile + overrides + translations + supplement plan, plus the encrypted `secrets.sqlite3` blob. Explicit whitelist (not blacklist); excludes WAL/SHM, maintenance lock, session DBs, `.bak` files. `KEEP=3`. The existing `chroma_*.sqlite3.gz` artifact is preserved — `sync_and_ingest.sh:321` still consumes it for fast rollback; migrating that callsite is a separate task. Smoke test: 2 m 18 s wall, 1.85 GB tar.gz, `gzip -t` OK, all five HNSW segment files present (`data_level0.bin` 507 MB, `link_lists.bin`, `header.bin`, `length.bin`, `index_metadata.pickle`).
+- **Nightly secret scanner via gitleaks**. Countermeasure to the 2026-05-04 incident (a `zsh` redirect typo wrote `TELEGRAM_BOT_TOKEN` plaintext into 4 untracked working-tree files). Three components: (i) `scripts/maintenance/secret_scan.sh` — bash wrapper with atomic `/tmp/tailor_secret_scan.lock`, sources `/etc/tailor/env` for the Telegram token, invokes `gitleaks dir`, writes redacted findings to `logs/secret_scan.log` (path/line/RuleID only — never values), sends a Telegram alert when findings > 0, always exits 0 (alert, not crash); (ii) `scripts/maintenance/secret_scan.gitleaks.toml` — extends the default 200+-rule set, allowlists 17 paths (`.venv`, `db`, `data`, `backups`, `logs`, `tests`, `docs`, …) to suppress generic-api-key FPs from log session strings; (iii) `launchd_proposed/com.tailor.secret-scan.plist` — user LaunchAgent at `StartCalendarInterval` 00:15, before sync-and-ingest 01:30. Tool: `gitleaks` 8.30.1 via brew. Smoke test: 0.5 s clean run over a 54 GB working tree with `--max-target-megabytes 5`; planted fake `ghp_…` detected, log redacted, Telegram POST sent.
+
+### Changed
+
+- **Scheduler: single-instance lock per cron+launchd coexistence**. The 6 jobs migrated to user LaunchAgent now acquire an internal lock before running real work, so cron — which can't be cleanly disabled on this Mac (TCC blocks `crontab` edit; SIP blocks `bootout` of `com.vix.cron`) — coexists without double-runs. 3 bash jobs (`backup_db`, `sync_and_ingest`, `sync_email`): `mkdir`-atomic lock in `/tmp/tailor_<job>.lock` with stale-PID reclaim and `EXIT` trap cleanup. 3 Python jobs (`heartbeat`, `reminder_checker`, `model_advisor`): `fcntl.flock` advisory (`LOCK_EX|NB`), auto-released by the kernel on FD close. `model_advisor.py` aligned with siblings by adding `load_env()`. Cron silenced operationally via `launchctl disable system/com.vix.cron` + `kill -STOP $(pgrep -x cron)`.
+- **LaunchAgent source-of-truth templates committed**. The 4 plists (`heartbeat`, `reminder-checker`, `model-advisor`, `sync-email`) were byte-identical with what is deployed under `~/Library/LaunchAgents/` but had never been committed into `launchd_proposed/`. Now tracked so future edits start from a consistent baseline.
+- **Nightly step-budget caps tuned**. Derivation cap 60 → 55 min, extraction cap 200 → 205 min. Empirical p95 of natural derivation completions = 47.7 min (n=16, Apr 25 → May 10); 55 min leaves 7 min margin above p95. The 5 min reclaimed is reallocated to extraction.
+- **`tailor.yaml` example: `email.addresses` bumped to 3 entries**. The template carried a single placeholder, but `chunk_gmail.py`'s identity filter (`is_user_sender OR is_user_sole_to`) already iterates the list. Three representative placeholders (personal, work, legacy-work) make the multi-mailbox case obvious during initial setup. Incident 2026-05-14: a 221-email triage was correctly classified (148 useful) but yielded zero chunks because the live `tailor.yaml` listed only two addresses, neither matching the export mailbox — the chunk filter silently dropped every useful email.
+
+### Fixed
+
+- **ChromaDB integrity check: signal-aware retry**. Incident 2026-05-13 01:31: a `SIGSEGV` in `chromadb_rust_bindings` (chromadb 1.5.8) emitted empty stdout+stderr; the check never read `$?`, so signal-killed Python was indistinguishable from a deterministic `EMPTY:0` / `ERROR:<msg>` — both fed the same `!= OK` branch and triggered auto-rollback. Hardening: 3 attempts total (1 + 2 retries, `sleep 5` between), retry **only** when exit > 128 (SIGSEGV=139, SIGABRT=134, SIGKILL=137); `EMPTY:0` / `ERROR:<msg>` still trigger immediate rollback (genuine-corruption safety net). Worst-case added latency on the 08:00-deadline pipeline: ~10 s. Five segfaults observed in the preceding 48 h (2026-05-12 04:01, 06:35; 2026-05-13 01:31, 04:01 ×2), all `KERN_INVALID_ADDRESS @ 0x0`.
+- **ChromaDB integrity check: COW snapshot to dodge race**. Follow-up to the retry fix above. P0bis confirmed the segfault is deterministic, not flaky: any second `PersistentClient` opening the live DB path crashes when MCP holds FDs on it — so the 3-attempt retry alone would have failed all attempts. Root mitigation: APFS clone-copy `chroma.sqlite3` into `/tmp/chroma_check_$$` (~1.5 s for 2.5 GB) and run the check against the isolated directory. No second client ever touches the live path; the race is structurally eliminated. Cleanup via `ensure_mcp_exit_maintenance` `EXIT` trap (idempotent) plus an explicit `rm -rf` post-success. `cp` failure (disk full, perms) triggers a distinct Telegram alert and exits 1 **without** rollback — the live DB is fine, only the check infrastructure broke. The 3-attempt loop is kept as defense-in-depth.
+- **`TAILOR_NIGHTLY_MODE=facts_only` + post-sync backup schedule restored**. The system-LaunchDaemon → user-LaunchAgent migration in `refactor(scheduler)` lost two settings: `TAILOR_NIGHTLY_MODE=facts_only` (without it, `sync_and_ingest.sh` defaults to `full` and re-runs `ingest_docs` / `create_missing_summaries` / `extract_entities` nightly — the ChromaDB-write steps `facts_only` intentionally skips); and the `backup-db` start hour (01:25, **before** sync-and-ingest 01:30 — a pre-sync snapshot). Restored `facts_only` in the new LaunchAgent and moved backup to 07:30 (after sync-email at 04:00) so the snapshot captures a quiet, coherent post-sync state. Manual cleanup post-migration: the 6 duplicate system LaunchDaemons removed; `/Library/LaunchDaemons/` now holds only the 4 genuinely system-level daemons (`chromadb_version_check`, `mcp`, `ollama`, `telegram`).
+- **`ConfigPage` form re-render dropped input focus**. Same class of bug as the prior `RuntimeConfigEditor` fix (commit `e400ac4`): `Row`, `EditBtn`, `SaveBar`, and `Section` were defined inside `ConfigPage`'s render body, so every parent render produced fresh function references that React treated as new component types — the subtree unmounted and remounted, killing focus after every keystroke. Affected every text field across Intent Classifier / LLM Backend / Telegram / Identity / Enrichment / Pipeline Schedule. Fix hoists all four helpers to module scope and introduces `ConfigEditorCtx` carrying the previously closed-over locals (`themeName`, `editing`, `startEdit`, `saving`, `saveMsg`). The same "do NOT inline these back" comment block added above `ConfigPage` as for `RuntimeConfigEditor`.
+- **Log wording: `deadline in X min` → `step budget remaining`**. The original message measured the budget remaining for the current step after reserving quota for subsequent steps — **not** the time until the absolute deadline. 3 occurrences renamed (extraction, supersession, derivation). No behavior change.
+
+### Internal
+
+- **gitleaks allowlist extended with `credentials/`**. The first nightly run (2026-05-14 00:15) flagged `credentials/gmail_credentials.json` and `credentials/gmail_token.json` (`generic-api-key` rule) — legitimate OAuth artifacts produced by the Gmail re-auth flow (`client_id`, `client_secret`, `refresh_token`), already `git check-ignore`'d, no push risk. Added to the allowlist alongside `data/`, `db/`, `backups/`.
+
+### Docs
+
+- **`CLAUDE.md` — conventions for AI agents**. 8-section convention file consolidating implicit conventions used across recent Roadmap #0 work: secrets handling, working-tree hygiene, authority boundaries (no `sudo` / no push / no root-owned edits), backup pre-edit pattern, validation post-edit, edit flow per round, restart-daemons mapping, commit & changelog conventions. Triggered by the 2026-05-04 token-echo incident. Also extends `.gitignore` with `.backups/` (covers root-level and nested `scripts/lib/.backups/` via a recursive pattern) to keep pre-edit code snapshots out of git.
+- **CHANGELOG back-fill: v1.2.6.2 → v1.2.8**. Entries for v1.2.6.2, v1.2.6.3, v1.2.7, and v1.2.8 added retroactively, integrated with the GitHub Release bodies. Footer extended with the full compare-link chain from `[Unreleased]` through v1.0.0 (12 missing links added; v1.2.4.1 / v1.2.3.1 hotfixes intentionally out of CHANGELOG scope per existing convention). `[Unreleased]` section reset to the keep-a-changelog template comment.
+
+### Stats
+
+- 15 commits since v1.2.8
+- 2 new nightly safety nets: gitleaks scan (00:15) + full-DB tar.gz backup (07:30)
+- 1 new code path: `run-sync` Gmail triage, parallel to the Batch API path
+- 4 LaunchAgent templates committed to `launchd_proposed/` (previously deployed-only)
+- 5 chromadb 1.5.8 `SIGSEGV` incidents in the 48 h preceding the retry + COW-snapshot fixes
+- 1 UI focus-loss regression closed (`ConfigPage`, 6 legacy sections affected)
+
+---
+
 ## [1.2.8] — 2026-05-08 — Roadmap #0: chat dashboard as control plane
 
 Five commits land the next phase of the dashboard-as-control-plane roadmap: the chat-side LLM can now manage reminders and read whitelisted personal documents end-to-end, plus a tightening of the REST API auth model. Internal cleanup: `validate_doc_path` extracted as a shared helper and a `SELF_PAGINATED_TOOLS` opt-out added to `tool_executor` for tools that handle their own pagination.
@@ -776,7 +821,8 @@ First public release. Self-hosted AI memory framework with persistent, searchabl
 
 ---
 
-[Unreleased]: https://github.com/tailormemory/tailor/compare/v1.2.8...HEAD
+[Unreleased]: https://github.com/tailormemory/tailor/compare/v1.2.9...HEAD
+[1.2.9]: https://github.com/tailormemory/tailor/compare/v1.2.8...v1.2.9
 [1.2.8]: https://github.com/tailormemory/tailor/compare/v1.2.7...v1.2.8
 [1.2.7]: https://github.com/tailormemory/tailor/compare/v1.2.6.3...v1.2.7
 [1.2.6.3]: https://github.com/tailormemory/tailor/compare/v1.2.6.2...v1.2.6.3
