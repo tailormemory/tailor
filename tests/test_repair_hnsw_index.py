@@ -701,3 +701,215 @@ def test_doc_chunk_embedding_text_includes_prefix(synthetic_db):
     # Summary chunk does NOT get an extra prefix (uses chroma:document as-is)
     assert summary_text == "summary text alpha"
     assert "Cartella:" not in summary_text
+
+
+# ============================================================
+# A3 — _classify_ghost dispatcher unit tests
+# ============================================================
+# After A3, _classify_ghost prefers 3 known mcp_server namespaces
+# (kb_add / kb_update_session / /api/ingest-live) before falling
+# through to the original doc_<hash>_chunk_<N> logic, which is
+# preserved bit-identical. These tests cover both directions:
+# positives + edge cases for the 3 new patterns, and explicit
+# non-regression of the doc_ and "truly-unknown" paths.
+
+
+def test_classify_ghost_kb_add_pattern_positive():
+    cls, note = rhi._classify_ghost("claude_20260516_213045_4271", set())
+    assert cls == "known_kb_add_ghost"
+    assert "kb_add" in note
+
+    cls2, _ = rhi._classify_ghost("chatgpt_20260516_213045_0000", set())
+    assert cls2 == "known_kb_add_ghost"
+
+
+def test_classify_ghost_kb_add_edge_cases():
+    # 3 digits instead of 4 in the trailing hash slot → no match → unknown
+    cls, _ = rhi._classify_ghost("claude_20260516_213045_427", set())
+    assert cls == "unknown"
+    # 7-digit date instead of 8 → no match → unknown
+    cls2, _ = rhi._classify_ghost("claude_2026051_213045_4271", set())
+    assert cls2 == "unknown"
+    # Unknown source prefix (regex is rigid on (claude|chatgpt))
+    cls3, _ = rhi._classify_ghost("gemini_20260516_213045_4271", set())
+    assert cls3 == "unknown"
+
+
+def test_classify_ghost_kb_session_pattern_positive():
+    cls, note = rhi._classify_ghost("claude_session_20260516_213045", set())
+    assert cls == "known_kb_session_ghost"
+    assert "kb_update_session" in note
+
+    cls2, _ = rhi._classify_ghost("chatgpt_session_20260516_213045", set())
+    assert cls2 == "known_kb_session_ghost"
+
+
+def test_classify_ghost_kb_session_edge_cases():
+    # Invalid prefix — regex is rigid
+    cls, _ = rhi._classify_ghost("manual_session_20260516_213045", set())
+    assert cls == "unknown"
+    # Truncated id (missing HHMMSS segment)
+    cls2, _ = rhi._classify_ghost("claude_session_20260516", set())
+    assert cls2 == "unknown"
+
+
+def test_classify_ghost_live_pattern_positive():
+    cls, note = rhi._classify_ghost("live_claude_abcdef0123456789", set())
+    assert cls == "known_live_capture_ghost"
+    assert "ingest-live" in note
+
+    # <source> is permissive: any [A-Za-z0-9_\-]+ value the browser
+    # extension might send
+    cls2, _ = rhi._classify_ghost("live_web_0000111122223333", set())
+    assert cls2 == "known_live_capture_ghost"
+
+    cls3, _ = rhi._classify_ghost("live_chatgpt_deadbeef12345678", set())
+    assert cls3 == "known_live_capture_ghost"
+
+
+def test_classify_ghost_live_edge_cases():
+    # Hex segment too short
+    cls, _ = rhi._classify_ghost("live_claude_abc123", set())
+    assert cls == "unknown"
+    # Uppercase hex — regex requires lowercase [0-9a-f]
+    cls2, _ = rhi._classify_ghost("live_claude_ABCDEF0123456789", set())
+    assert cls2 == "unknown"
+
+
+def test_classify_ghost_truly_unknown_remains_unknown():
+    """Non-regression: ids that returned 'unknown' pre-A3 still return
+    'unknown' with the original note text (bit-identical fallthrough)."""
+    cls, note = rhi._classify_ghost("some_random_id", set())
+    assert cls == "unknown"
+    assert note == "id does not match `<prefix>_chunk_NNNN` pattern"
+
+    # _chunk_ present, prefix not doc_ — original third 'unknown' branch
+    cls2, note2 = rhi._classify_ghost("weirdo_chunk_0001", set())
+    assert cls2 == "unknown"
+    assert note2 == "prefix weirdo does not match document namespace"
+
+
+def test_classify_ghost_doc_superseded_unchanged():
+    """Non-regression: doc_<hash>_chunk_<N> behaves bit-identically.
+    Both 'known_superseded_doc' branch and the two doc_ 'unknown'
+    branches keep their exact pre-A3 note text."""
+    # Hash NOT in registry → known_superseded_doc
+    cls, note = rhi._classify_ghost("doc_abc123def456_chunk_0007", set())
+    assert cls == "known_superseded_doc"
+    assert note == (
+        "prefix doc_abc123def456 not in current doc_registry "
+        "— likely superseded prior version"
+    )
+
+    # Hash IN registry → unknown with the original note text
+    cls2, note2 = rhi._classify_ghost(
+        "doc_abc123def456_chunk_0007", {"abc123def456"}
+    )
+    assert cls2 == "unknown"
+    assert note2 == (
+        "prefix doc_abc123def456 matches a doc_hash still in registry "
+        "— unexpected"
+    )
+
+
+def test_classify_ghost_precedence_session_vs_add():
+    """Dispatcher ordering: kb_add and kb_session regexes are mutually
+    exclusive (the first digit after `claude_` discriminates: digit →
+    kb_add, 's' → kb_session). Confirm neither classification leaks
+    across."""
+    cls_session, _ = rhi._classify_ghost(
+        "claude_session_20260516_213045", set()
+    )
+    assert cls_session == "known_kb_session_ghost"
+
+    cls_add, _ = rhi._classify_ghost("claude_20260516_213045_4271", set())
+    assert cls_add == "known_kb_add_ghost"
+
+
+# ============================================================
+# A3 — end-to-end audit with the 3 new ghost namespaces present
+# ============================================================
+
+
+@pytest.fixture
+def synthetic_db_with_modern_ghosts(synthetic_db):
+    """Extends synthetic_db's HNSW pickle with 3 extra ghosts under the
+    new mcp_server namespaces (kb_add, kb_update_session, ingest-live).
+    The new ghosts have no SQL row → they appear as HNSW-only entries.
+
+    Built as a derivative fixture (NOT by parametrising synthetic_db)
+    so the 16 baseline tests keep their fixed expectations
+    (hnsw_only_count == 2) untouched.
+
+    Resulting state for this fixture:
+      hnsw_only_count == 5 (2 doc-superseded + 3 modern)
+      unknown_count   == 0 (all classified after A3)
+    """
+    extra_ghosts = [
+        "claude_20260516_213045_4271",      # kb_add namespace
+        "claude_session_20260516_213045",   # kb_update_session namespace
+        "live_claude_abcdef0123456789",     # /api/ingest-live namespace
+    ]
+    pickle_path = os.path.join(
+        synthetic_db["db_dir"], VEC_SEG_ID, "index_metadata.pickle",
+    )
+    with open(pickle_path, "rb") as f:
+        payload = pickle.load(f)
+    next_label = max(payload["id_to_label"].values()) + 1
+    for hid in extra_ghosts:
+        payload["id_to_label"][hid] = next_label
+        payload["label_to_id"][next_label] = hid
+        next_label += 1
+    payload["total_elements_added"] = len(payload["id_to_label"])
+    with open(pickle_path, "wb") as f:
+        pickle.dump(payload, f)
+
+    return {**synthetic_db, "extra_ghost_ids": list(extra_ghosts)}
+
+
+def test_audit_recognises_modern_ghost_namespaces(synthetic_db_with_modern_ghosts):
+    """End-to-end: audit on a DB with kb_add / kb_session / live_capture
+    ghosts classifies them as known_*_ghost; unknown_count == 0. This
+    is the central invariant of A3."""
+    report = rhi.audit(
+        db_path=synthetic_db_with_modern_ghosts["db_path"],
+        db_dir=synthetic_db_with_modern_ghosts["db_dir"],
+    )
+    assert report.hnsw_only_count == 5
+    assert report.unknown_count == 0
+    assert report.has_unknowns() is False
+
+    classifications = {g.classification for g in report.hnsw_only_ghosts}
+    assert "known_kb_add_ghost" in classifications
+    assert "known_kb_session_ghost" in classifications
+    assert "known_live_capture_ghost" in classifications
+    # The 2 original doc-superseded ghosts are still classified
+    assert "known_superseded_doc" in classifications
+
+
+def test_apply_proceeds_with_modern_ghosts_present(synthetic_db_with_modern_ghosts):
+    """End-to-end: with the 3 new ghost types present (alongside the
+    existing SQL-only orphans), rhi.repair() proceeds without raising.
+    The ghosts themselves are not re-embedded — only the SQL-only
+    orphans are — but the apply gate no longer blocks on them.
+
+    Pre-A3: same DB would have report.unknown_count >= 3, repair()
+    raised RuntimeError, and the CLI returned rc=4. This is the user-
+    visible unblock that A3 delivers."""
+    report = rhi.audit(
+        db_path=synthetic_db_with_modern_ghosts["db_path"],
+        db_dir=synthetic_db_with_modern_ghosts["db_dir"],
+    )
+    coll = FakeCollection()
+    result = rhi.repair(
+        report,
+        embed_fn=_deterministic_embed,
+        collection=coll,
+        batch_size=10,
+    )
+    assert result["repaired"] == 4
+    assert result["skipped_oversize"] == 0
+    upserted_ids = sorted(i for call in coll.upsert_calls for i in call["ids"])
+    assert upserted_ids == sorted(
+        synthetic_db_with_modern_ghosts["expected_orphan_ids"]
+    )

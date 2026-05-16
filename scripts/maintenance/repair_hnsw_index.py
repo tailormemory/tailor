@@ -31,6 +31,7 @@ import argparse
 import json
 import os
 import pickle
+import re
 import sqlite3
 import sys
 import time
@@ -70,7 +71,9 @@ class OrphanChunk:
 @dataclass
 class GhostChunk:
     embedding_id: str
-    classification: str  # "known_superseded_doc" | "unknown"
+    classification: str  # "known_superseded_doc" | "known_kb_add_ghost" |
+                        # "known_kb_session_ghost" | "known_live_capture_ghost" |
+                        # "unknown"
     note: str = ""
 
 
@@ -225,8 +228,49 @@ def _classify_orphan(eid: str, meta: dict[str, Any]) -> str:
     return "unknown"
 
 
+# Dispatch table for _classify_ghost. Each entry is
+# (compiled_regex, classification_string, note_string).
+# Matched in order; first match wins. The doc_<hash>_chunk_<N> namespace
+# is intentionally NOT in this table — it lives in the fallthrough below
+# because its classification depends on the live doc_registry, not on
+# the id pattern alone.
+_KNOWN_GHOST_PATTERNS: list[tuple[re.Pattern, str, str]] = [
+    (
+        re.compile(r"^(claude|chatgpt)_\d{8}_\d{6}_\d{4}$"),
+        "known_kb_add_ghost",
+        "kb_add namespace — stranded by an mcp_server kb_add persist failure",
+    ),
+    (
+        re.compile(r"^(claude|chatgpt)_session_\d{8}_\d{6}$"),
+        "known_kb_session_ghost",
+        "kb_update_session namespace — stranded by an mcp_server kb_update_session persist failure",
+    ),
+    (
+        re.compile(r"^live_[A-Za-z0-9_\-]+_[0-9a-f]{16}$"),
+        "known_live_capture_ghost",
+        "/api/ingest-live namespace — stranded by a browser-extension ingest persist failure",
+    ),
+]
+
+
 def _classify_ghost(eid: str, registry_doc_hashes: set[str]) -> tuple[str, str]:
-    """Returns (classification, note)."""
+    """Returns (classification, note).
+
+    Two-stage classification:
+      (1) Match against `_KNOWN_GHOST_PATTERNS` in order. These cover
+          ghosts produced by mcp_server write paths (kb_add /
+          kb_update_session / /api/ingest-live) that lost their SQL row
+          but kept the HNSW vector. First match wins.
+      (2) Fallthrough: the original doc_<hash>_chunk_<N> logic, preserved
+          bit-identical from the pre-A3 implementation. Routes superseded
+          doc_ ghosts to "known_superseded_doc" and everything else to
+          "unknown" with the original note text.
+    """
+    for pattern, cls, note in _KNOWN_GHOST_PATTERNS:
+        if pattern.match(eid):
+            return cls, note
+
+    # === Original doc_<hash>_chunk_<N> logic — preserved bit-identical ===
     if "_chunk_" not in eid:
         return "unknown", "id does not match `<prefix>_chunk_NNNN` pattern"
     prefix = eid.rsplit("_chunk_", 1)[0]
@@ -516,9 +560,13 @@ def format_report_human(report: DriftReport, delta: Delta | None = None) -> str:
     unknown_ghosts = [g for g in report.hnsw_only_ghosts if g.classification == "unknown"]
     if not unknowns and not unknown_ghosts:
         lines.append("  none")
-        lines.append("  (script knows about: SQL-only docs/summaries/conversations/emails,")
-        lines.append("   HNSW-only chunks under doc_<hash> namespace not in current registry,")
-        lines.append("   queue lag from pending upserts)")
+        lines.append("  (script knows about:")
+        lines.append("     SQL-only:  docs / summaries / conversations / emails")
+        lines.append("     HNSW-only: doc_<hash> superseded by registry")
+        lines.append("                claude|chatgpt_<YYYYMMDD>_<HHMMSS>_<NNNN>    (kb_add)")
+        lines.append("                claude|chatgpt_session_<YYYYMMDD>_<HHMMSS>   (kb_update_session)")
+        lines.append("                live_<source>_<16hex>                        (/api/ingest-live)")
+        lines.append("     queue lag from pending upserts.)")
     else:
         for o in unknowns:
             lines.append(f"  ORPHAN  {o.embedding_id}  source={o.metadata.get('source')!r}  conv_id={o.metadata.get('conv_id')!r}")
