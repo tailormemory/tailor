@@ -1,24 +1,26 @@
 """Tests for scripts.lib.ingest_helpers.
 
-The helper wraps `collection.upsert()` with a vector-path readback that
-detects chromadb 1.x SQL-vs-HNSW persist drift. Tests build a fake
-collection that simulates HNSW state explicitly, so we exercise:
-  - clean upsert path (verifier passes first try)
-  - retry-then-success (vector consumer lag)
-  - persistent drift -> pending_<run_id>.json + maintenance_log row
-  - never-raise contract
-without requiring chromadb to be installed.
+verified_upsert (post-v1.2.6.3) wraps collection.upsert() with a
+sample-get sentinel: reads back the first id of each batch via
+collection.get(); if missing, returns False. Surfaces the chromadb
+1.5.8 frozen-collection silent-drop. No HNSW probing, no retry,
+no pending-drift recording — the canonical drift detector is
+repair_hnsw_index.py (nightly).
+
+The pre-1.2.6.3 inline drift verifier (_vector_path_drift +
+embeddings_queue check + pending-drift JSON + maintenance_log) is
+dead code disabled by the SIGSEGV bypass introduced in v1.2.6.1.
+Tests that exercised it were removed; their coverage either lives
+in repair_hnsw_index.py (canonical drift detector) or will be
+re-introduced by A1 with the new retry-opt-in semantics.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import sqlite3
 import sys
-import time
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -34,52 +36,75 @@ import ingest_helpers as ih  # noqa: E402
 
 
 class FakeCollection:
-    """Fake chromadb.Collection that explicitly tracks HNSW vs SQL state.
+    """Fake chromadb.Collection for verified_upsert tests.
 
-    `sql` mirrors the metadata segment (always written on upsert).
-    `hnsw` mirrors the vector segment (configurable: drop writes to
-    simulate persist-on-shutdown drift). `query()` returns top-1 from
-    `hnsw` only — exactly what the verifier reads.
+    Truth model:
+        upsert(ids=[i], embeddings=[e], ...) writes i -> e to self.sql.
+        get(ids=[i]) returns {"ids": [i]} iff i is in self.sql,
+        else {"ids": []}.
+
+    Silent-drop simulation: use .program_get(*responses) to enqueue a
+    FIFO sequence of overrides for upcoming get() calls. Each response
+    is either a dict with key "ids" (returned verbatim) or the class
+    sentinel FakeCollection.DEFAULT (fall through to truthful SQL
+    behaviour for that single call). Once the queue is exhausted, all
+    further calls use truthful behaviour.
+
+    Common patterns (used by this file and by A1 retry/backoff tests):
+        coll.program_get({"ids": []})
+            -> silent-drop only on the first get() call.
+        coll.program_get({"ids": []}, FakeCollection.DEFAULT)
+            -> drop on call 1, truthful on call 2 (retry recovery).
+        coll.program_get({"ids": []}, {"ids": []}, {"ids": []})
+            -> drop on first 3 calls (retry=2 exhausted, 3 attempts).
+
+    Attributes for assertions:
+        sql           dict[id -> embedding]
+        upsert_calls  list[dict] — one entry per upsert() with {"ids": [...]}
+        get_calls     list[list[str]] — one entry per get() with the ids requested
     """
 
-    def __init__(self, *, drop_hnsw_for: list[str] | None = None, drop_after_n_calls: int | None = None):
+    DEFAULT = object()  # sentinel: program_get queue entry meaning "use truthful SQL default"
+
+    def __init__(self):
         self.sql: dict[str, list[float]] = {}
-        self.hnsw: dict[str, list[float]] = {}
         self.upsert_calls: list[dict] = []
-        self.query_calls: int = 0
-        self._drop_for = set(drop_hnsw_for or [])
-        # If set, only drop on upsert calls AFTER the Nth call has happened
-        # (used to simulate "first attempt drifted, retry succeeded")
-        self._drop_after = drop_after_n_calls
-        self._upsert_count = 0
+        self.get_calls: list[list[str]] = []
+        self._get_queue: list = []
+
+    def program_get(self, *responses) -> None:
+        """Enqueue FIFO responses for the next get() calls.
+
+        Each response must be either a dict containing the key "ids" or
+        the sentinel FakeCollection.DEFAULT. Anything else raises
+        TypeError — fail-fast on malformed test setup.
+        """
+        for r in responses:
+            if r is FakeCollection.DEFAULT:
+                self._get_queue.append(r)
+                continue
+            if isinstance(r, dict) and "ids" in r:
+                self._get_queue.append(r)
+                continue
+            raise TypeError(
+                f"program_get: each response must be a dict with key 'ids' "
+                f"or FakeCollection.DEFAULT; got {type(r).__name__}: {r!r}"
+            )
 
     def upsert(self, *, ids, embeddings, documents, metadatas):
-        self._upsert_count += 1
-        self.upsert_calls.append({"ids": list(ids), "n": self._upsert_count})
-        # SQL always succeeds
+        self.upsert_calls.append({"ids": list(ids)})
         for i, eid in enumerate(ids):
             self.sql[eid] = list(embeddings[i])
-        # HNSW: drop the configured ids only on the configured upsert call
-        for i, eid in enumerate(ids):
-            if eid in self._drop_for:
-                if self._drop_after is None or self._upsert_count <= self._drop_after:
-                    continue
-            self.hnsw[eid] = list(embeddings[i])
 
-    def query(self, *, query_embeddings, n_results=1, include=None):
-        self.query_calls += 1
-        results_ids: list[list[str]] = []
-        for q in query_embeddings:
-            best_id = None
-            best_dist = float("inf")
-            for hid, hemb in self.hnsw.items():
-                # squared euclidean — sufficient for ranking
-                d = sum((a - b) ** 2 for a, b in zip(q, hemb))
-                if d < best_dist:
-                    best_dist = d
-                    best_id = hid
-            results_ids.append([best_id] if best_id else [])
-        return {"ids": results_ids}
+    def get(self, *, ids):
+        ids_list = list(ids)
+        self.get_calls.append(ids_list)
+        if self._get_queue:
+            resp = self._get_queue.pop(0)
+            if resp is not FakeCollection.DEFAULT:
+                return resp
+        present = [i for i in ids_list if i in self.sql]
+        return {"ids": present}
 
 
 def _ensure_maintenance_log(db_path: str) -> None:
@@ -94,7 +119,13 @@ def _ensure_maintenance_log(db_path: str) -> None:
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
-    """Synthetic environment: tmp DB with maintenance_log, tmp pending dir."""
+    """Synthetic environment: tmp DB with maintenance_log, tmp pending dir.
+
+    Used by the clean-upsert sanity check to prove verified_upsert does
+    not write to legacy locations (pending JSON dir / maintenance_log
+    table). Those writes belonged to the pre-1.2.6.3 inline drift
+    verifier and must remain dormant.
+    """
     db_path = tmp_path / "chroma.sqlite3"
     pending_dir = tmp_path / "logs" / "hnsw_audits"
     _ensure_maintenance_log(str(db_path))
@@ -109,10 +140,10 @@ def env(tmp_path, monkeypatch):
 def _payload(ids: list[str]) -> dict:
     """Build matching ids/embeddings/documents/metadatas of the same length.
 
-    Embeddings are derived from `hash(eid)` so distinct ids across distinct
-    batches still get distinct vectors — important for the multi-batch test
-    where the verifier must not match a chunk against a same-position chunk
-    from a prior batch."""
+    Embeddings are derived from `hash(eid)` so distinct ids get distinct
+    vectors. The shape is preserved for parity with the real chromadb
+    upsert contract even though verified_upsert post-1.2.6.3 only
+    reads back via collection.get() (no vector probing)."""
     embs: list[list[float]] = []
     for eid in ids:
         h = hash(eid)
@@ -161,11 +192,12 @@ def test_make_run_id_is_unique_across_pids(monkeypatch):
 
 
 # ============================================================
-# verified_upsert success path
+# verified_upsert — post-1.2.6.3 sample-get sentinel
 # ============================================================
 
 
 def test_verified_upsert_clean_returns_true(env):
+    """Clean upsert: sentinel reads back the first batch id and finds it."""
     coll = FakeCollection()
     p = _payload(["a_chunk_0", "a_chunk_1", "a_chunk_2"])
     ok = ih.verified_upsert(
@@ -174,313 +206,25 @@ def test_verified_upsert_clean_returns_true(env):
     )
     assert ok is True
     assert len(coll.upsert_calls) == 1
-    assert coll.query_calls == 1  # single batched verify, no retry
-    # No pending file written
-    assert not Path(env["pending_dir"]).exists() or not list(Path(env["pending_dir"]).glob("pending_*.json"))
-    # No maintenance_log row written
+    # Post-1.2.6.3 sentinel: a single get() of the first batch id.
+    assert len(coll.get_calls) == 1
+    assert coll.get_calls[0] == ["a_chunk_0"]
+    # Sanity: verified_upsert must not write to legacy locations (those
+    # belonged to the pre-1.2.6.3 inline drift verifier — dead code).
+    pending_dir = Path(env["pending_dir"])
+    assert not pending_dir.exists() or not list(pending_dir.glob("pending_*.json"))
     con = sqlite3.connect(env["db_path"])
     rows = con.execute("SELECT * FROM maintenance_log").fetchall()
     con.close()
     assert rows == []
 
 
-# ============================================================
-# verified_upsert retry-then-success
-# ============================================================
-
-
-def test_verified_upsert_retry_then_success(env, monkeypatch):
-    """Vector-consumer lag: first verify fails, retry succeeds."""
-    # Drop hnsw write for 'a_chunk_0' on call #1, but not on call #2.
-    # We simulate the lag by having FakeCollection upsert once, then
-    # us patching its hnsw map between the two _vector_path_drift calls.
-    coll = FakeCollection(drop_hnsw_for=["a_chunk_0"])
-    p = _payload(["a_chunk_0", "a_chunk_1"])
-
-    # Patch sleep to avoid real delay; while sleeping, flip hnsw to "caught up"
-    sleeps: list[float] = []
-    def fake_sleep(d):
-        sleeps.append(d)
-        # Vector consumer "catches up" while we sleep
-        coll.hnsw["a_chunk_0"] = list(p["embeddings"][0])
-    monkeypatch.setattr(ih.time, "sleep", fake_sleep)
-
-    ok = ih.verified_upsert(
-        coll, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
-        run_id="test_run_002", source="test",
-    )
-    assert ok is True
-    assert len(coll.upsert_calls) == 1  # single upsert, two verify calls
-    assert coll.query_calls == 2
-    assert sleeps == [ih.VERIFIER_RETRY_DELAY]
-
-
-# ============================================================
-# verified_upsert persistent drift
-# ============================================================
-
-
-def test_verified_upsert_drift_logs_pending_and_maintenance_log(env, monkeypatch):
-    """Persistent drift: pending JSON + maintenance_log written, returns False."""
-    # Drop hnsw for two ids permanently
-    coll = FakeCollection(drop_hnsw_for=["a_chunk_0", "a_chunk_2"])
-    p = _payload(["a_chunk_0", "a_chunk_1", "a_chunk_2"])
-    monkeypatch.setattr(ih.time, "sleep", lambda d: None)
-
-    ok = ih.verified_upsert(
-        coll, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
-        run_id="test_run_003", source="docs",
-    )
-    assert ok is False
-    assert len(coll.upsert_calls) == 1
-    assert coll.query_calls == 2  # primary + retry
-
-    # Pending JSON
-    pending_path = Path(env["pending_dir"]) / "pending_test_run_003.json"
-    assert pending_path.exists()
-    data = json.loads(pending_path.read_text())
-    assert data["run_id"] == "test_run_003"
-    assert len(data["entries"]) == 1
-    entry = data["entries"][0]
-    assert entry["source"] == "docs"
-    assert sorted(entry["ids"]) == ["a_chunk_0", "a_chunk_2"]
-
-    # maintenance_log row
-    con = sqlite3.connect(env["db_path"])
-    rows = con.execute("SELECT id, timestamp, operation FROM maintenance_log").fetchall()
-    con.close()
-    assert len(rows) == 1
-    payload = json.loads(rows[0][2])
-    assert payload["tool"] == "ingest_helpers.py"
-    assert payload["mode"] == "verify"
-    assert payload["run_id"] == "test_run_003"
-    assert payload["source"] == "docs"
-    assert payload["drift_summary"]["drift_total"] == 2
-    assert payload["drift_summary"]["drift_ids_in_payload"] == 2
-    assert sorted(payload["drift_ids"]) == ["a_chunk_0", "a_chunk_2"]
-
-
-def test_verified_upsert_drift_caps_payload_ids(env, monkeypatch):
-    """Drift > MAINTENANCE_LOG_DRIFT_ID_CAP → cap the payload, drift_total still
-    reports the true count."""
-    big_ids = [f"chunk_{i:04d}" for i in range(75)]
-    coll = FakeCollection(drop_hnsw_for=big_ids)
-    p = _payload(big_ids)
-    monkeypatch.setattr(ih.time, "sleep", lambda d: None)
-
-    ok = ih.verified_upsert(
-        coll, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
-        run_id="test_run_004", source="docs",
-    )
-    assert ok is False
-
-    # All 75 ids in pending JSON
-    pending_path = Path(env["pending_dir"]) / "pending_test_run_004.json"
-    data = json.loads(pending_path.read_text())
-    assert len(data["entries"][0]["ids"]) == 75
-
-    # maintenance_log capped at 50, but drift_total = 75
-    con = sqlite3.connect(env["db_path"])
-    rows = con.execute("SELECT operation FROM maintenance_log").fetchall()
-    con.close()
-    payload = json.loads(rows[0][0])
-    assert payload["drift_summary"]["drift_total"] == 75
-    assert payload["drift_summary"]["drift_ids_in_payload"] == 50
-    assert payload["drift_summary"]["drift_ids_capped_at"] == ih.MAINTENANCE_LOG_DRIFT_ID_CAP
-    assert len(payload["drift_ids"]) == 50
-
-
-def test_verified_upsert_multiple_batches_same_run_id_appends(env, monkeypatch):
-    """Two batches in one run that both drift → single pending file with two entries."""
-    coll = FakeCollection(drop_hnsw_for=["a_chunk_0", "b_chunk_0"])
-    monkeypatch.setattr(ih.time, "sleep", lambda d: None)
-
-    p1 = _payload(["a_chunk_0", "a_chunk_1"])
-    ih.verified_upsert(
-        coll, p1["ids"], p1["embeddings"], p1["documents"], p1["metadatas"],
-        run_id="test_run_005", source="docs",
-    )
-    p2 = _payload(["b_chunk_0", "b_chunk_1"])
-    ih.verified_upsert(
-        coll, p2["ids"], p2["embeddings"], p2["documents"], p2["metadatas"],
-        run_id="test_run_005", source="docs",
-    )
-
-    pending_path = Path(env["pending_dir"]) / "pending_test_run_005.json"
-    data = json.loads(pending_path.read_text())
-    assert len(data["entries"]) == 2
-    assert data["entries"][0]["ids"] == ["a_chunk_0"]
-    assert data["entries"][1]["ids"] == ["b_chunk_0"]
-
-
-# ============================================================
-# never-raise contract
-# ============================================================
-
-
-def test_verified_upsert_never_raises_on_log_write_failure(env, monkeypatch, capsys):
-    """If maintenance_log write fails, verified_upsert returns False with stderr
-    warning — never raises. Pending JSON is still written."""
-    # Break the DB by pointing at a non-existent path
-    monkeypatch.setattr(ih, "DB_PATH", "/nonexistent/path/should_not_be_writable.sqlite3")
-    monkeypatch.setattr(ih.time, "sleep", lambda d: None)
-
-    coll = FakeCollection(drop_hnsw_for=["x_chunk_0"])
-    p = _payload(["x_chunk_0", "x_chunk_1"])
-    ok = ih.verified_upsert(
-        coll, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
-        run_id="test_run_006", source="docs",
-    )
-    assert ok is False
-
-    # Pending JSON is still written
-    pending_path = Path(env["pending_dir"]) / "pending_test_run_006.json"
-    assert pending_path.exists()
-
-    captured = capsys.readouterr()
-    assert "maintenance_log write failed" in captured.err
-    assert "test_run_006" in captured.err
-
-
-def test_verified_upsert_empty_ids_short_circuits(env):
+def test_verified_upsert_empty_ids_short_circuits():
+    """Empty batch: upsert is called (mirrors real chromadb contract) but
+    the sentinel get() is skipped because there is no first id to sample."""
     coll = FakeCollection()
     ok = ih.verified_upsert(
         coll, [], [], [], [], run_id="test_run_007", source="test",
     )
     assert ok is True
-    # Upsert is still called (empty batch is upsert-callee's call), but query is skipped
-    assert coll.query_calls == 0
-
-
-# ============================================================
-# defensive: malformed query result
-# ============================================================
-
-
-def test_verifier_handles_malformed_result_shape(env, monkeypatch):
-    """If chromadb returns fewer result lists than queries, missing positions
-    are treated as drift."""
-    class WeirdCollection(FakeCollection):
-        def query(self, *, query_embeddings, n_results=1, include=None):
-            self.query_calls += 1
-            # Return only one result for two queries — malformed
-            return {"ids": [["a_chunk_0"]]}
-
-    coll = WeirdCollection()
-    p = _payload(["a_chunk_0", "a_chunk_1"])
-    monkeypatch.setattr(ih.time, "sleep", lambda d: None)
-
-    ok = ih.verified_upsert(
-        coll, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
-        run_id="test_run_008", source="test",
-    )
-    # a_chunk_1 has no result row -> treated as drift
-    assert ok is False
-    pending_path = Path(env["pending_dir"]) / "pending_test_run_008.json"
-    data = json.loads(pending_path.read_text())
-    assert "a_chunk_1" in data["entries"][0]["ids"]
-
-
-# ============================================================
-# v1.2.3.1: queue-membership check suppresses transient drift
-# ============================================================
-
-
-def test_verified_upsert_suppresses_transient_queue_lag(env, monkeypatch, capsys):
-    """All drift ids found in embeddings_queue → suppress, return True,
-    no pending JSON, no maintenance_log row."""
-    coll = FakeCollection(drop_hnsw_for=["a_chunk_0", "a_chunk_1", "a_chunk_2"])
-    p = _payload(["a_chunk_0", "a_chunk_1", "a_chunk_2"])
-    monkeypatch.setattr(ih.time, "sleep", lambda d: None)
-    # Simulate: every drifted id is sitting in embeddings_queue
-    monkeypatch.setattr(
-        ih, "_check_queue_membership",
-        lambda db_path, ids: set(ids),
-    )
-
-    ok = ih.verified_upsert(
-        coll, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
-        run_id="test_queue_001", source="email",
-    )
-    assert ok is True
-
-    pending_path = Path(env["pending_dir"]) / "pending_test_queue_001.json"
-    assert not pending_path.exists()
-    con = sqlite3.connect(env["db_path"])
-    rows = con.execute("SELECT * FROM maintenance_log").fetchall()
-    con.close()
-    assert rows == []
-
-    captured = capsys.readouterr()
-    assert "transient drift suppressed" in captured.err
-    assert "3 chunk(s)" in captured.err
-    assert "test_queue_001" in captured.err
-
-
-def test_verified_upsert_partial_queue_lag_records_only_real_drift(env, monkeypatch):
-    """Half the drift ids in queue, half not → pending JSON contains only
-    the not-in-queue ids; maintenance_log payload tracks both counts."""
-    coll = FakeCollection(drop_hnsw_for=["a_chunk_0", "a_chunk_1", "a_chunk_2", "a_chunk_3"])
-    p = _payload(["a_chunk_0", "a_chunk_1", "a_chunk_2", "a_chunk_3"])
-    monkeypatch.setattr(ih.time, "sleep", lambda d: None)
-    # Half are in queue (transient), half are real drift
-    monkeypatch.setattr(
-        ih, "_check_queue_membership",
-        lambda db_path, ids: {"a_chunk_0", "a_chunk_2"},
-    )
-
-    ok = ih.verified_upsert(
-        coll, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
-        run_id="test_queue_002", source="email",
-    )
-    assert ok is False
-
-    pending_path = Path(env["pending_dir"]) / "pending_test_queue_002.json"
-    assert pending_path.exists()
-    data = json.loads(pending_path.read_text())
-    assert len(data["entries"]) == 1
-    assert sorted(data["entries"][0]["ids"]) == ["a_chunk_1", "a_chunk_3"]
-
-    con = sqlite3.connect(env["db_path"])
-    rows = con.execute("SELECT operation FROM maintenance_log").fetchall()
-    con.close()
-    assert len(rows) == 1
-    payload = json.loads(rows[0][0])
-    assert payload["drift_summary"]["drift_total"] == 2
-    assert payload["drift_summary"]["transient_count"] == 2
-    assert sorted(payload["drift_ids"]) == ["a_chunk_1", "a_chunk_3"]
-
-
-def test_verified_upsert_queue_check_failure_degrades_gracefully(env, monkeypatch, capsys):
-    """If _check_queue_membership raises (defensive: helper already
-    swallows sqlite errors, but we must never re-raise), behavior matches
-    pre-v1.2.3.1: all drift recorded as permanent, transient_count=0."""
-    coll = FakeCollection(drop_hnsw_for=["a_chunk_0", "a_chunk_1"])
-    p = _payload(["a_chunk_0", "a_chunk_1"])
-    monkeypatch.setattr(ih.time, "sleep", lambda d: None)
-
-    def raising_check(db_path, ids):
-        raise RuntimeError("simulated failure past helper try/except")
-    monkeypatch.setattr(ih, "_check_queue_membership", raising_check)
-
-    ok = ih.verified_upsert(
-        coll, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
-        run_id="test_queue_003", source="email",
-    )
-    assert ok is False
-
-    pending_path = Path(env["pending_dir"]) / "pending_test_queue_003.json"
-    data = json.loads(pending_path.read_text())
-    assert sorted(data["entries"][0]["ids"]) == ["a_chunk_0", "a_chunk_1"]
-
-    con = sqlite3.connect(env["db_path"])
-    rows = con.execute("SELECT operation FROM maintenance_log").fetchall()
-    con.close()
-    payload = json.loads(rows[0][0])
-    assert payload["drift_summary"]["drift_total"] == 2
-    assert payload["drift_summary"]["transient_count"] == 0
-    assert sorted(payload["drift_ids"]) == ["a_chunk_0", "a_chunk_1"]
-
-    captured = capsys.readouterr()
-    assert "queue-membership check failed" in captured.err
-    assert "test_queue_003" in captured.err
+    assert coll.get_calls == []
