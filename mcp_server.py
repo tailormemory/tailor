@@ -181,6 +181,7 @@ def _get_chat_app():
 
 # ── Multi-token auth ───────────────────────────────────────────
 from scripts.lib.token_auth import TokenAuth
+from scripts.lib.ingest_helpers import verified_upsert, make_run_id
 _tokens_cfg = []
 try:
     _tokens_cfg = _rl_get("auth", "tokens") or []
@@ -1062,12 +1063,22 @@ class BearerAuthMiddleware:
                         "type": "conversation",
                         "document_date": timestamp[:10] if timestamp else "",
                     }
-                    collection.upsert(
-                        ids=[chunk_id],
-                        embeddings=[embedding],
-                        documents=[text[:10000]],
-                        metadatas=[metadata],
+                    # Batch-1: verified_upsert verifies only id_list[0]; if this
+                    # becomes batch-N, per-id coverage must be revisited.
+                    ok = verified_upsert(
+                        collection,
+                        ids=[chunk_id], embeddings=[embedding],
+                        documents=[text[:10000]], metadatas=[metadata],
+                        run_id=make_run_id("ingest_live"), source="ingest_live",
+                        retry=2, retry_backoff=0.3,
                     )
+                    if not ok:
+                        return _json_response(
+                            {"error": "KB write verification failed after 3 "
+                                      "attempts (chromadb silent-drop)",
+                             "persisted": False},
+                            500,
+                        )
                     return _json_response({"ok": True, "chunks": 1, "updated": is_update})
                 except Exception as e:
                     import traceback as _tb_live
@@ -2594,7 +2605,19 @@ def kb_add(content: str, title: str, category: str = "general", source: str = "c
         meta["entity_types"] = json.dumps(types, ensure_ascii=False)
         meta["entities_extracted"] = 1
         meta["entities_count"] = len(entities)
-        collection.add(ids=[chunk_id], embeddings=[embedding], documents=[content[:4000]], metadatas=[meta])
+        # Batch-1: verified_upsert verifies only id_list[0]; if this
+        # becomes batch-N, per-id coverage must be revisited.
+        ok = verified_upsert(
+            collection,
+            ids=[chunk_id], embeddings=[embedding],
+            documents=[content[:4000]], metadatas=[meta],
+            run_id=make_run_id("kb_add"), source="kb_add",
+            retry=2, retry_backoff=(0.5, 1.0),
+        )
+        if not ok:
+            return ("Error saving: KB write verification failed after 3 "
+                    "attempts (chromadb silent-drop). Content NOT "
+                    "persisted \u2014 retry or check logs.")
         if entities:
             _update_entity_index(chunk_id, entities, types)
         entity_info = f", {len(entities)} entit\u00e0" if entities else ""
@@ -2655,7 +2678,24 @@ def kb_update_session(summary: str, key_facts: str, decisions: str = "", action_
         meta["entity_types"] = json.dumps(types, ensure_ascii=False)
         meta["entities_extracted"] = 1
         meta["entities_count"] = len(entities)
-        collection.add(ids=[chunk_id], embeddings=[embedding], documents=[full_doc[:4000]], metadatas=[meta])
+        # Batch-1: verified_upsert verifies only id_list[0]; if this
+        # becomes batch-N, per-id coverage must be revisited.
+        # Known follow-up (out of A1 scope): chunk_id is second-
+        # resolution without a content hash, so two summaries in the
+        # same second collide and the 2nd silently overwrites the 1st
+        # (was: add() raised). Root cause is the id granularity, not
+        # upsert(). Finer-grained chunk_id would fix it.
+        ok = verified_upsert(
+            collection,
+            ids=[chunk_id], embeddings=[embedding],
+            documents=[full_doc[:4000]], metadatas=[meta],
+            run_id=make_run_id("kb_update_session"), source="kb_update_session",
+            retry=2, retry_backoff=(0.5, 1.0),
+        )
+        if not ok:
+            return ("Error saving session: KB write verification failed "
+                    "after 3 attempts (chromadb silent-drop). "
+                    "Session NOT persisted.")
         if entities:
             _update_entity_index(chunk_id, entities, types)
         entity_info = f", {len(entities)} entit\u00e0" if entities else ""
