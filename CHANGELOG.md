@@ -18,6 +18,10 @@ Template for upcoming changes. Move entries under a new version heading on relea
 ### Docs
 -->
 
+### Docs
+
+- **Errata to the 2026-05-13 chromadb post-mortem** — v1.2.6.3's `verified_upsert()` was wired into the 4 batch ingest scripts but not the 3 mcp_server-side write paths (`kb_add`, `kb_update_session`, `/api/ingest-live`); three real ghosts surfaced 2026-05-16 confirming the gap. Closed same day across 5 commits ([`bf3335d`](https://github.com/tailormemory/tailor/commit/bf3335d) test cleanup, [`633e089`](https://github.com/tailormemory/tailor/commit/633e089) retry kwarg, [`599acc2`](https://github.com/tailormemory/tailor/commit/599acc2) mock extract, [`7954e49`](https://github.com/tailormemory/tailor/commit/7954e49) callsite wraps, [`f4f9e8c`](https://github.com/tailormemory/tailor/commit/f4f9e8c) repair classifier). Committed to `main`; not yet deployed (awaits `launchctl kickstart` of the MCP daemon, operator decision). Errata appended as §11 of the post-mortem.
+
 ---
 
 ## [1.2.9] — 2026-05-14 — Scheduler resilience & nightly hardening
