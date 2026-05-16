@@ -35,6 +35,19 @@ import ingest_helpers as ih  # noqa: E402
 # ============================================================
 
 
+def _is_exception_value(v) -> bool:
+    """True if v is an Exception instance or an Exception subclass.
+
+    Shared validator for FakeCollection.program_get / program_upsert: both
+    methods accept the same exception forms (instance or class) and route
+    them through the same raise path. Anything matching this is suitable
+    as a `raise` target — Python's `raise` syntax accepts both forms.
+    """
+    return isinstance(v, BaseException) or (
+        isinstance(v, type) and issubclass(v, BaseException)
+    )
+
+
 class FakeCollection:
     """Fake chromadb.Collection for verified_upsert tests.
 
@@ -43,12 +56,25 @@ class FakeCollection:
         get(ids=[i]) returns {"ids": [i]} iff i is in self.sql,
         else {"ids": []}.
 
-    Silent-drop simulation: use .program_get(*responses) to enqueue a
-    FIFO sequence of overrides for upcoming get() calls. Each response
-    is either a dict with key "ids" (returned verbatim) or the class
-    sentinel FakeCollection.DEFAULT (fall through to truthful SQL
-    behaviour for that single call). Once the queue is exhausted, all
-    further calls use truthful behaviour.
+    Silent-drop / failure simulation via .program_get(*responses) and
+    .program_upsert(*outcomes). Both enqueue FIFO entries consumed
+    one-per-call by the corresponding method; once a queue is exhausted,
+    the method reverts to the truthful default.
+
+    Queue entry types:
+        FakeCollection.DEFAULT
+            sentinel — use truthful behaviour for this single call
+            (upsert writes to self.sql; get reads from self.sql).
+        Exception INSTANCE or SUBCLASS (e.g. RuntimeError or RuntimeError("boom"))
+            the method `raise`s it. Used to simulate chromadb-side
+            failures (e.g. SIGSEGV-recovered exception, frozen-collection
+            raise variants). Validated by _is_exception_value.
+        dict with key "ids" (program_get only)
+            returned verbatim from get(). Used to simulate silent-drop
+            (`{"ids": []}` = sample missing).
+
+    program_upsert does NOT accept dict outcomes — upsert has no
+    user-facing return value, only side-effects.
 
     Common patterns (used by this file and by A1 retry/backoff tests):
         coll.program_get({"ids": []})
@@ -57,27 +83,33 @@ class FakeCollection:
             -> drop on call 1, truthful on call 2 (retry recovery).
         coll.program_get({"ids": []}, {"ids": []}, {"ids": []})
             -> drop on first 3 calls (retry=2 exhausted, 3 attempts).
+        coll.program_upsert(RuntimeError("boom"), FakeCollection.DEFAULT)
+            -> first upsert raises, second succeeds (retry recovery).
 
     Attributes for assertions:
         sql           dict[id -> embedding]
-        upsert_calls  list[dict] — one entry per upsert() with {"ids": [...]}
-        get_calls     list[list[str]] — one entry per get() with the ids requested
+        upsert_calls  list[dict] — one entry per upsert() with {"ids": [...]},
+                      recorded BEFORE the queue is consumed so raising
+                      attempts are counted too.
+        get_calls     list[list[str]] — one entry per get() with the ids requested,
+                      recorded BEFORE the queue is consumed (same rule).
     """
 
-    DEFAULT = object()  # sentinel: program_get queue entry meaning "use truthful SQL default"
+    DEFAULT = object()  # sentinel: queue entry meaning "use truthful default"
 
     def __init__(self):
         self.sql: dict[str, list[float]] = {}
         self.upsert_calls: list[dict] = []
         self.get_calls: list[list[str]] = []
         self._get_queue: list = []
+        self._upsert_queue: list = []
 
     def program_get(self, *responses) -> None:
         """Enqueue FIFO responses for the next get() calls.
 
-        Each response must be either a dict containing the key "ids" or
-        the sentinel FakeCollection.DEFAULT. Anything else raises
-        TypeError — fail-fast on malformed test setup.
+        Each response must be a dict with key "ids", FakeCollection.DEFAULT,
+        or an Exception instance/subclass. Anything else raises TypeError
+        — fail-fast on malformed test setup.
         """
         for r in responses:
             if r is FakeCollection.DEFAULT:
@@ -86,13 +118,38 @@ class FakeCollection:
             if isinstance(r, dict) and "ids" in r:
                 self._get_queue.append(r)
                 continue
+            if _is_exception_value(r):
+                self._get_queue.append(r)
+                continue
             raise TypeError(
-                f"program_get: each response must be a dict with key 'ids' "
-                f"or FakeCollection.DEFAULT; got {type(r).__name__}: {r!r}"
+                f"program_get: each response must be a dict with key 'ids', "
+                f"FakeCollection.DEFAULT, or an Exception instance/subclass; "
+                f"got {type(r).__name__}: {r!r}"
+            )
+
+    def program_upsert(self, *outcomes) -> None:
+        """Enqueue FIFO outcomes for the next upsert() calls.
+
+        Each outcome must be FakeCollection.DEFAULT (truthful write) or
+        an Exception instance/subclass (raised from upsert()). Anything
+        else raises TypeError — fail-fast on malformed test setup.
+        """
+        for o in outcomes:
+            if o is FakeCollection.DEFAULT or _is_exception_value(o):
+                self._upsert_queue.append(o)
+                continue
+            raise TypeError(
+                f"program_upsert: each outcome must be FakeCollection.DEFAULT "
+                f"or an Exception instance/subclass; "
+                f"got {type(o).__name__}: {o!r}"
             )
 
     def upsert(self, *, ids, embeddings, documents, metadatas):
         self.upsert_calls.append({"ids": list(ids)})
+        if self._upsert_queue:
+            outcome = self._upsert_queue.pop(0)
+            if outcome is not FakeCollection.DEFAULT:
+                raise outcome
         for i, eid in enumerate(ids):
             self.sql[eid] = list(embeddings[i])
 
@@ -101,7 +158,11 @@ class FakeCollection:
         self.get_calls.append(ids_list)
         if self._get_queue:
             resp = self._get_queue.pop(0)
-            if resp is not FakeCollection.DEFAULT:
+            if resp is FakeCollection.DEFAULT:
+                pass  # fall through to truthful default
+            elif _is_exception_value(resp):
+                raise resp
+            else:
                 return resp
         present = [i for i in ids_list if i in self.sql]
         return {"ids": present}
@@ -228,3 +289,190 @@ def test_verified_upsert_empty_ids_short_circuits():
     )
     assert ok is True
     assert coll.get_calls == []
+
+
+# ============================================================
+# A1 — retry opt-in (retry kwarg, backoff, never-raise extension)
+# ============================================================
+
+
+def test_retry_zero_is_single_shot_legacy():
+    """Regression guard for the 4 batch callsites: retry not passed →
+    1 upsert, 1 get, single-shot (identical to pre-A1 batch behaviour)."""
+    coll = FakeCollection()
+    p = _payload(["a_chunk_0"])
+    ok = ih.verified_upsert(
+        coll, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
+        run_id="t_retry_zero_legacy", source="test",
+    )
+    assert ok is True
+    assert len(coll.upsert_calls) == 1
+    assert len(coll.get_calls) == 1
+    assert coll.get_calls[0] == ["a_chunk_0"]
+
+
+def test_retry_zero_get_raises_swallowed():
+    """retry=0 with collection.get() raising → return False, no propagation
+    (contract preserved for the 4 batch callsites)."""
+    coll = FakeCollection()
+    coll.program_get(RuntimeError("simulated get failure"))
+    p = _payload(["a_chunk_0"])
+    ok = ih.verified_upsert(
+        coll, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
+        run_id="t_retry_zero_get_raise", source="test",
+    )
+    assert ok is False
+    assert len(coll.upsert_calls) == 1  # upsert succeeded
+    assert len(coll.get_calls) == 1     # get attempted before raising
+
+
+def test_retry_zero_upsert_raises_propagates():
+    """retry=0 with collection.upsert() raising → exception PROPAGATES.
+    The 4 batch callsites depend on this: their outer try/except catches
+    chromadb exceptions and increments their `errors` counter."""
+    coll = FakeCollection()
+    coll.program_upsert(RuntimeError("simulated upsert failure"))
+    p = _payload(["a_chunk_0"])
+    with pytest.raises(RuntimeError, match="simulated upsert failure"):
+        ih.verified_upsert(
+            coll, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
+            run_id="t_retry_zero_upsert_raise", source="test",
+        )
+    assert len(coll.upsert_calls) == 1
+    assert coll.get_calls == []  # never reached get
+
+
+def test_retry_recovers_on_second_attempt(monkeypatch):
+    """retry=2: first sample-get sees silent-drop, second attempt is
+    truthful → True. Both upsert and get are re-run for the recovery."""
+    coll = FakeCollection()
+    coll.program_get({"ids": []}, FakeCollection.DEFAULT)
+    monkeypatch.setattr(ih.time, "sleep", lambda d: None)
+    p = _payload(["a_chunk_0"])
+    ok = ih.verified_upsert(
+        coll, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
+        run_id="t_retry_recover", source="test",
+        retry=2,
+    )
+    assert ok is True
+    assert len(coll.upsert_calls) == 2  # full re-run, not get-only retry
+    assert len(coll.get_calls) == 2
+
+
+def test_retry_exhausted_returns_false(monkeypatch):
+    """retry=2, all 3 attempts see silent-drop → False, 3 full attempts,
+    no exception leaks (retry>0 contract: never raises)."""
+    coll = FakeCollection()
+    coll.program_get({"ids": []}, {"ids": []}, {"ids": []})
+    monkeypatch.setattr(ih.time, "sleep", lambda d: None)
+    p = _payload(["a_chunk_0"])
+    ok = ih.verified_upsert(
+        coll, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
+        run_id="t_retry_exhausted", source="test",
+        retry=2,
+    )
+    assert ok is False
+    assert len(coll.upsert_calls) == 3
+    assert len(coll.get_calls) == 3
+
+
+def test_retry_upsert_raise_recovered(monkeypatch):
+    """retry=2, upsert raises on attempt 1, succeeds on attempt 2 → True.
+    Verifies the retry loop catches upsert exceptions (differs from retry=0
+    where they propagate)."""
+    coll = FakeCollection()
+    coll.program_upsert(
+        RuntimeError("attempt-1 upsert boom"),
+        FakeCollection.DEFAULT,
+    )
+    monkeypatch.setattr(ih.time, "sleep", lambda d: None)
+    p = _payload(["a_chunk_0"])
+    ok = ih.verified_upsert(
+        coll, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
+        run_id="t_retry_upsert_recover", source="test",
+        retry=2,
+    )
+    assert ok is True
+    assert len(coll.upsert_calls) == 2  # both attempts recorded (raise + success)
+    assert len(coll.get_calls) == 1     # only attempt 2 reached the sentinel
+
+
+def test_retry_upsert_raise_exhausted(monkeypatch):
+    """retry=2, upsert raises on all 3 attempts → False, NO RAISE
+    (key behavioural divergence from retry=0 which propagates)."""
+    coll = FakeCollection()
+    coll.program_upsert(
+        RuntimeError("a1"), RuntimeError("a2"), RuntimeError("a3"),
+    )
+    monkeypatch.setattr(ih.time, "sleep", lambda d: None)
+    p = _payload(["a_chunk_0"])
+    ok = ih.verified_upsert(
+        coll, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
+        run_id="t_retry_upsert_exhausted", source="test",
+        retry=2,
+    )
+    assert ok is False
+    assert len(coll.upsert_calls) == 3
+    assert coll.get_calls == []  # no upsert ever succeeded, never reached get
+
+
+def test_backoff_float(monkeypatch):
+    """retry_backoff as float → uniform sleep between every attempt pair."""
+    sleeps: list[float] = []
+    monkeypatch.setattr(ih.time, "sleep", lambda d: sleeps.append(d))
+    coll = FakeCollection()
+    coll.program_get({"ids": []}, {"ids": []}, {"ids": []})
+    p = _payload(["a_chunk_0"])
+    ih.verified_upsert(
+        coll, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
+        run_id="t_backoff_float", source="test",
+        retry=2, retry_backoff=0.3,
+    )
+    assert sleeps == [0.3, 0.3]
+
+
+def test_backoff_tuple(monkeypatch):
+    """retry_backoff as tuple → per-position sleeps."""
+    sleeps: list[float] = []
+    monkeypatch.setattr(ih.time, "sleep", lambda d: sleeps.append(d))
+    coll = FakeCollection()
+    coll.program_get({"ids": []}, {"ids": []}, {"ids": []})
+    p = _payload(["a_chunk_0"])
+    ih.verified_upsert(
+        coll, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
+        run_id="t_backoff_tuple", source="test",
+        retry=2, retry_backoff=(0.5, 1.0),
+    )
+    assert sleeps == [0.5, 1.0]
+
+
+def test_backoff_tuple_clamp(monkeypatch):
+    """retry_backoff tuple shorter than the number of retries → clamp to
+    the last value for further positions."""
+    sleeps: list[float] = []
+    monkeypatch.setattr(ih.time, "sleep", lambda d: sleeps.append(d))
+    coll = FakeCollection()
+    coll.program_get({"ids": []}, {"ids": []}, {"ids": []}, {"ids": []})
+    p = _payload(["a_chunk_0"])
+    ih.verified_upsert(
+        coll, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
+        run_id="t_backoff_clamp", source="test",
+        retry=3, retry_backoff=(0.5, 1.0),
+    )
+    assert sleeps == [0.5, 1.0, 1.0]
+
+
+def test_no_sleep_after_last_attempt(monkeypatch):
+    """Sleep happens BETWEEN attempts, not after the final one. retry=1 →
+    2 attempts total → at most 1 sleep."""
+    sleeps: list[float] = []
+    monkeypatch.setattr(ih.time, "sleep", lambda d: sleeps.append(d))
+    coll = FakeCollection()
+    coll.program_get({"ids": []}, {"ids": []})
+    p = _payload(["a_chunk_0"])
+    ih.verified_upsert(
+        coll, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
+        run_id="t_no_sleep_last", source="test",
+        retry=1, retry_backoff=5.0,
+    )
+    assert sleeps == [5.0]

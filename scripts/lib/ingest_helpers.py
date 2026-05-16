@@ -194,6 +194,25 @@ def _record_maintenance_log(
         return False
 
 
+def _resolve_backoff(
+    backoff: float | tuple[float, ...],
+    attempt_idx: int,
+) -> float:
+    """Resolve sleep duration before the (attempt_idx+1)-th retry attempt.
+
+    `backoff` may be a float (constant delay between every attempt pair)
+    or a tuple of per-position delays. With a tuple, `backoff[i]` is the
+    sleep between attempt `i+1` and attempt `i+2`; if `attempt_idx`
+    exceeds `len(backoff)-1`, the last value is reused (clamp). Empty
+    tuple yields 0.0.
+    """
+    if isinstance(backoff, tuple):
+        if not backoff:
+            return 0.0
+        return float(backoff[min(attempt_idx, len(backoff) - 1)])
+    return float(backoff)
+
+
 def verified_upsert(
     collection: Any,
     ids: Sequence[str],
@@ -206,20 +225,123 @@ def verified_upsert(
     db_path: str | None = None,
     pending_dir: str | None = None,
     retry_delay: float = VERIFIER_RETRY_DELAY,
+    retry: int = 0,
+    retry_backoff: float | tuple[float, ...] = 0.0,
 ) -> bool:
-    """Upsert into ChromaDB and verify all ids are reachable via HNSW.
+    """Upsert into ChromaDB and verify the first batch id is reachable
+    via a post-upsert sample-get sentinel (chromadb 1.5.8 frozen-collection
+    silent-drop detection — see v1.2.6.3 commit).
 
-    Returns True on clean upsert (verifier passed, possibly after a single
-    retry that handled vector-consumer lag, or after the v1.2.3.1
-    queue-membership check classified all drift as transient). Returns
-    False on persistent drift, after recording the suspect ids for the
-    next audit run. Does not raise: the caller's existing error-handling
-    path (increment counter, continue loop) stays intact.
+    Two modes:
+
+    retry=0 (default — used by all 4 batch callsites)
+        Single-shot, bit-identical to the v1.2.6.3 behaviour:
+          - `collection.upsert()` exceptions PROPAGATE to the caller (the
+            batch loops in ingest_docs / ingest_conversations / ingest_upload
+            / ingest_gmail rely on this to increment their `errors` counter
+            via their own try/except).
+          - `collection.get()` exceptions are swallowed; the function
+            returns False with a stderr log.
+          - Empty sample-get result → return False.
+          - No retry, no backoff.
+
+    retry=N>0 (A1, opt-in — used by the 3 interactive mcp_server callsites)
+        Up to `1 + N` attempts. Each attempt re-runs BOTH `collection.upsert()`
+        AND the sample-get (the chromadb 1.5.8 frozen-collection state is
+        not cured by re-reading; only a fresh upsert may break out of it).
+        Exceptions from upsert OR get are caught and logged as a failed
+        attempt — with retry>0, verified_upsert NEVER raises (differs
+        from retry=0). Returns True on the first successful attempt;
+        if attempt > 0, logs "recovered on attempt N". Returns False
+        if all attempts exhaust, with a FINAL_FAILURE stderr line that
+        includes `last_error`.
+
+        Between attempts, sleeps for `_resolve_backoff(retry_backoff, i)`
+        seconds; NO sleep follows the last attempt.
+
+    Rationale for retry (NOT a cure for frozen-collection):
+        The chromadb 1.5.8 frozen-collection state is non-transient — once
+        a collection is in that state, every attempt fails. Retry serves
+        two distinct purposes:
+          (1) anti-false-positive filter: N consecutive sample-get misses
+              confirm a real silent-drop rather than a transient blip;
+          (2) recovery for the non-frozen transient case (embeddings_queue
+              lag, momentary vector-consumer stall).
+        On a true frozen collection, all attempts fail and the function
+        returns False — by design, not a bug. The caller surfaces this
+        to the user as an explicit error (see mcp_server.py callsites).
+
+    Known limitation (parity with the 4 batch callsites — not a regression):
+        the sample-get reads from the same Collection object that just
+        wrote. If chromadb serves the read from an in-memory cache before
+        the on-disk persist, a true persist failure can be masked. Out
+        of scope for A1; the canonical drift detector remains
+        `repair_hnsw_index.py` (nightly).
+
+    Args:
+        retry: number of EXTRA attempts after the initial one (0 = single-shot).
+        retry_backoff: sleep between consecutive attempts. A float applies
+            uniformly; a tuple `(s0, s1, ...)` specifies per-position delays
+            with clamp to the last value when there are more retries than
+            tuple entries.
 
     `run_id` is the caller-supplied identifier shared across all batches in
     one ingest run; use `make_run_id(source)` at the top of the script.
     """
     id_list = list(ids)
+
+    if retry > 0:
+        # ===== retry>0 path (A1 opt-in): loop with full upsert+sample-get =====
+        last_error: str | None = None
+        total_attempts = retry + 1
+        for attempt in range(total_attempts):
+            attempt_label = f"attempt {attempt + 1}/{total_attempts}"
+            try:
+                collection.upsert(
+                    ids=id_list,
+                    embeddings=list(embeddings),
+                    documents=list(documents),
+                    metadatas=list(metadatas),
+                )
+                if not id_list:
+                    return True
+                sample_id = id_list[0]
+                result = collection.get(ids=[sample_id])
+                if result.get("ids") and sample_id in result["ids"]:
+                    if attempt > 0:
+                        print(
+                            f"[ingest_helpers] verified_upsert recovered on "
+                            f"{attempt_label} (run_id={run_id}, source={source}).",
+                            file=sys.stderr,
+                        )
+                    return True
+                last_error = f"silent_drop sample_id={sample_id!r}"
+                print(
+                    f"[ingest_helpers] SILENT DROP observed on {attempt_label}: "
+                    f"upsert returned OK but get(ids=[{sample_id!r}]) is empty "
+                    f"(run_id={run_id}, source={source}, batch_size={len(id_list)}).",
+                    file=sys.stderr,
+                )
+            except Exception as e:
+                last_error = f"{type(e).__name__}: {e}"
+                print(
+                    f"[ingest_helpers] {attempt_label} raised "
+                    f"{type(e).__name__}: {e} (run_id={run_id}, source={source}).",
+                    file=sys.stderr,
+                )
+            if attempt < retry:
+                sleep_for = _resolve_backoff(retry_backoff, attempt)
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+        print(
+            f"[ingest_helpers] verified_upsert FAILED after {total_attempts} "
+            f"attempts (run_id={run_id}, source={source}, "
+            f"last_error={last_error}).",
+            file=sys.stderr,
+        )
+        return False
+
+    # ===== retry=0 path: v1.2.6.3 single-shot, body preserved verbatim =====
     collection.upsert(
         ids=id_list,
         embeddings=list(embeddings),
