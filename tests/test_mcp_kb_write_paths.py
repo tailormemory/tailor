@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import os
+import re
 import sys
 
 import pytest
@@ -214,8 +215,10 @@ def test_ingest_live_callsite_wraps_verified_upsert():
     with open(os.path.join(ROOT, "mcp_server.py"), encoding="utf-8") as f:
         src = f.read()
     # Locate the /api/ingest-live branch.
-    anchor = src.find('path == "/api/ingest-live"')
-    assert anchor != -1, "ingest-live handler not found in mcp_server.py"
+    # Tolerant to quoting/spacing reformat of mcp_server.py.
+    anchor_match = re.search(r'path\s*==\s*[\'"]/api/ingest-live[\'"]', src)
+    assert anchor_match is not None, "ingest-live handler not found in mcp_server.py"
+    anchor = anchor_match.start()
     block = src[anchor:]
     # Cut at the next elif route (heuristic but stable for this branch).
     next_elif = block.find("elif path ==")
@@ -224,11 +227,15 @@ def test_ingest_live_callsite_wraps_verified_upsert():
 
     # Wrap shape
     assert "verified_upsert(" in block
-    assert 'source="ingest_live"' in block
-    assert "retry=2" in block
-    assert "retry_backoff=0.3" in block
+    assert re.search(r'source\s*=\s*[\'"]ingest_live[\'"]', block), \
+        'verified_upsert call missing source="ingest_live"'
+    assert re.search(r'retry\s*=\s*2\b', block), \
+        "verified_upsert call missing retry=2"
+    assert re.search(r'retry_backoff\s*=\s*0\.3\b', block), \
+        "verified_upsert call missing retry_backoff=0.3"
 
     # Failure response shape (contract with the browser extension)
-    assert '"persisted": False' in block
+    assert re.search(r'[\'"]persisted[\'"]\s*:\s*False\b', block), \
+        'failure response missing "persisted": False'
     assert "silent-drop" in block
     assert "verification failed" in block
