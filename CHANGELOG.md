@@ -18,9 +18,46 @@ Template for upcoming changes. Move entries under a new version heading on relea
 ### Docs
 -->
 
+<!-- Errata entry moved to [1.2.10] on release 2026-05-17 -->
+
+---
+
+## [1.2.10] — 2026-05-17 — Silent-drop closure on conversational write paths
+
+### Fixed
+
+- **Silent-drop closure on the three conversational write paths.** The
+  `verified_upsert()` guard introduced in v1.2.6.3 to detect chromadb 1.5.8's
+  silent-drop (an `upsert()` that returns success but does not persist) was
+  wired into the four batch ingest scripts but not the three mcp_server-side
+  write paths. `kb_add`, `kb_update_session` and `/api/ingest-live` now route
+  through `verified_upsert` with bounded retry; on persistent verification
+  failure the caller receives an explicit error instead of a silent loss.
+  `_update_entity_index` was moved inside the success branch so a failed
+  persist can no longer leave a dangling entity-index entry. Three real ghost
+  vectors observed in production on 2026-05-16 confirmed the prior gap; deployed
+  and verified across both daemons (MCP + Telegram, in-process import) the same
+  day. Commits: [`bf3335d`](https://github.com/tailormemory/tailor/commit/bf3335d)
+  test baseline, [`633e089`](https://github.com/tailormemory/tailor/commit/633e089)
+  retry kwarg, [`599acc2`](https://github.com/tailormemory/tailor/commit/599acc2)
+  shared mock, [`7954e49`](https://github.com/tailormemory/tailor/commit/7954e49)
+  callsite wraps, [`f4f9e8c`](https://github.com/tailormemory/tailor/commit/f4f9e8c)
+  repair classifier.
+- **`repair_hnsw_index.py --apply` re-armed.** A table-driven ghost classifier
+  (`_KNOWN_GHOST_PATTERNS`) recognises the `kb_add` / `kb_update_session` /
+  live-capture ghost id shapes so `--apply` is no longer blocked by
+  `unknown_count > 0`. The existing `doc_` / `_chunk_` path is preserved
+  bit-identically (purely additive). Verified in production post-deploy:
+  `unknown_count: 0`.
+
 ### Docs
 
-- **Errata to the 2026-05-13 chromadb post-mortem** — v1.2.6.3's `verified_upsert()` was wired into the 4 batch ingest scripts but not the 3 mcp_server-side write paths (`kb_add`, `kb_update_session`, `/api/ingest-live`); three real ghosts surfaced 2026-05-16 confirming the gap. Closed same day across 5 commits ([`bf3335d`](https://github.com/tailormemory/tailor/commit/bf3335d) test cleanup, [`633e089`](https://github.com/tailormemory/tailor/commit/633e089) retry kwarg, [`599acc2`](https://github.com/tailormemory/tailor/commit/599acc2) mock extract, [`7954e49`](https://github.com/tailormemory/tailor/commit/7954e49) callsite wraps, [`f4f9e8c`](https://github.com/tailormemory/tailor/commit/f4f9e8c) repair classifier). Committed to `main`; not yet deployed (awaits `launchctl kickstart` of the MCP daemon, operator decision). Errata appended as §11 of the post-mortem.
+- **Errata to the 2026-05-13 chromadb post-mortem** — appended as §11,
+  documenting that v1.2.6.3's silent-drop fix covered four of seven chromadb
+  write callsites, the evidence (three production ghosts plus a test suite red
+  since v1.2.6.3), and two generalised lessons (verify by callsite enumeration
+  not by sample; a fix shipped with a red suite is an unverified fix).
+  Commit [`e913e00`](https://github.com/tailormemory/tailor/commit/e913e00).
 
 ---
 
