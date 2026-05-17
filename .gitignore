@@ -22,6 +22,9 @@ config/.backups/
 .env.local
 .env.*.local
 
+# ── Internal operational runbooks (NEVER commit) ─────────────
+SECRETS.md
+
 # ── Archive (old scripts, backups, dated READMEs) ────────────
 archive/
 
