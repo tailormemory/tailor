@@ -32,6 +32,7 @@ import json
 import os
 import pickle
 import re
+import shutil
 import sqlite3
 import sys
 import time
@@ -903,6 +904,36 @@ def main(argv: list[str] | None = None) -> int:
     def _progress(done: int, total: int) -> None:
         if not args.json:
             print(f"  re-embedded {done}/{total}", flush=True)
+
+    # Pre-apply pickle backup — internal safety net additive to the external
+    # backup gate (L867-878). Taken only when repair() will do real work
+    # (sql_only_orphans non-empty); on failure, abort BEFORE repair() touches
+    # HNSW. Naming follows docs/conventions.md: <file>.backup.<reason>_<ts>.
+    if report.sql_only_orphans:
+        pre_apply_pickle = _resolve_hnsw_pickle_path(DB_PATH, DB_DIR)
+        if pre_apply_pickle is None:
+            msg = (
+                f"\nFATAL: cannot resolve HNSW pickle path for pre-apply backup "
+                f"(segments lookup or pickle file missing). Refusing to run repair()."
+            )
+            _print(msg, args.json)
+            if args.json:
+                print(json.dumps({"error": "pre_apply_backup_failed", "reason": "pickle_not_found"}))
+            return 6
+        backup_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        pre_apply_dest = f"{pre_apply_pickle}.backup.pre_apply_{backup_ts}"
+        try:
+            shutil.copy2(pre_apply_pickle, pre_apply_dest)
+        except (IOError, OSError) as e:
+            msg = (
+                f"\nFATAL: pre-apply pickle backup failed "
+                f"({type(e).__name__}: {e}). Refusing to run repair()."
+            )
+            _print(msg, args.json)
+            if args.json:
+                print(json.dumps({"error": "pre_apply_backup_failed", "reason": f"{type(e).__name__}: {e}"}))
+            return 6
+        _print(f"\nPre-apply backup: {pre_apply_dest}", args.json)
 
     _print(f"\nRe-embedding {report.sql_only_count} orphan chunks via collection.upsert()...", args.json)
     result = repair(report, embed_fn=get_embeddings, collection=collection, progress=_progress)
