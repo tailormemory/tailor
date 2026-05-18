@@ -362,7 +362,7 @@
         llm: { provider: "anthropic", model: "claude-haiku-4-5-20251001", api_key: "", tool_use: true, max_tokens: 1000, temperature: 0.3 },
         embedding: { provider: "ollama", model: "nomic-embed-text", dimensions: 768 },
         telegram: { bot_token: "", chat_id: "", poll_timeout: 30 },
-        email: { provider: "", address: "", credentials: {} },
+        email: { provider: "", addresses: [""], gmail: { credentials: "", token: "" }, imap: { host: "", port: 993, username: "", password: "" } },
         cloud_sync: [],
         remote_access: { provider: "none" },
         ingest: { conversations: [] },
@@ -405,6 +405,14 @@
           const payload = JSON.parse(JSON.stringify(cfg));
           if (!payload.telegram.bot_token) delete payload.telegram;
           if (!payload.email.provider) delete payload.email;
+          if (payload.email) {
+            if (payload.email.provider === "gmail") delete payload.email.imap;
+            else if (payload.email.provider === "imap") delete payload.email.gmail;
+            delete payload.email.address;
+            delete payload.email.credentials;
+            payload.email.addresses = (payload.email.addresses || [])
+              .map(a => a.trim()).filter(Boolean);
+          }
           // Convert cloud_sync folders_text to folders array
           if (payload.cloud_sync && payload.cloud_sync.length > 0) {
             const cs = payload.cloud_sync[0];
@@ -598,28 +606,62 @@
               React.createElement(WInput, { label: "Chat ID", value: cfg.telegram.chat_id, onChange: v => updateCfg("telegram", { chat_id: v }), mono: true, placeholder: "Your Telegram chat ID", helpText: "Send /start to your bot, then use @userinfobot to find your chat ID.", mode })
             );
           case "email":
+            const wizUpdateAddress = (idx, v) => setCfg(prev => {
+              const addrs = [...(prev.email.addresses || [])];
+              addrs[idx] = v;
+              return { ...prev, email: { ...prev.email, addresses: addrs } };
+            });
+            const wizAddAddress = () => setCfg(prev => ({
+              ...prev, email: { ...prev.email, addresses: [...(prev.email.addresses || []), ""] }
+            }));
+            const wizRemoveAddress = (idx) => setCfg(prev => {
+              const addrs = [...(prev.email.addresses || [])];
+              addrs.splice(idx, 1);
+              return { ...prev, email: { ...prev.email, addresses: addrs.length ? addrs : [""] } };
+            });
+            const _emailAddrs = cfg.email.addresses || [""];
             return React.createElement("div", null,
               React.createElement("div", { className: cl("text-sm mb-4 p-3 rounded-xl", t.infoBox) },
                 "Optional. Sync your emails into the Knowledge Base."
               ),
               React.createElement(WSelect, {
                 label: "Provider", value: cfg.email.provider, mode,
-                onChange: v => updateCfg("email", { provider: v, credentials: {} }),
+                onChange: v => updateCfg("email", { provider: v }),
                 options: [
                   { value: "", label: "Skip email sync" },
                   { value: "imap", label: "IMAP (recommended — works with any provider)" },
                   { value: "gmail", label: "Gmail API (advanced — requires Google Cloud project)" },
                 ],
               }),
+              cfg.email.provider && React.createElement("div", { className: "mt-3" },
+                React.createElement("label", { className: cl("text-sm font-medium block mb-1", t.text) }, "Email Addresses"),
+                React.createElement("div", { className: cl("text-xs mb-2", t.textFaint) }, "Your email addresses — used to detect sent vs received emails. Add one per row."),
+                React.createElement("div", { className: "space-y-1.5" },
+                  _emailAddrs.map((a, idx) =>
+                    React.createElement("div", { key: idx, className: "flex items-center gap-2" },
+                      React.createElement("input", { type: "text", value: a || "", placeholder: "you@example.com",
+                        onChange: e => wizUpdateAddress(idx, e.target.value),
+                        className: cl("flex-1 px-2 py-1.5 rounded-lg border text-sm font-mono", t.input) }),
+                      _emailAddrs.length > 1 && React.createElement("button", {
+                        onClick: () => wizRemoveAddress(idx),
+                        className: "text-xs text-red-400 hover:bg-red-500/10 px-1 rounded"
+                      }, "✕")
+                    )
+                  )
+                ),
+                React.createElement("button", { onClick: wizAddAddress,
+                  className: cl("mt-1.5 text-xs px-2 py-1 rounded-md border border-dashed", t.borderLight, "hover:border-teal-500 hover:text-teal-400", t.textFaint)
+                }, "+ Add address")
+              ),
               cfg.email.provider === "imap" && React.createElement("div", null,
-                React.createElement(WInput, { label: "Email Address", value: cfg.email.address, onChange: v => updateCfg("email", { address: v }), placeholder: "you@gmail.com", helpText: "Your email address — used to detect sent vs received emails.", mode }),
-                React.createElement(WInput, { label: "IMAP Host", value: cfg.email.credentials?.host || "", onChange: v => updateCfg("email", { credentials: { ...cfg.email.credentials, host: v } }), mono: true, placeholder: "imap.gmail.com", helpText: "Gmail: imap.gmail.com | Outlook: outlook.office365.com | iCloud: imap.mail.me.com", mode }),
-                React.createElement(WInput, { label: "IMAP Port", value: cfg.email.credentials?.port || "993", onChange: v => updateCfg("email", { credentials: { ...cfg.email.credentials, port: v } }), mono: true, mode }),
-                React.createElement(WInput, { label: "Username", value: cfg.email.credentials?.username || "", onChange: v => updateCfg("email", { credentials: { ...cfg.email.credentials, username: v } }), mono: true, placeholder: "you@gmail.com", mode }),
-                React.createElement(WInput, { label: "Password / App Password", value: cfg.email.credentials?.password || "", onChange: v => updateCfg("email", { credentials: { ...cfg.email.credentials, password: v } }), type: "password", mono: true, helpText: "Gmail and Outlook require an App Password (not your regular password). Enable 2FA first, then generate one in your account security settings.", mode })
+                React.createElement(WInput, { label: "IMAP Host", value: cfg.email.imap?.host || "", onChange: v => updateCfg("email", { imap: { ...cfg.email.imap, host: v } }), mono: true, placeholder: "imap.gmail.com", helpText: "Gmail: imap.gmail.com | Outlook: outlook.office365.com | iCloud: imap.mail.me.com", mode }),
+                React.createElement(WInput, { label: "IMAP Port", value: cfg.email.imap?.port || 993, onChange: v => updateCfg("email", { imap: { ...cfg.email.imap, port: parseInt(v) || 993 } }), mono: true, mode }),
+                React.createElement(WInput, { label: "Username", value: cfg.email.imap?.username || "", onChange: v => updateCfg("email", { imap: { ...cfg.email.imap, username: v } }), mono: true, placeholder: "you@gmail.com", mode }),
+                React.createElement(WInput, { label: "Password / App Password", value: cfg.email.imap?.password || "", onChange: v => updateCfg("email", { imap: { ...cfg.email.imap, password: v } }), type: "password", mono: true, helpText: "Gmail and Outlook require an App Password (not your regular password). Enable 2FA first, then generate one in your account security settings.", mode })
               ),
               cfg.email.provider === "gmail" && React.createElement("div", null,
-                React.createElement(WInput, { label: "Email Address", value: cfg.email.address, onChange: v => updateCfg("email", { address: v }), placeholder: "you@gmail.com", mode }),
+                React.createElement(WInput, { label: "Credentials JSON path", value: cfg.email.gmail?.credentials || "", onChange: v => updateCfg("email", { gmail: { ...cfg.email.gmail, credentials: v } }), mono: true, placeholder: "./credentials/gmail_credentials.json", mode }),
+                React.createElement(WInput, { label: "Token JSON path", value: cfg.email.gmail?.token || "", onChange: v => updateCfg("email", { gmail: { ...cfg.email.gmail, token: v } }), mono: true, placeholder: "./credentials/gmail_token.json", mode }),
                 React.createElement("div", { className: cl("text-sm p-3 rounded-xl", t.tipBox) },
                   "Gmail API requires a Google Cloud project with OAuth2 credentials. See docs/EMAIL_SETUP.md for a detailed step-by-step guide. After setup, run: .venv/bin/python3 scripts/gmail/export_gmail.py --stats"
                 )
@@ -762,7 +804,7 @@
               cfg.email.provider && React.createElement(Tile, null,
                 React.createElement("h4", { className: cl("text-sm font-semibold mb-3", t.text) }, "\u{1F4E7} Email"),
                 React.createElement(RR, { label: "Provider", value: cfg.email.provider }),
-                React.createElement(RR, { label: "Address", value: cfg.email.address })
+                React.createElement(RR, { label: "Addresses", value: (cfg.email.addresses || []).map(a => (a || "").trim()).filter(Boolean).join(", ") })
               ),
               cfg.remote_access?.provider && cfg.remote_access.provider !== "none" && React.createElement(Tile, null,
                 React.createElement("h4", { className: cl("text-sm font-semibold mb-3", t.text) }, "\u{1F310} Remote Access"),
