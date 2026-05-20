@@ -1057,11 +1057,22 @@ class BearerAuthMiddleware:
                     # Flatten if nested list (some providers return [[...]])
                     if embedding and isinstance(embedding[0], list):
                         embedding = embedding[0]
+                    try:
+                        _create_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp() if timestamp else 0
+                    except (ValueError, AttributeError):
+                        _create_time = 0
+                    _date_str = timestamp[:10] if timestamp else ""
                     metadata = {
-                        "source": source,
+                        "conv_id": conversation_id or "",
                         "title": title,
-                        "type": "conversation",
-                        "document_date": timestamp[:10] if timestamp else "",
+                        "date": _date_str,
+                        "document_date": _date_str,
+                        "create_time": _create_time,
+                        "default_model": source,
+                        "chunk_index": 0,
+                        "char_count": min(len(text), 10000),
+                        "turn_count": len(messages),
+                        "source": source,
                     }
                     # Batch-1: verified_upsert verifies only id_list[0]; if this
                     # becomes batch-N, per-id coverage must be revisited.
