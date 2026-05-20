@@ -28,7 +28,8 @@ import json
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -85,14 +86,10 @@ def should_keep(email):
 # ============================================================
 
 def dedup_by_thread(emails):
-    """Keep only the latest email per thread_id."""
-    threads = {}
-    for email in emails:
-        tid = email.get("thread_id", email.get("id", ""))
-        date = email.get("date") or email.get("internal_date") or ""
-        if tid not in threads or date > threads[tid].get("date", ""):
-            threads[tid] = email
-    return list(threads.values())
+    """Pass-through: keep all messages, no per-thread selection.
+    Idempotency in KB is guaranteed downstream by stable chunk_id
+    (`email_<id>_chunk_NNNN`) + ChromaDB upsert; no dedup needed here."""
+    return list(emails)
 
 
 # ============================================================
@@ -283,6 +280,24 @@ def chunk_email(email, stripped_body):
     date = email.get("date", "")
     snippet = email.get("snippet", "")
 
+    _raw_date = date
+    _date_iso = ""
+    _create_time = 0
+    if _raw_date:
+        _dt = None
+        try:
+            _dt = datetime.fromisoformat(_raw_date.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            try:
+                _dt = parsedate_to_datetime(_raw_date)
+            except (TypeError, ValueError):
+                _dt = None
+        if _dt is not None:
+            if _dt.tzinfo is not None:
+                _dt = _dt.astimezone(timezone.utc).replace(tzinfo=None)
+            _date_iso = _dt.strftime("%Y-%m-%d")
+            _create_time = int(_dt.replace(tzinfo=timezone.utc).timestamp())
+
     
     from_short = from_addr.split("<")[0].strip().strip('"') if "<" in from_addr else from_addr
     to_short = to_addr.split("<")[0].strip().strip('"') if "<" in to_addr else to_addr
@@ -310,8 +325,9 @@ def chunk_email(email, stripped_body):
         meta = {
             "conv_id": f"email_thread_{thread_id}",
             "title": subject or "(nessun oggetto)",
-            "date": date,
-            "create_time": 0,  # Will be computed if needed
+            "date": _date_iso,
+            "email_date_raw": _raw_date,
+            "create_time": _create_time,
             "chunk_index": idx,
             "char_count": len(full_text),
             "turn_count": 1,
@@ -370,7 +386,7 @@ def process():
     # Step 2: Dedup per thread
     print(f"\nStep 2: Dedup per thread...")
     deduped = dedup_by_thread(kept)
-    print(f"  Thread unici: {len(deduped):,} (da {len(kept):,} email)")
+    print(f"  Email da processare: {len(deduped):,}")
 
     # Step 3: Strip quoted + chunk
     print(f"\nStep 3: Strip quoted text + chunking...")
@@ -452,7 +468,7 @@ def show_stats():
     print(f"Email totali: {total:,}")
     print(f"Utili (triage): {useful:,}")
     print(f"Filtrate (sender + sole TO): {kept_count:,}")
-    print(f"Thread unici: {len(deduped):,}")
+    print(f"Email da processare: {len(deduped):,}")
     print(f"Chars raw: {total_raw:,}")
     print(f"Chars dopo strip: {total_stripped:,} (-{(1 - total_stripped / max(1, total_raw)) * 100:.0f}%)")
     print(f"Chunk stimati: ~{total_stripped // 1200:,}")
