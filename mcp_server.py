@@ -1021,7 +1021,7 @@ class BearerAuthMiddleware:
                     data = _jlive.loads(body)
                 except Exception:
                     return _json_response({"error": "Invalid JSON"}, 400)
-                source = data.get("source", "web")
+                source = data.get("source", "unknown")
                 title = data.get("title", "Untitled")
                 messages = data.get("messages", [])
                 conversation_id = data.get("conversation_id", "")
@@ -1040,7 +1040,12 @@ class BearerAuthMiddleware:
                     conv_hash = _hlive.sha256(conversation_id.encode()).hexdigest()[:16]
                     chunk_id = f"live_{source}_{conv_hash}"
                 else:
-                    content_hash = _hlive.sha256(text[:500].encode()).hexdigest()[:16]
+                    # Hash on multiple fields to virtually eliminate collisions
+                    # for conversations without conversation_id (Chrome extension
+                    # currently does not send conversation_id — content_hash is
+                    # ALWAYS the active path, not a rare fallback).
+                    hash_input = f"{title}|{timestamp}|{len(text)}|{text[:500]}".encode()
+                    content_hash = _hlive.sha256(hash_input).hexdigest()[:16]
                     chunk_id = f"live_{source}_{content_hash}"
                 # Check if this is an update
                 collection = get_collection()
@@ -1057,11 +1062,19 @@ class BearerAuthMiddleware:
                     # Flatten if nested list (some providers return [[...]])
                     if embedding and isinstance(embedding[0], list):
                         embedding = embedding[0]
-                    try:
-                        _create_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp() if timestamp else 0
-                    except (ValueError, AttributeError):
-                        _create_time = 0
-                    _date_str = timestamp[:10] if timestamp else ""
+                    # Parse timestamp once, derive both create_time and date_str
+                    # from the parsed datetime to keep them consistent. If parsing
+                    # fails, both fall back to safe empty/zero values (no garbage
+                    # saved as date when timestamp is malformed).
+                    _create_time = 0
+                    _date_str = ""
+                    if timestamp:
+                        try:
+                            _dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                            _create_time = _dt.timestamp()
+                            _date_str = _dt.strftime("%Y-%m-%d")
+                        except (ValueError, AttributeError, TypeError):
+                            pass
                     metadata = {
                         "conv_id": conversation_id or "",
                         "title": title,
