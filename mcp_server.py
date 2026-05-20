@@ -2368,13 +2368,41 @@ def kb_query_advanced(
 @mcp.tool()
 def kb_stats() -> str:
     """General Knowledge Base statistics."""
+    from email.utils import parsedate_to_datetime
+    from datetime import timezone
+
+    def _parse_kb_date(meta):
+        raw = meta.get("date", "")
+        if not raw:
+            raw = meta.get("document_date", "")
+        if not raw or not isinstance(raw, str):
+            return None
+        s = raw.strip()
+        if not s:
+            return None
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                dt = parsedate_to_datetime(s)
+            except (TypeError, ValueError):
+                return None
+            if dt is None:
+                return None
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+
     try:
         collection = get_collection()
         count = collection.count()
         BATCH = 500
         convs = set()
         total_chars = 0
-        models, sources, dates = {}, {}, []
+        models, sources = {}, {}
+        dates_by_source: dict[str, list] = {}
+        no_date_by_source: dict[str, int] = {}
+        all_dates: list = []
         offset = 0
         while offset < count:
             batch = collection.get(include=["metadatas"], limit=BATCH, offset=offset)
@@ -2387,18 +2415,35 @@ def kb_stats() -> str:
                 models[model] = models.get(model, 0) + 1
                 source = meta.get("source", "chatgpt")
                 sources[source] = sources.get(source, 0) + 1
-                date = meta.get("date", "")
-                if date:
-                    dates.append(date)
+                dt = _parse_kb_date(meta)
+                if dt is None:
+                    no_date_by_source[source] = no_date_by_source.get(source, 0) + 1
+                else:
+                    dates_by_source.setdefault(source, []).append(dt)
+                    all_dates.append(dt)
             offset += len(batch["metadatas"])
-        dates.sort()
+        if all_dates:
+            periodo_globale = f"{min(all_dates).strftime('%Y-%m-%d')} -> {max(all_dates).strftime('%Y-%m-%d')}"
+        else:
+            periodo_globale = "N/A -> N/A"
         output = [
             "=== TAILOR KB Stats ===",
             f"Total chunks: {count:,}", f"Conversations: {len(convs)}",
             f"Total chars: {total_chars:,}", f"Estimated tokens: {total_chars // 4:,}",
-            f"Periodo: {dates[0] if dates else 'N/A'} -> {dates[-1] if dates else 'N/A'}",
-            f"\nFonti:",
+            f"Periodo (globale): {periodo_globale}",
+            f"\nPeriodo per source:",
         ]
+        for src in sorted(sources.keys(), key=lambda s: -sources[s]):
+            dlist = dates_by_source.get(src, [])
+            n_with = len(dlist)
+            n_without = no_date_by_source.get(src, 0)
+            if dlist:
+                mn = min(dlist).strftime("%Y-%m-%d")
+                mx = max(dlist).strftime("%Y-%m-%d")
+            else:
+                mn = mx = "N/A"
+            output.append(f"  {src}: {mn} -> {mx}  ({n_with:,} con data, {n_without:,} senza data)")
+        output.append(f"\nFonti:")
         for source, cnt in sorted(sources.items(), key=lambda x: -x[1]):
             output.append(f"  {source}: {cnt:,} chunk")
         output.append(f"\nModelli (top 5):")
