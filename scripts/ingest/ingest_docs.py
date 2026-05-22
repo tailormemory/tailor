@@ -38,9 +38,12 @@ import chromadb
 # CONFIGURAZIONE (from config/tailor.yaml)
 # ============================================================
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from embedding import get_embedding, get_embeddings
 from config import get as cfg
 from ingest_helpers import verified_upsert, make_run_id
+from ocr_quality import assess_text_quality
+from vlm_extractor import extract_page_via_vlm
 
 # Cartelle da scansionare (ricorsivamente) — from YAML
 WATCH_FOLDERS = cfg("ingest", "document_paths") or []
@@ -366,6 +369,99 @@ def extract_pdf(filepath):
         if route:
             return _extract_pdf_paddle(filepath, doc_type, reason)
     return _extract_pdf_legacy(filepath)
+
+
+FINANCIAL_DOCTYPES_VLM_FALLBACK = {
+    "rendiconto_investimenti",
+    "estratto_conto",
+}
+
+
+def _write_vlm_audit_log(filepath, doctype, total_pages, decisions, daily_count_after, daily_cap):
+    from datetime import datetime
+    log_dir = os.path.expanduser("~/tailor/logs")
+    os.makedirs(log_dir, exist_ok=True)
+    ts = datetime.now()
+    log_path = os.path.join(log_dir, f"vlm_fallback_{ts.strftime('%Y%m%d_%H%M%S')}.json")
+    payload = {
+        "timestamp": ts.isoformat(),
+        "filepath": filepath,
+        "doctype": doctype,
+        "total_pages": total_pages,
+        "decisions": decisions,
+        "vlm_calls_today_after": daily_count_after,
+        "vlm_daily_cap": daily_cap,
+    }
+    try:
+        with open(log_path, "w") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"  [vlm] audit log write failed: {e}")
+
+
+def extract_pdf_with_quality_fallback(filepath, doctype=None):
+    """Run extract_pdf, then re-extract garbage sections via VLM for financial doctypes.
+
+    Returns the (possibly modified) sections list. Always falls back to original
+    sections on any VLM problem — never raises. Writes per-invocation audit log
+    when at least one quality check is performed.
+    """
+    sections = extract_pdf(filepath)
+
+    vlm_cfg = cfg("enrichment", "vlm_extraction") or {}
+    enabled = vlm_cfg.get("enabled", False)
+    daily_cap = vlm_cfg.get("daily_cap", 100)
+    raster_dpi = vlm_cfg.get("raster_dpi", 144)
+
+    if not enabled:
+        return sections
+    if not doctype or doctype not in FINANCIAL_DOCTYPES_VLM_FALLBACK:
+        return sections
+    if not sections:
+        return sections
+
+    from vlm_extractor import vlm_daily_count_get
+
+    total_pages = sections[0].get("metadata", {}).get("total_pages", len(sections))
+    decisions = []
+
+    for i, section in enumerate(sections):
+        text = section.get("text", "") or ""
+        meta = section.get("metadata", {}) or {}
+        page = meta.get("page", i + 1)
+        quality = assess_text_quality(text)
+
+        if not quality["is_garbage"]:
+            if quality["char_count"] < 200:
+                decisions.append({"page": page, "quality": quality,
+                                  "action": "kept_original_edge_case_short"})
+            else:
+                decisions.append({"page": page, "quality": quality,
+                                  "action": "kept_original_clean"})
+            continue
+
+        if vlm_daily_count_get() >= daily_cap:
+            decisions.append({"page": page, "quality": quality,
+                              "action": "vlm_skipped_daily_cap"})
+            continue
+
+        vlm_section = extract_page_via_vlm(filepath, page, total_pages,
+                                           daily_cap=daily_cap,
+                                           raster_dpi=raster_dpi)
+        if vlm_section is None:
+            decisions.append({"page": page, "quality": quality,
+                              "action": "vlm_failed_all_backends"})
+            continue
+
+        sections[i] = vlm_section
+        decisions.append({
+            "page": page, "quality": quality, "action": "vlm_success",
+            "extractor_after": vlm_section["metadata"]["extractor"],
+        })
+
+    _write_vlm_audit_log(filepath, doctype, total_pages, decisions,
+                         vlm_daily_count_get(), daily_cap)
+    return sections
 
 
 def _route_to_paddle(filepath, doc_type):
@@ -770,11 +866,15 @@ def extract_pptx(filepath):
     return sections
 
 
-def extract_text(filepath):
-    """Router: estrae testo in base all'estensione."""
+def extract_text(filepath, doctype=None):
+    """Router: estrae testo in base all'estensione.
+
+    doctype, if provided, routes PDF extraction through the VLM quality-fallback
+    wrapper. Other formats ignore it (no OCR garbage risk on native text formats).
+    """
     ext = os.path.splitext(filepath)[1].lower()
     if ext == ".pdf":
-        return extract_pdf(filepath)
+        return extract_pdf_with_quality_fallback(filepath, doctype=doctype)
     elif ext in (".xlsx", ".xls"):
         return extract_excel(filepath)
     elif ext in (".csv", ".tsv"):
@@ -1188,8 +1288,9 @@ def main():
                 deleted = delete_file_chunks(collection, old_hash)
                 print(f"  Rimossi {deleted} chunk vecchi")
 
-        # Estrai testo
-        sections = extract_text(f["filepath"])
+        # Estrai testo (doctype dal filename per gating VLM fallback)
+        pre_doctype = infer_doc_type(f["filename"])
+        sections = extract_text(f["filepath"], doctype=pre_doctype)
         if not sections:
             # Track extraction failure in registry
             existing = registry.get(f["filepath"], {})

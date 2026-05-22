@@ -284,6 +284,16 @@ enrichment:
       - provider: anthropic
         model: claude-haiku-4-5-20251001
 
+  vlm_extraction:
+    enabled: false       # explicit opt-in (M3 will flip in runtime)
+    daily_cap: 100       # max VLM calls per calendar day across all docs
+    raster_dpi: 144      # page raster DPI (144 = 2x default 72)
+    backends:
+      - provider: google
+        model: gemini-2.5-pro
+      - provider: anthropic
+        model: claude-sonnet-4-6-20260218
+
   fact_supersession:
     daily_limit_per_backend: 50000  # high-volume role; default 4500 would route 91% of pairs to fallback
     backends:
