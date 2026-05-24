@@ -51,6 +51,8 @@ from scripts.lib.backend_manager import BackendManager
 DEFAULT_WORKERS = 5
 SIMILARITY_THRESHOLD = 0.45  # soglia fuzzy match per candidare una coppia
 MAX_COMPARISONS = 50000  # No daily cap on this side; backend daily limits enforced by BackendManager
+MAX_PAIRS_PER_CLUSTER = 500  # cap per single (cat, entity) cluster to ensure coverage diversity
+                              # (added 2026-05-24 to prevent user_general mega-cluster monopolizing the budget)
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 GEMINI_URL_TMPL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
@@ -88,7 +90,7 @@ def find_candidate_pairs(max_pairs=MAX_COMPARISONS):
 
     # Load facts not yet superseded, with category and entity_tags
     cur.execute("""
-        SELECT id, fact, category, entity_tags, event_date, chunk_id
+        SELECT id, fact, category, entity_tags, event_date, chunk_id, created_at
         FROM facts
         WHERE superseded_by IS NULL
         ORDER BY id
@@ -104,6 +106,7 @@ def find_candidate_pairs(max_pairs=MAX_COMPARISONS):
             "id": row[0], "fact": row[1], "category": row[2] or "",
             "tags": [t.lower().strip() for t in tags if t],
             "event_date": row[4] or "", "chunk_id": row[5],
+            "created_at": row[6] or "",
             "primary_entity": tags[0].lower().strip() if tags else ""
         })
     conn.close()
@@ -133,10 +136,21 @@ def find_candidate_pairs(max_pairs=MAX_COMPARISONS):
     groups = {k: v for k, v in groups.items() if len(v) >= 2}
     print(f"  Gruppi con 2+ fatti: {len(groups):,}")
 
+    # Sort clusters by recency (max fact id within cluster, DESC) so that
+    # clusters touched by recently-ingested facts get explored first.
+    # Combined with MAX_PAIRS_PER_CLUSTER below, this guarantees coverage
+    # diversity across the cluster space instead of exhausting the budget
+    # on a single mega-cluster (the user_general failure mode pre-2026-05-24).
+    sorted_items = sorted(
+        groups.items(),
+        key=lambda kv: max(f["id"] for f in kv[1]),
+        reverse=True,
+    )
+
     # For each group, find pairs with similarity > threshold
     pairs = []
     groups_checked = 0
-    for key, facts in groups.items():
+    for key, facts in sorted_items:
         if len(pairs) >= max_pairs:
             break
 
@@ -144,8 +158,9 @@ def find_candidate_pairs(max_pairs=MAX_COMPARISONS):
         facts.sort(key=lambda f: f["id"])
 
         # Compare each fact with subsequent ones in the group
+        cluster_pairs_count = 0  # per-cluster cap (MAX_PAIRS_PER_CLUSTER)
         for i in range(len(facts)):
-            if len(pairs) >= max_pairs:
+            if len(pairs) >= max_pairs or cluster_pairs_count >= MAX_PAIRS_PER_CLUSTER:
                 break
             for j in range(i + 1, min(i + 20, len(facts))):  # max 20 confronti per fatto
                 # Fuzzy match sulla stringa del fatto
@@ -159,12 +174,15 @@ def find_candidate_pairs(max_pairs=MAX_COMPARISONS):
                     new_f = facts[j]
                     old_f = facts[i]
                     pairs.append((new_f, old_f, sim))
+                    cluster_pairs_count += 1
+                    if cluster_pairs_count >= MAX_PAIRS_PER_CLUSTER:
+                        break
 
         groups_checked += 1
         if groups_checked % 1000 == 0:
             print(f"    ...{groups_checked:,} gruppi, {len(pairs):,} coppie")
 
-    print(f"  Coppie candidate: {len(pairs):,}")
+    print(f"  Coppie candidate: {len(pairs):,} ({groups_checked:,} cluster esplorati)")
     return pairs
 
 
