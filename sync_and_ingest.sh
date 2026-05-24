@@ -550,27 +550,37 @@ db.close()
 log "Fact extraction completed: $FACTS_EXTRACTED facts from $FACTS_CHUNKS chunks"
 
 # ── 5f. FACT SUPERSESSION (confronto fact-vs-fact sui nuovi fatti) ──
-log "Starting fact supersession"
-# Timeout 30 min
-"$PYTHON" scripts/enrichment/fact_supersession.py --workers 5 >> "$LOG_FILE" 2>&1 &
+# DISABLED 2026-05-24: feature stalled since 2026-05-12 (last confirmed
+# supersession). 12 consecutive nights of TIMEOUT at ~17k LLM calls,
+# SUP=0 always — wasted ~$80 in zero-value runs. Diagnosis: MAX_COMPARISONS
+# cap + ORDER BY id iteration in find_candidate_pairs no longer scales with
+# 1.57M active facts (was working at ~600k April). Re-enable after the
+# scalability fix (window-based filtering or cluster prioritization).
+# See: docs/diagnostics/ + chat 2026-05-24 fact_supersession diagnosis.
+log "Starting fact supersession (DISABLED — no-op stub, see source comment)"
+true &
 SUP_PID=$!
-SUP_ELAPSED=0
-while kill -0 $SUP_PID 2>/dev/null; do
-    sleep 10
-    SUP_ELAPSED=$((SUP_ELAPSED + 10))
-    REMAINING=$((DEADLINE - $(date +%s) - DERIVATION_MAX_SEC))  # leave room for derivation
-        if [ "$SUP_ELAPSED" -ge "$SUPERSESSION_MAX_SEC" ] || [ "$REMAINING" -le 0 ]; then
-        log "TIMEOUT: fact supersession after $((SUP_ELAPSED/60)) min (step budget remaining: $((REMAINING/60)) min) — killing"
-        kill -15 $SUP_PID 2>/dev/null
-        sleep 15
-        if kill -0 $SUP_PID 2>/dev/null; then
-            kill -9 $SUP_PID 2>/dev/null
-        fi
-        wait $SUP_PID 2>/dev/null
-        ERRORS="${ERRORS}Timeout fact supersession. "
-        break
-    fi
-done
+wait $SUP_PID 2>/dev/null
+# Original guarded loop kept commented for easy re-enable:
+# "$PYTHON" scripts/enrichment/fact_supersession.py --workers 5 >> "$LOG_FILE" 2>&1 &
+# SUP_PID=$!
+# SUP_ELAPSED=0
+# while kill -0 $SUP_PID 2>/dev/null; do
+#     sleep 10
+#     SUP_ELAPSED=$((SUP_ELAPSED + 10))
+#     REMAINING=$((DEADLINE - $(date +%s) - DERIVATION_MAX_SEC))  # leave room for derivation
+#         if [ "$SUP_ELAPSED" -ge "$SUPERSESSION_MAX_SEC" ] || [ "$REMAINING" -le 0 ]; then
+#         log "TIMEOUT: fact supersession after $((SUP_ELAPSED/60)) min (step budget remaining: $((REMAINING/60)) min) — killing"
+#         kill -15 $SUP_PID 2>/dev/null
+#         sleep 15
+#         if kill -0 $SUP_PID 2>/dev/null; then
+#             kill -9 $SUP_PID 2>/dev/null
+#         fi
+#         wait $SUP_PID 2>/dev/null
+#         ERRORS="${ERRORS}Timeout fact supersession. "
+#         break
+#     fi
+# done
 wait $SUP_PID 2>/dev/null
 # Query DB directly for accurate supersession count
 FACTS_SUPERSEDED=$("$PYTHON" -c "
