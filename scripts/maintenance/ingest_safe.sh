@@ -48,7 +48,7 @@ export PYTHONPATH="$TAILOR_DIR:${PYTHONPATH:-}"
 
 PYTHON="$TAILOR_DIR/.venv/bin/python3"
 DB="$TAILOR_DIR/db/chroma.sqlite3"
-COLLECTION_ID="9358d5d7-8b90-4ed2-882c-3309b6dacd1f"
+COLLECTION_ID="d6e49a14-f0e2-4e86-996f-95788e0413bf"
 MCP_PLIST="/Library/LaunchDaemons/com.tailor.mcp.plist"
 MCP_SERVICE="system/com.tailor.mcp"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
