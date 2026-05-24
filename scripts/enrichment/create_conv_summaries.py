@@ -50,7 +50,7 @@ _USER_LANG = cfg("user", "language") or "en"
 _sum_cfg = get_enrichment("summaries")
 MODEL = _sum_cfg["model"]
 
-COLLECTION_NAME = cfg("kb", "collection") or "tailor_kb"
+COLLECTION_NAME = cfg("kb", "collection") or "tailor_kb_v2"
 
 # Quanti chars di testo per conversazione mandare al modello
 MAX_INPUT_CHARS = 8000

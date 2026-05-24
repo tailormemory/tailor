@@ -26,7 +26,7 @@ DB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.ab
 CHROMA_DB = os.path.join(DB_DIR, "chroma.sqlite3")
 ENTITY_DB = os.path.join(DB_DIR, "entity_index.sqlite3")
 
-# Segment ID del METADATA segment della collection tailor_kb
+# Segment ID del METADATA segment della collection tailor_kb_v2
 # Aggiornare se la collection viene ricreata
 METADATA_SEGMENT = None  # Auto-detect
 
@@ -34,24 +34,24 @@ BATCH = 1000
 
 
 def get_metadata_segment(conn):
-    """Trova il segment_id METADATA della collection tailor_kb."""
+    """Trova il segment_id METADATA della collection tailor_kb_v2."""
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT s.id 
-        FROM segments s 
-        JOIN collections c ON s.collection = c.id 
-        WHERE c.name = 'tailor_kb' AND s.scope = 'METADATA'
+        SELECT s.id
+        FROM segments s
+        JOIN collections c ON s.collection = c.id
+        WHERE c.name = 'tailor_kb_v2' AND s.scope = 'METADATA'
     """)
     row = cursor.fetchone()
     if not row:
         # Fallback: try different join (depends on ChromaDB version)
-        cursor.execute("SELECT id FROM collections WHERE name = 'tailor_kb'")
+        cursor.execute("SELECT id FROM collections WHERE name = 'tailor_kb_v2'")
         col_row = cursor.fetchone()
         if col_row:
             cursor.execute("SELECT id FROM segments WHERE collection = ? AND scope = 'METADATA'", (col_row[0],))
             row = cursor.fetchone()
     if not row:
-        print("❌ Collection tailor_kb non trovata!")
+        print("❌ Collection tailor_kb_v2 non trovata!")
         sys.exit(1)
     return row[0]
 

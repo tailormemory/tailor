@@ -11,7 +11,7 @@ from embedding import get_embeddings
 from ingest_helpers import verified_upsert, make_run_id
 
 DB_DIR = os.path.join(BASE_DIR, "db")
-COLLECTION_NAME = cfg("kb", "collection") or "tailor_kb"
+COLLECTION_NAME = cfg("kb", "collection") or "tailor_kb_v2"
 BATCH_SIZE = 10
 MAX_TEXT_CHARS = 4000
 TARGET_CHUNK_CHARS = 1200

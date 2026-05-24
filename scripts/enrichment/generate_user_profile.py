@@ -71,7 +71,7 @@ def get_segment_id():
     cur = conn.cursor()
     cur.execute("""
         SELECT s.id FROM segments s JOIN collections c ON s.collection = c.id 
-        WHERE c.name = 'tailor_kb' AND s.scope = 'METADATA'
+        WHERE c.name = 'tailor_kb_v2' AND s.scope = 'METADATA'
     """)
     row = cur.fetchone()
     conn.close()

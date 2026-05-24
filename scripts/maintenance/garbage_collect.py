@@ -18,7 +18,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 DB_DIR = os.path.join(BASE_DIR, "db")
 REGISTRY_FILE = os.path.join(DB_DIR, "doc_registry.json")
 LOG_PATH = os.path.join(BASE_DIR, "logs", "garbage_collect.log")
-COLLECTION_NAME = "tailor_kb"
+COLLECTION_NAME = "tailor_kb_v2"
 
 sys.path.insert(0, os.path.join(BASE_DIR, "scripts", "lib"))
 from config import get as cfg

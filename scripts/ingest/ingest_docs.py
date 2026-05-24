@@ -60,7 +60,7 @@ IGNORE_PATTERNS = set(cfg("ingest", "ignore_patterns") or ["~$", ".tmp", "Thumbs
 DB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "db")
 REGISTRY_FILE = os.path.join(DB_DIR, "doc_registry.json")
 
-COLLECTION_NAME = cfg("kb", "collection") or "tailor_kb"
+COLLECTION_NAME = cfg("kb", "collection") or "tailor_kb_v2"
 
 BATCH_SIZE = 10
 MAX_TEXT_CHARS = 4000

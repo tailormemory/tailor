@@ -36,7 +36,7 @@ DB_DIR = cfg("kb", "chromadb_path") or os.path.join(BASE_DIR, "db")
 
 INPUT_FILE = os.path.join(DATA_DIR, "chunks_gmail.jsonl")
 
-COLLECTION_NAME = cfg("kb", "collection") or "tailor_kb"
+COLLECTION_NAME = cfg("kb", "collection") or "tailor_kb_v2"
 
 BATCH_SIZE = 10
 MAX_TEXT_CHARS = 4000

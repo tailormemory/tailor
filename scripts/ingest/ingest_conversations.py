@@ -40,7 +40,7 @@ from ingest_helpers import verified_upsert, make_run_id
 # ── Constants ─────────────────────────────────────────────────
 DB_DIR = os.path.join(BASE_DIR, "db")
 DATA_DIR = os.path.join(BASE_DIR, "data")
-COLLECTION_NAME = cfg("kb", "collection") or "tailor_kb"
+COLLECTION_NAME = cfg("kb", "collection") or "tailor_kb_v2"
 
 # Chunking parameters
 TARGET_CHUNK_CHARS = 1200

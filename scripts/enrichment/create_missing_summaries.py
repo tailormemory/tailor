@@ -41,7 +41,7 @@ else:
 _sum_cfg = get_enrichment("summaries")
 MODEL = _sum_cfg["model"]
 
-COLLECTION_NAME = cfg("kb", "collection") or "tailor_kb"
+COLLECTION_NAME = cfg("kb", "collection") or "tailor_kb_v2"
 
 MAX_INPUT_CHARS = 8000
 MAX_WORKERS = 2

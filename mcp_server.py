@@ -134,9 +134,9 @@ from embedding import get_embedding, get_embeddings, info as embedding_info
 # Collection name from config
 try:
     from scripts.lib.config import get as _cfg_get_top
-    COLLECTION_NAME = _cfg_get_top("kb", "collection") or "tailor_kb"
+    COLLECTION_NAME = _cfg_get_top("kb", "collection") or "tailor_kb_v2"
 except Exception:
-    COLLECTION_NAME = "tailor_kb"
+    COLLECTION_NAME = "tailor_kb_v2"
 FACTS_DB_PATH = os.path.join(DB_DIR, "facts.sqlite3")
 
 # ── Model Advisor: Ollama pull jobs ───────────────────────────

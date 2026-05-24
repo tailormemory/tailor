@@ -312,7 +312,7 @@ if ! cp "$TAILOR_DIR/db/chroma.sqlite3" "$SNAPSHOT_DIR/chroma.sqlite3" 2>>"$LOG_
     exit 1
 fi
 
-CHROMA_COLLECTION=$(python3 -c "import yaml; c=yaml.safe_load(open('$TAILOR_DIR/config/tailor.yaml')); print(c.get('kb',{}).get('collection','tailor_kb'))" 2>/dev/null || echo tailor_kb)
+CHROMA_COLLECTION=$(python3 -c "import yaml; c=yaml.safe_load(open('$TAILOR_DIR/config/tailor.yaml')); print(c.get('kb',{}).get('collection','tailor_kb_v2'))" 2>/dev/null || echo tailor_kb_v2)
 CHROMA_CHECK_PY=$(cat <<PYEOF
 import chromadb, sys
 try:
@@ -731,7 +731,7 @@ if os.path.exists(db):
     total = c.execute('SELECT COUNT(*) FROM facts').fetchone()[0]
     import chromadb
     cc = chromadb.PersistentClient(path=os.path.join('$TAILOR_DIR', 'db'))
-    total_chunks = cc.get_collection('tailor_kb').count()
+    total_chunks = cc.get_collection('$CHROMA_COLLECTION').count()
     sup = c.execute('SELECT COUNT(*) FROM facts WHERE superseded_by IS NOT NULL').fetchone()[0]
     chunks = c.execute('SELECT COUNT(*) FROM extraction_log').fetchone()[0]
     remaining = total_chunks - chunks

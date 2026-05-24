@@ -50,7 +50,7 @@ import chromadb
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 DB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "db")
-COLLECTION_NAME = "tailor_kb"
+COLLECTION_NAME = "tailor_kb_v2"
 
 # --- Backend Ollama ---
 from scripts.lib.config import get as _cfg

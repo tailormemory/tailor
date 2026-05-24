@@ -48,7 +48,7 @@ DB_PATH = os.path.join(DB_DIR, "chroma.sqlite3")
 BACKUPS_DIR = os.path.join(BASE_DIR, "backups")
 MAINTENANCE_LOCK = os.path.join(BASE_DIR, "maintenance.lock")
 AUDIT_HISTORY_DIR = os.path.join(BASE_DIR, "logs", "hnsw_audits")
-COLLECTION_NAME = "tailor_kb"
+COLLECTION_NAME = "tailor_kb_v2"
 
 UPSERT_BATCH_SIZE = 10
 MAX_TEXT_CHARS = 4000  # mirrors ingest_docs.py
