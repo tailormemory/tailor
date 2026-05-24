@@ -138,14 +138,32 @@ def _open_sqlite_rw(db_path: str) -> sqlite3.Connection:
     return sqlite3.connect(db_path)
 
 
-def _load_segment_ids(con: sqlite3.Connection) -> tuple[str, str]:
+def _load_segment_ids(con: sqlite3.Connection, collection_name: str = COLLECTION_NAME) -> tuple[str, str]:
+    """Return (metadata_segment_id, vector_segment_id) for the named collection.
+
+    The collection filter is critical when the database hosts more than one
+    collection (e.g. during the tailor_kb → tailor_kb_v2 migration window).
+    Without it, the first segment encountered for each scope was returned,
+    which silently pointed audits at the wrong (stale) collection — see
+    bug discovered 2026-05-24.
+    """
     cur = con.cursor()
-    cur.execute("SELECT id FROM segments WHERE scope='METADATA'")
+    cur.execute("""
+        SELECT s.id FROM segments s
+        JOIN collections c ON c.id = s.collection
+        WHERE s.scope = 'METADATA' AND c.name = ?
+    """, (collection_name,))
     meta_row = cur.fetchone()
-    cur.execute("SELECT id FROM segments WHERE scope='VECTOR'")
+    cur.execute("""
+        SELECT s.id FROM segments s
+        JOIN collections c ON c.id = s.collection
+        WHERE s.scope = 'VECTOR' AND c.name = ?
+    """, (collection_name,))
     vec_row = cur.fetchone()
     if not meta_row or not vec_row:
-        raise RuntimeError("Could not locate METADATA and VECTOR segments")
+        raise RuntimeError(
+            f"Could not locate METADATA and VECTOR segments for collection '{collection_name}'"
+        )
     return meta_row[0], vec_row[0]
 
 
