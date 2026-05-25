@@ -197,6 +197,19 @@ trap ensure_mcp_exit_maintenance EXIT
 
 echo "========================================" >> "$LOG_FILE"
 log "START sync_and_ingest v9 (mode=$NIGHTLY_MODE)"
+
+# Safeguard: policy "manual ingest only" — facts_only è l'unico mode permesso
+# per il cron notturno. Default env unset → "full" (vedi NIGHTLY_MODE assign),
+# flip accidentale del plist → "full". Entrambi i casi bloccati qui.
+# Storia: chromadb 1.5.8 #6975 motivò la migrazione a facts_only; 1.5.9 ha
+# fixato il bug class, ma la policy "manual ingest only" resta (controllo
+# human-in-the-loop, audit visibility, bootout safe). Vedi ingest_safe.sh.
+if [ "$NIGHTLY_MODE" = "full" ]; then
+    log "ABORT: MANUAL INGEST POLICY — full mode disabled, use ingest_safe.sh"
+    log "ABORT: set TAILOR_NIGHTLY_MODE=facts_only in plist com.tailor.sync-and-ingest"
+    exit 2
+fi
+
 START_TIME=$(date +%s)
 RUN_START=$(date -u +"%Y-%m-%dT%H:%M:%S")
 # Read pipeline config from YAML (with defaults)
