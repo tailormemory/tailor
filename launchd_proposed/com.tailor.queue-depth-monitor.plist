@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tailor.queue-depth-monitor</string>
+    <key>UserName</key>
+    <string>jarvis</string>
+    <key>GroupName</key>
+    <string>staff</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/jarvis/tailor/scripts/services/run_queue_depth_monitor.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/jarvis/tailor</string>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StartInterval</key>
+    <integer>1800</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/jarvis/tailor/logs/queue_depth_monitor_stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/jarvis/tailor/logs/queue_depth_monitor_stderr.log</string>
+</dict>
+</plist>
