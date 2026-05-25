@@ -396,6 +396,24 @@ def main():
     db = get_db()
     cp = load_checkpoint()
 
+    # Reset processed_entities if this is a NEW run (last_run > 1h ago).
+    # processed_entities is meant for resume-from-crash within a single run
+    # (checkpoint is saved every 50 entities). Without this reset it grew
+    # cumulatively across runs to 34,395 entries on 2026-05-25 and started
+    # silently skipping every entity already touched in any previous run —
+    # producing 0 derived facts despite 16 entities with new source facts.
+    last_run_str = cp.get("last_run", "")
+    if last_run_str:
+        try:
+            from datetime import datetime as _dt
+            age_sec = (_dt.now() - _dt.fromisoformat(last_run_str)).total_seconds()
+            if age_sec > 3600:
+                cp["processed_entities"] = []
+        except (ValueError, TypeError):
+            cp["processed_entities"] = []
+    else:
+        cp["processed_entities"] = []
+
     # Load entity groups
     nightly_since = cp.get("last_run", "") if args.nightly else None
     entity_filter = args.entity if args.entity else None
