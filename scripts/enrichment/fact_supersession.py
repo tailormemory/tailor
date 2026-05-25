@@ -50,7 +50,7 @@ from scripts.lib.backend_manager import BackendManager
 
 DEFAULT_WORKERS = 5
 SIMILARITY_THRESHOLD = 0.45  # soglia fuzzy match per candidare una coppia
-MAX_COMPARISONS = 50000  # No daily cap on this side; backend daily limits enforced by BackendManager
+MAX_COMPARISONS = 15000  # No daily cap on this side; backend daily limits enforced by BackendManager
 MAX_PAIRS_PER_CLUSTER = 500  # cap per single (cat, entity) cluster to ensure coverage diversity
                               # (added 2026-05-24 to prevent user_general mega-cluster monopolizing the budget)
 
