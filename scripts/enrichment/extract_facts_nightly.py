@@ -272,11 +272,19 @@ def is_code_heavy(text, threshold=0.6):
 
 
 def load_chunks(limit=20000):
-    # Already-extracted chunks
+    # Already-extracted chunks. Exclude transient failures (model='failed_1',
+    # 'failed_2') so they get retried up to 3 attempts total. Permanent
+    # failures (model='failed_persistent', set after 3 None results) stay
+    # in the exclusion set to prevent infinite retry loops on chunks the
+    # LLM cannot parse (e.g. mojibake conversation dumps, address-list
+    # emails, multi-language insurance tables — see indagine 2026-05-25).
     extracted = set()
     if os.path.exists(FACTS_DB_PATH):
         conn = sqlite3.connect(f"file:{FACTS_DB_PATH}?mode=ro", uri=True)
-        for r in conn.execute("SELECT chunk_id FROM extraction_log"):
+        for r in conn.execute(
+            "SELECT chunk_id FROM extraction_log "
+            "WHERE model = 'failed_persistent' OR model NOT LIKE 'failed_%'"
+        ):
             extracted.add(r[0])
         conn.close()
 
@@ -454,6 +462,25 @@ async def main():
             if result is None or result == "RATE_LIMITED":
                 errors += 1
                 processed += 1
+                # Track persistent None failures: bump fail counter (stored as
+                # negative facts_count). After 3 consecutive None results,
+                # mark as 'failed_persistent' to stop the infinite retry loop.
+                # See indagine 2026-05-25 — 17 chunks were retried every night
+                # for weeks, all returning None from Claude Haiku.
+                if facts_conn and result is None:
+                    cur = facts_conn.cursor()
+                    row = cur.execute(
+                        "SELECT facts_count FROM extraction_log WHERE chunk_id = ?",
+                        (chunk["id"],)
+                    ).fetchone()
+                    prev = row[0] if row and row[0] < 0 else 0
+                    new_count = prev - 1
+                    new_model = "failed_persistent" if new_count <= -3 else f"failed_{abs(new_count)}"
+                    cur.execute(
+                        "INSERT OR REPLACE INTO extraction_log "
+                        "(chunk_id, facts_count, model, extracted_at) VALUES (?, ?, ?, ?)",
+                        (chunk["id"], new_count, new_model, now_str)
+                    )
                 continue
 
             manager.mark_success()
