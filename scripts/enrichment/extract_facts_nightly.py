@@ -115,6 +115,9 @@ def _parse_facts_json(content):
 # is preserved temporarily to avoid expanding test surface in the
 # v1.2.3.x cost-leak fix PR. Migration tracked in
 # docs/v1.2.4_resume_state.md "v1.2.5 backlog".
+NONE_CONSECUTIVE_THRESHOLD = 3  # rotate backend after this many consecutive None responses
+
+
 class BackendManager:
     """Gestisce la rotazione tra backend con tracking dei rate limit."""
 
@@ -129,7 +132,8 @@ class BackendManager:
                 self.backends.append({
                     "name": provider, "model": model, "calls": 0,
                     "limit": DAILY_LIMIT_PER_BACKEND, "exhausted": False,
-                    "workers": bcfg.get("workers", 5)
+                    "workers": bcfg.get("workers", 5),
+                    "none_consecutive": 0,
                 })
             else:
                 print(f"  ⚠️  Skipping {provider}/{model} — no API key found")
@@ -147,6 +151,7 @@ class BackendManager:
     def mark_success(self):
         b = self.backends[self.current_idx]
         b["calls"] += 1
+        b["none_consecutive"] = 0  # reset None streak
         if b["calls"] >= b["limit"]:
             b["exhausted"] = True
             print(f"  ⚠️  {b['name']} ha raggiunto il limite di {b['limit']} call. Switching...")
@@ -155,8 +160,34 @@ class BackendManager:
     def mark_rate_limited(self):
         b = self.backends[self.current_idx]
         b["exhausted"] = True
+        b["none_consecutive"] = 0  # reset (rate limit is orthogonal to parse-fail)
         print(f"  ⚠️  {b['name']} rate limited (429). Switching...")
         self.current_idx = (self.current_idx + 1) % len(self.backends)
+
+    def mark_none(self):
+        """Record a None response from current backend. After
+        NONE_CONSECUTIVE_THRESHOLD consecutive None responses, rotate
+        to the next backend (without exhausting current — backend may
+        recover later). Returns True if rotation occurred.
+
+        Rationale: a backend that returns None on N successive chunks
+        is likely in a transient degraded state (timeout, malformed
+        responses, content filter triggers) or fundamentally unable to
+        parse the chunk pattern. Either way, trying the next backend
+        is cheap and may succeed (see indagine 2026-05-25: 17 chunks
+        permanently failing on anthropic without ever being attempted
+        on gemini/openai)."""
+        b = self.backends[self.current_idx]
+        b["none_consecutive"] = b.get("none_consecutive", 0) + 1
+        if b["none_consecutive"] >= NONE_CONSECUTIVE_THRESHOLD:
+            print(
+                f"  🔄 {b['name']} returned None {b['none_consecutive']}× consecutive — rotating",
+                flush=True,
+            )
+            b["none_consecutive"] = 0  # reset counter so next rotation tracks fresh streak
+            self.current_idx = (self.current_idx + 1) % len(self.backends)
+            return True
+        return False
 
     def all_exhausted(self):
         return all(b["exhausted"] for b in self.backends)
@@ -481,6 +512,19 @@ async def main():
                         "(chunk_id, facts_count, model, extracted_at) VALUES (?, ?, ?, ?)",
                         (chunk["id"], new_count, new_model, now_str)
                     )
+                # Backend rotation on N consecutive None: try a different
+                # provider on the next chunk. May recover transient backend
+                # degradation OR succeed where the previous backend's parser
+                # cannot handle the chunk pattern.
+                if result is None:
+                    if manager.mark_none():
+                        backend = manager.current()
+                        if backend and args.workers <= 0:
+                            nw = manager.current_workers()
+                            if nw != current_worker_count:
+                                semaphore = asyncio.Semaphore(nw)
+                                current_worker_count = nw
+                                print(f"  Workers: {nw} (auto-tuned for {backend['name']})")
                 continue
 
             manager.mark_success()
