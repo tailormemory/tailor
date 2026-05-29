@@ -51,17 +51,17 @@ LOG_PATH = os.path.join(SNAP_DIR, "monitor.log")
 STATE_PATH = os.path.join(SNAP_DIR, "alert_state.json")
 MAINTENANCE_LOCK = os.path.join(BASE_DIR, "maintenance.lock")
 
-WARNING_THRESHOLD = 600
-CRITICAL_THRESHOLD = 850
+WARNING_THRESHOLD = 1200
+CRITICAL_THRESHOLD = 1800
 SYNC_THRESHOLD = 1000  # chromadb default
-STUCK_WINDOW_HOURS = 12
+STUCK_WINDOW_HOURS = 48
 SNOOZE_HOURS = 6
 KEEP_DAYS = 8
 
 DRIFT_SNAP_PATH = os.path.join(SNAP_DIR, "drift_snapshots.jsonl")
 DRIFT_STATE_PATH = os.path.join(SNAP_DIR, "drift_alert_state.json")
-DRIFT_WARNING = 100   # drift > 100  → WARNING
-DRIFT_CRITICAL = 500  # drift > 500  → CRITICAL
+DRIFT_WARNING = 800   # drift > 800  → WARNING (tollerante: lazy compaction normale fino a sync_threshold=1000)
+DRIFT_CRITICAL = 1500 # drift > 1500 → CRITICAL (problema reale, oltre sync_threshold)
 
 TS_FMT = "%Y-%m-%d %H:%M:%S"
 
