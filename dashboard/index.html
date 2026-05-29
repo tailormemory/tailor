@@ -1022,7 +1022,7 @@
         ),
         stats && (() => {
           const coverage = stats.chunks.total > 0 ? Math.min(Math.round((stats.facts.covered / stats.chunks.total) * 100), 100) : 0;
-          const isHealthMode = coverage >= 95;
+          const isHealthMode = coverage >= 90;
           const factsPerChunk = stats.facts.covered > 0 ? (stats.facts.extracted / stats.facts.covered).toFixed(1) : "—";
           const supersededPct = stats.facts.total > 0 ? ((stats.facts.superseded / stats.facts.total) * 100).toFixed(2) : "0";
           const derivedPct = stats.facts.total > 0 ? ((stats.facts.derived / stats.facts.total) * 100).toFixed(1) : "0";
