@@ -80,6 +80,13 @@ def _call_system_status(args: dict) -> str:
         superseded = cur.fetchone()[0]
         cur.execute("SELECT COUNT(DISTINCT chunk_id) FROM facts")
         chunks_covered = cur.fetchone()[0]
+        # Chunks that can never yield facts — excluded from coverage denominator
+        # (near-empty grids, code-heavy, LLM-unparseable).
+        cur.execute(
+            "SELECT COUNT(*) FROM extraction_log "
+            "WHERE model IN ('skipped_empty', 'skipped_code', 'failed_persistent')"
+        )
+        excluded = cur.fetchone()[0]
         conn.close()
 
         conn2 = sqlite3.connect(os.path.join(base, "db", "entity_index.sqlite3"))
@@ -94,8 +101,9 @@ def _call_system_status(args: dict) -> str:
         except Exception:
             total_chunks = 0
 
-        coverage_pct = round(chunks_covered / total_chunks * 100, 1) if total_chunks > 0 else 0
-        remaining = total_chunks - chunks_covered
+        coverable = max(0, total_chunks - excluded)
+        coverage_pct = round(chunks_covered / coverable * 100, 1) if coverable > 0 else 0
+        remaining = coverable - chunks_covered
         nights_est = max(1, round(remaining / 2500)) if remaining > 0 else 0
 
         result["fact_extraction"] = {
@@ -103,6 +111,8 @@ def _call_system_status(args: dict) -> str:
             "superseded": superseded,
             "chunks_covered": chunks_covered,
             "total_chunks": total_chunks,
+            "coverable_chunks": coverable,
+            "excluded_chunks": excluded,
             "coverage_percent": coverage_pct,
             "chunks_remaining": remaining,
             "estimated_nights_to_complete": nights_est,

@@ -302,6 +302,17 @@ def is_code_heavy(text, threshold=0.6):
     return (code_lines / len(lines)) > threshold
 
 
+def is_empty_chunk(text, threshold=0.05):
+    """Returns True if the chunk is almost entirely non-alphanumeric:
+    empty spreadsheet grids serialized as '| | | |', separator/whitespace
+    noise. No extractable facts. See /tmp/document_zero_facts_analysis.md
+    (2026-05-29): 91.3% of document zero-facts chunks have alnum ratio
+    <5%, dominated by sparse xlsx grids (BP 2WATCH INVESTORS.xlsx etc)."""
+    if not text:
+        return True
+    return sum(c.isalnum() for c in text) / max(len(text), 1) < threshold
+
+
 def load_chunks(limit=20000):
     # Already-extracted chunks. Exclude transient failures (model='failed_1',
     # 'failed_2') so they get retried up to 3 attempts total. Permanent
@@ -333,10 +344,15 @@ def load_chunks(limit=20000):
     """)
     chunks = []
     skipped_code = []
+    skipped_empty = []
     for eid, text, date, source in cur.fetchall():
         if eid in extracted:
             continue
         if not text or len(text.strip()) < 50:
+            continue
+        # Skip near-empty chunks (sparse xlsx grids, separator-only) — no facts
+        if is_empty_chunk(text):
+            skipped_empty.append(eid)
             continue
         # Skip pure code/markup chunks (>60% code lines — no useful facts)
         if is_code_heavy(text):
@@ -347,8 +363,9 @@ def load_chunks(limit=20000):
             break
     conn.close()
 
-    # Mark skipped code chunks in extraction_log so they're not retried
-    if skipped_code and os.path.exists(FACTS_DB_PATH):
+    # Mark skipped chunks (code-heavy + near-empty) in extraction_log so they're
+    # not retried and are excluded from the coverage denominator.
+    if (skipped_code or skipped_empty) and os.path.exists(FACTS_DB_PATH):
         fconn = sqlite3.connect(FACTS_DB_PATH, timeout=30)
         fconn.execute("PRAGMA journal_mode=WAL")
         now_str = datetime.now().isoformat()
@@ -357,10 +374,17 @@ def load_chunks(limit=20000):
                 "INSERT OR IGNORE INTO extraction_log (chunk_id, model, facts_count, extracted_at) VALUES (?, ?, ?, ?)",
                 (cid, "skipped_code", 0, now_str)
             )
+        for cid in skipped_empty:
+            fconn.execute(
+                "INSERT OR IGNORE INTO extraction_log (chunk_id, model, facts_count, extracted_at) VALUES (?, ?, ?, ?)",
+                (cid, "skipped_empty", 0, now_str)
+            )
         fconn.commit()
         fconn.close()
         if skipped_code:
             print(f"  Skipped {len(skipped_code):,} code-heavy chunks (marked in extraction_log)")
+        if skipped_empty:
+            print(f"  Skipped {len(skipped_empty):,} near-empty chunks (marked in extraction_log)")
 
     return chunks
 

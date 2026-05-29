@@ -1021,7 +1021,8 @@
           React.createElement(Tile, null, React.createElement(BigNum, { value: stats?.db_size_mb ? `${(stats.db_size_mb / 1000).toFixed(1)}` : null, label: "Database", unit: "GB" }))
         ),
         stats && (() => {
-          const coverage = stats.chunks.total > 0 ? Math.min(Math.round((stats.facts.covered / stats.chunks.total) * 100), 100) : 0;
+          const denom = (stats.facts.coverable && stats.facts.coverable > 0) ? stats.facts.coverable : stats.chunks.total;
+          const coverage = denom > 0 ? Math.min(Math.round((stats.facts.covered / denom) * 100), 100) : 0;
           const isHealthMode = coverage >= 90;
           const factsPerChunk = stats.facts.covered > 0 ? (stats.facts.extracted / stats.facts.covered).toFixed(1) : "—";
           const supersededPct = stats.facts.total > 0 ? ((stats.facts.superseded / stats.facts.total) * 100).toFixed(2) : "0";
@@ -1053,13 +1054,13 @@
           }
 
           // Extraction progress mode (< 95%)
-          const remaining = Math.max(0, stats.chunks.total - stats.facts.covered);
+          const remaining = Math.max(0, denom - stats.facts.covered);
           return React.createElement(Tile, null,
             React.createElement("div", { className: "flex items-center justify-between mb-3" },
               React.createElement("h3", { className: cl("text-sm font-semibold", t.text) }, "\u{1F9E0} Fact Extraction Progress"),
               React.createElement("span", { className: cl("text-sm", t.textMuted) }, `${coverage}% coverage`)
             ),
-            React.createElement(ProgressBar, { value: stats.facts.covered, max: stats.chunks.total }),
+            React.createElement(ProgressBar, { value: stats.facts.covered, max: denom }),
             React.createElement("div", { className: "flex justify-between mt-2 text-sm" },
               React.createElement("span", { className: t.textFaint }, `${stats.facts.covered.toLocaleString()} chunks processed`),
               React.createElement("span", { className: t.textFaint }, `${remaining.toLocaleString()} chunks remaining`)
