@@ -532,7 +532,7 @@ def handle_drift(args: argparse.Namespace, queue_snap: dict | None) -> int:
             mdelta = r["meta_seq"] - last["meta_seq"]
         else:
             vdelta = mdelta = None
-        stuck_vector = (vdelta == 0 and mdelta is not None and mdelta > 0)
+        stuck_vector = (vdelta == 0 and mdelta is not None and mdelta > 0 and r["drift"] > DRIFT_WARNING)
         level = classify_drift(r["drift"])
         if level == "CRITICAL":
             status = "CRITICAL"
