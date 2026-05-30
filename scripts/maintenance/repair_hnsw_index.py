@@ -13,12 +13,21 @@ Usage:
   python scripts/maintenance/repair_hnsw_index.py            # audit (default)
   python scripts/maintenance/repair_hnsw_index.py --audit    # explicit
   python scripts/maintenance/repair_hnsw_index.py --apply    # repair (mutates)
+  python scripts/maintenance/repair_hnsw_index.py --flush-queue-backlog
+                                                               # force HNSW flush (mutates)
   python scripts/maintenance/repair_hnsw_index.py --json     # machine output
 
 Audit is read-only and side-effect-free except for an audit-history JSON
 file under logs/hnsw_audits/ and (optionally) a row in maintenance_log.
 Apply requires the MCP to be in maintenance mode (SIGUSR1 already issued)
 and a backup taken within the last 60 minutes.
+
+`--flush-queue-backlog` is a targeted workaround for chromadb 1.5.9
+chroma-core/chroma#6975: PersistentLocalHnswSegment only persists after
+`hnsw:sync_threshold` cumulative writes. Queries and nightly reads do not
+force the flush. The 2026-05-30 live incident confirmed drift 821 -> 21
+after an idempotent burst, while `--apply` was a no-op because all lagging
+ids were still in embeddings_queue rather than SQL-only orphans.
 
 Restart-aware: when a previous audit JSON exists from <2h ago, the report
 includes a delta section so race-induced drift around an MCP restart is
@@ -54,6 +63,9 @@ UPSERT_BATCH_SIZE = 10
 MAX_TEXT_CHARS = 4000  # mirrors ingest_docs.py
 DELTA_WINDOW_SECONDS = 7200  # 2 hours
 BACKUP_MAX_AGE_SECONDS = 3600  # 60 minutes
+DRIFT_WARNING = 800
+FLUSH_BURST_MARGIN = 100
+DEFAULT_HNSW_SYNC_THRESHOLD = 1000
 
 
 # ============================================================
@@ -165,6 +177,94 @@ def _load_segment_ids(con: sqlite3.Connection, collection_name: str = COLLECTION
             f"Could not locate METADATA and VECTOR segments for collection '{collection_name}'"
         )
     return meta_row[0], vec_row[0]
+
+
+def _load_collection_id(con: sqlite3.Connection, collection_name: str = COLLECTION_NAME) -> str:
+    cur = con.cursor()
+    cur.execute("SELECT id FROM collections WHERE name = ?", (collection_name,))
+    row = cur.fetchone()
+    if not row:
+        raise RuntimeError(f"Could not locate collection '{collection_name}'")
+    return row[0]
+
+
+def _decode_seq_id(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    return int(value)
+
+
+def _load_segment_seq(con: sqlite3.Connection, segment_id: str) -> int:
+    cur = con.cursor()
+    cur.execute("SELECT seq_id FROM max_seq_id WHERE segment_id = ?", (segment_id,))
+    row = cur.fetchone()
+    return _decode_seq_id(row[0]) if row else 0
+
+
+def _load_seq_state(
+    con: sqlite3.Connection,
+    *,
+    collection_name: str = COLLECTION_NAME,
+) -> dict[str, Any]:
+    collection_id = _load_collection_id(con, collection_name)
+    meta_seg, vec_seg = _load_segment_ids(con, collection_name)
+    vector_seq = _load_segment_seq(con, vec_seg)
+    metadata_seq = _load_segment_seq(con, meta_seg)
+    return {
+        "collection_id": collection_id,
+        "metadata_segment": meta_seg,
+        "vector_segment": vec_seg,
+        "vector_seq": vector_seq,
+        "metadata_seq": metadata_seq,
+        "drift": metadata_seq - vector_seq,
+    }
+
+
+def _load_hnsw_sync_threshold(
+    con: sqlite3.Connection,
+    *,
+    collection_id: str,
+    vector_segment: str,
+) -> int:
+    """Return hnsw:sync_threshold, falling back to Chroma's 1.x default.
+
+    Collection-level metadata is checked first because Tailor creates
+    collections through Chroma's public API. Segment metadata is kept as a
+    fallback for schema/version differences.
+    """
+    cur = con.cursor()
+    for table, id_col, id_value in (
+        ("collection_metadata", "collection_id", collection_id),
+        ("segment_metadata", "segment_id", vector_segment),
+    ):
+        try:
+            cur.execute(
+                f"SELECT int_value FROM {table} WHERE {id_col} = ? AND key = ?",
+                (id_value, "hnsw:sync_threshold"),
+            )
+            row = cur.fetchone()
+        except sqlite3.OperationalError:
+            row = None
+        if row and row[0] is not None:
+            return int(row[0])
+    return DEFAULT_HNSW_SYNC_THRESHOLD
+
+
+def _load_existing_embedding_ids(con: sqlite3.Connection, meta_seg: str, limit: int) -> list[str]:
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT embedding_id
+        FROM embeddings
+        WHERE segment_id = ?
+        ORDER BY id
+        LIMIT ?
+        """,
+        (meta_seg, limit),
+    )
+    return [row[0] for row in cur.fetchall()]
 
 
 def _resolve_hnsw_pickle_path(db_path: str, db_dir: str) -> str | None:
@@ -800,6 +900,90 @@ def repair(
 
 
 # ============================================================
+# FLUSH QUEUE BACKLOG (--flush-queue-backlog)
+# ============================================================
+
+
+class OllamaNomicEmbeddingFunction:
+    """Explicit Chroma embedding function for the #6975 flush path.
+
+    ChromaDB 1.5.9 validates embedding function names on `get_collection()`.
+    Tailor's collection was persisted with the name "default", so this class
+    deliberately reports that name while routing calls through
+    scripts/lib/embedding.py (Ollama nomic-embed-text, 768d). This mirrors the
+    2026-05-30 live burst prototype that resolved drift 821 -> 21.
+    """
+
+    def __init__(self, embed_fn) -> None:
+        self._embed_fn = embed_fn
+
+    def name(self) -> str:
+        return "default"
+
+    def __call__(self, input: list[str]) -> list[list[float]]:
+        embeddings = self._embed_fn(list(input))
+        for i, embedding in enumerate(embeddings):
+            if len(embedding) != 768:
+                raise ValueError(f"embedding[{i}] has {len(embedding)} dims, expected 768")
+        return embeddings
+
+
+def flush_queue_backlog(
+    *,
+    collection,
+    chunk_ids: list[str],
+    progress=None,
+) -> dict[str, Any]:
+    """Force ChromaDB 1.5.9 to persist HNSW by idempotent re-upserts.
+
+    This is the targeted workaround for chroma-core/chroma#6975 when SQL and
+    HNSW are both logically healthy (no orphans/ghosts), but VECTOR max_seq_id
+    is stuck behind METADATA because pending WAL rows remain in
+    embeddings_queue. Each write reuses the currently stored document and
+    metadata for an existing chunk id, so the operation is semantically a no-op
+    while still bumping Chroma's internal HNSW write counter.
+
+    This mode is more conservative than the 2026-05-30 manual burst, which ran
+    with MCP up. It requires maintenance mode to avoid the chromadb 1.5.8
+    SIGSEGV race condition documented in
+    [[project_chromadb_1_5_8_segfault_race_condition]].
+    """
+    processed = 0
+    skipped = 0
+    errors = 0
+
+    for chunk_id in chunk_ids:
+        try:
+            fetched = collection.get(ids=[chunk_id], include=["documents", "metadatas"])
+            ids = fetched.get("ids") or []
+            if not ids:
+                skipped += 1
+                print(f"[flush-queue-backlog] skip missing id: {chunk_id}", file=sys.stderr)
+                continue
+
+            documents = fetched.get("documents") or [""]
+            metadatas = fetched.get("metadatas") or [{}]
+            collection.upsert(
+                ids=[ids[0]],
+                documents=[documents[0]],
+                metadatas=[metadatas[0]],
+            )
+            processed += 1
+            if progress and processed % 100 == 0:
+                progress(processed, len(chunk_ids), skipped, errors)
+        except Exception as e:
+            errors += 1
+            print(f"[flush-queue-backlog] error {chunk_id}: {type(e).__name__}: {e}", file=sys.stderr)
+
+    return {
+        "processed": processed,
+        "skipped": skipped,
+        "errors": errors,
+        "candidate_ids": len(chunk_ids),
+    }
+
+
+# ============================================================
 # CLI ENTRY
 # ============================================================
 
@@ -809,6 +993,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--audit", action="store_true", help="Read-only diagnosis (default)")
     mode.add_argument("--apply", action="store_true", help="Repair SQL-only orphans (mutates)")
+    mode.add_argument(
+        "--flush-queue-backlog",
+        action="store_true",
+        help="Force a ChromaDB #6975 HNSW flush when backlog is still in embeddings_queue (mutates)",
+    )
     p.add_argument("--prune-hnsw-ghosts", action="store_true",
                    help="Remove HNSW-only ghosts (NOT IMPLEMENTED — see docs)")
     p.add_argument("--json", action="store_true", help="Emit JSON instead of human-readable")
@@ -833,6 +1022,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     apply_mode = args.apply
+    flush_mode = args.flush_queue_backlog
 
     # Audit always runs first
     report = audit()
@@ -851,6 +1041,8 @@ def main(argv: list[str] | None = None) -> int:
         }
         if apply_mode:
             out["apply_attempted"] = True
+        if flush_mode:
+            out["flush_queue_backlog_attempted"] = True
         print(json.dumps(out, indent=2, default=str))
     else:
         print(format_report_human(report, delta))
@@ -867,13 +1059,14 @@ def main(argv: list[str] | None = None) -> int:
         if not args.json:
             print(f"\n[warn] could not write maintenance_log row: {e}", file=sys.stderr)
 
-    if not apply_mode:
+    if not apply_mode and not flush_mode:
         return 0 if report.is_clean() else 1
 
-    # ----- APPLY MODE -----
+    # ----- MUTATING MODES -----
     if not is_in_maintenance_mode():
+        mode_name = "--flush-queue-backlog" if flush_mode else "--apply"
         msg = (
-            f"\nREFUSING --apply: MCP is not in maintenance mode "
+            f"\nREFUSING {mode_name}: MCP is not in maintenance mode "
             f"(no lock at {MAINTENANCE_LOCK}).\n"
             f"  To enter maintenance mode: kill -USR1 <mcp_pid>\n"
             f"  To exit:                   kill -USR2 <mcp_pid>"
@@ -885,8 +1078,9 @@ def main(argv: list[str] | None = None) -> int:
 
     backup = find_recent_backup()
     if not backup:
+        mode_name = "--flush-queue-backlog" if flush_mode else "--apply"
         msg = (
-            f"\nREFUSING --apply: no recent backup (<{BACKUP_MAX_AGE_SECONDS // 60} min) found in\n"
+            f"\nREFUSING {mode_name}: no recent backup (<{BACKUP_MAX_AGE_SECONDS // 60} min) found in\n"
             f"  {BACKUPS_DIR}/chroma_*.sqlite3.gz  or\n"
             f"  {DB_DIR}/chroma.sqlite3.backup.*\n"
             f"  Take a backup first: bash scripts/maintenance/backup_db.sh"
@@ -896,6 +1090,155 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"error": "no_recent_backup"}))
         return 3
 
+    if flush_mode:
+        if report.sql_only_count or report.hnsw_only_count or report.has_unknowns():
+            msg = (
+                f"\nREFUSING --flush-queue-backlog: this mode only handles clean #6975 queue backlog.\n"
+                f"  sql_only_orphans={report.sql_only_count}, "
+                f"hnsw_only_ghosts={report.hnsw_only_count}, unknown={report.unknown_count}\n"
+                f"  Use --apply for SQL-only orphans, or investigate ghosts/unknowns first."
+            )
+            _print(msg, args.json)
+            if args.json:
+                print(json.dumps({
+                    "error": "not_clean_queue_backlog",
+                    "sql_only_count": report.sql_only_count,
+                    "hnsw_only_count": report.hnsw_only_count,
+                    "unknown_count": report.unknown_count,
+                }))
+            return 4
+
+        con = _open_sqlite_ro(DB_PATH)
+        try:
+            pre_seq = _load_seq_state(con)
+            sync_threshold = _load_hnsw_sync_threshold(
+                con,
+                collection_id=pre_seq["collection_id"],
+                vector_segment=pre_seq["vector_segment"],
+            )
+            burst_n = max(sync_threshold + FLUSH_BURST_MARGIN, pre_seq["drift"] + FLUSH_BURST_MARGIN)
+            chunk_ids = _load_existing_embedding_ids(con, pre_seq["metadata_segment"], burst_n)
+        finally:
+            con.close()
+
+        if pre_seq["drift"] < DRIFT_WARNING:
+            msg = (
+                f"\nWARNING --flush-queue-backlog not needed: drift={pre_seq['drift']} "
+                f"is below WARNING={DRIFT_WARNING}."
+            )
+            _print(msg, args.json)
+            if args.json:
+                print(json.dumps({
+                    "flush_queue_backlog": {"skipped": True, "reason": "drift_below_warning"},
+                    "pre": pre_seq,
+                    "drift_warning": DRIFT_WARNING,
+                }, indent=2))
+            return 0
+
+        if report.queue_total == 0:
+            msg = (
+                f"\nREFUSING --flush-queue-backlog: drift={pre_seq['drift']} but embeddings_queue is empty. "
+                f"This does not match the chromadb#6975 queue-backlog pattern."
+            )
+            _print(msg, args.json)
+            if args.json:
+                print(json.dumps({"error": "queue_empty", "pre": pre_seq}, indent=2))
+            return 4
+
+        # Lazy imports — only needed for the mutating Chroma flush path.
+        sys.path.insert(0, os.path.join(BASE_DIR, "scripts", "lib"))
+        import chromadb  # noqa: E402
+        from embedding import get_embeddings, info as embedding_info  # noqa: E402
+
+        client = chromadb.PersistentClient(path=DB_DIR)
+        collection = client.get_collection(
+            name=COLLECTION_NAME,
+            embedding_function=OllamaNomicEmbeddingFunction(get_embeddings),
+        )
+
+        def _flush_progress(done: int, total: int, skipped: int, errors: int) -> None:
+            if not args.json:
+                print(f"  flush upsert {done}/{total} skipped={skipped} errors={errors}", flush=True)
+
+        _print(
+            f"\nFlushing queue backlog via {len(chunk_ids)} idempotent re-upserts "
+            f"(target={burst_n}, sync_threshold={sync_threshold}, drift={pre_seq['drift']})...",
+            args.json,
+        )
+        result = flush_queue_backlog(
+            collection=collection,
+            chunk_ids=chunk_ids,
+            progress=_flush_progress,
+        )
+
+        con = _open_sqlite_ro(DB_PATH)
+        try:
+            post_seq = _load_seq_state(con)
+        finally:
+            con.close()
+        post_report = audit()
+        vector_delta = post_seq["vector_seq"] - pre_seq["vector_seq"]
+        success = vector_delta >= sync_threshold and post_seq["drift"] < DRIFT_WARNING
+
+        try:
+            con = _open_sqlite_rw(DB_PATH)
+            try:
+                _ensure_maintenance_log_row(
+                    con,
+                    mode="flush_queue_backlog",
+                    report=report,
+                    action=(
+                        f"chromadb#6975 flush burst: processed {result['processed']} "
+                        f"of {result['candidate_ids']} candidate ids"
+                    ),
+                    extra={
+                        "backup_used": os.path.basename(backup),
+                        "issue": "chroma-core/chroma#6975",
+                        "session_reference": "2026-05-30 drift 821->21 via idempotent burst",
+                        "embedding": embedding_info(),
+                        "sync_threshold": sync_threshold,
+                        "drift_warning": DRIFT_WARNING,
+                        "burst_target": burst_n,
+                        "pre_seq": pre_seq,
+                        "post_seq": post_seq,
+                        "vector_seq_delta": vector_delta,
+                        "post_queue_total": post_report.queue_total,
+                        "result": result,
+                        "success": success,
+                    },
+                )
+            finally:
+                con.close()
+        except Exception as e:
+            if not args.json:
+                print(f"\n[warn] could not write maintenance_log row: {e}", file=sys.stderr)
+
+        if args.json:
+            print(json.dumps({
+                "flush_queue_backlog": result,
+                "pre": pre_seq,
+                "post": post_seq,
+                "sync_threshold": sync_threshold,
+                "drift_warning": DRIFT_WARNING,
+                "burst_target": burst_n,
+                "vector_seq_delta": vector_delta,
+                "post_queue_total": post_report.queue_total,
+                "success": success,
+            }, indent=2, default=str))
+        else:
+            print(f"\nFlush result: {result}")
+            print(f"Vector seq: {pre_seq['vector_seq']} -> {post_seq['vector_seq']} ({vector_delta:+d})")
+            print(f"Metadata seq: {pre_seq['metadata_seq']} -> {post_seq['metadata_seq']}")
+            print(f"Drift: {pre_seq['drift']} -> {post_seq['drift']} (WARNING={DRIFT_WARNING})")
+            print(f"Queue: {report.queue_total} -> {post_report.queue_total}")
+            if success:
+                print("OK — HNSW backlog flushed below warning.")
+            else:
+                print("WARN — flush did not meet success criteria. Investigate before retrying.")
+
+        return 0 if success else 5
+
+    # ----- APPLY MODE -----
     if report.has_unknowns():
         msg = (
             f"\nREFUSING --apply: {report.unknown_count} unknown drift entries found.\n"
