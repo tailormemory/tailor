@@ -174,7 +174,7 @@ def _log_paddle_fallback(filepath, reason, error, events):
 
     logger = logging.getLogger(__name__)
     try:
-        log_dir = _Path("/Users/jarvis/tailor/logs")
+        log_dir = _Path(os.environ.get("TAILOR_HOME", os.path.expanduser("~/tailor"))) / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / f"paddle_fallback_{datetime.now().strftime('%Y%m%d')}.json"
 

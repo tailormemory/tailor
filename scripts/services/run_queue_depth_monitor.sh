@@ -3,7 +3,7 @@
 # Loads /etc/tailor/env (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID).
 set -euo pipefail
 
-TAILOR_DIR="/Users/jarvis/tailor"
+TAILOR_DIR="${TAILOR_HOME:-$HOME/tailor}"
 ENV_FILE="/etc/tailor/env"
 
 if [ ! -r "$ENV_FILE" ]; then

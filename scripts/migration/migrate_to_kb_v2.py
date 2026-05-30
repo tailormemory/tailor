@@ -11,12 +11,13 @@ Esecuzione: ~/tailor/.venv/bin/python ~/tailor/scripts/migration/migrate_to_kb_v
 """
 import chromadb, json, time, os, sys
 
-DB = "/Users/jarvis/tailor/db"
+TAILOR_HOME = os.environ.get("TAILOR_HOME", os.path.expanduser("~/tailor"))
+DB = f"{TAILOR_HOME}/db"
 SRC_NAME = "tailor_kb"
 DST_NAME = "tailor_kb_v2"
 BATCH = 500
 PROGRESS_FILE = "/tmp/migrate_kb_v2_progress.json"
-LOG_FILE = f"/Users/jarvis/tailor/logs/migration_kb_v2_{time.strftime('%Y%m%d_%H%M%S')}.log"
+LOG_FILE = f"{TAILOR_HOME}/logs/migration_kb_v2_{time.strftime('%Y%m%d_%H%M%S')}.log"
 
 def log(msg):
     line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"

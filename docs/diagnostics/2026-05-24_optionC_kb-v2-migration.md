@@ -105,7 +105,7 @@ Tutti i 5 file Python: AST syntax check **ok**. YAML `safe_load`: **ok**.
 
 | Test | Esito |
 |---|---|
-| dashboard `https://jarvis.carlucci.io/` hard-refresh | ✅ counter popolati ~158,396 (operatore conferma) |
+| dashboard `https://your-tunnel.example.com/` hard-refresh | ✅ counter popolati ~158,396 (operatore conferma) |
 | Chrome extension → Test Connection | ✅ verde (operatore conferma) |
 | Capture write end-to-end Chrome → MCP | ✅ stdout mostra `POST /api/ingest-live → 200 OK`, embeddings 158,396 → 158,397 (+1) |
 | Telegram bot ping | ✅ risponde (operatore conferma) |
