@@ -29,6 +29,18 @@ force the flush. The 2026-05-30 live incident confirmed drift 821 -> 21
 after an idempotent burst, while `--apply` was a no-op because all lagging
 ids were still in embeddings_queue rather than SQL-only orphans.
 
+A plain restart does NOT drain the backlog: at boot the segment loads its
+persisted pickle at the old max_seq_id and only persists again past
+`hnsw:sync_threshold` or on a *clean* shutdown (`System.stop()`/atexit). A
+`launchctl kickstart -k` (SIGKILL) skips that clean shutdown entirely, so the
+queue survives the restart untouched. Only a threshold-crossing burst (this
+mode) or a graceful shutdown drains it.
+
+Actionability is therefore gated on EITHER seq-drift >= DRIFT_WARNING OR a
+queue backlog >= FLUSH_QUEUE_BACKLOG_MIN (configurable via
+--queue-backlog-min): a large #6975 backlog is worth flushing even when
+seq-drift alone is still below WARNING.
+
 Restart-aware: when a previous audit JSON exists from <2h ago, the report
 includes a delta section so race-induced drift around an MCP restart is
 visible.
@@ -66,6 +78,10 @@ BACKUP_MAX_AGE_SECONDS = 3600  # 60 minutes
 DRIFT_WARNING = 800
 FLUSH_BURST_MARGIN = 100
 DEFAULT_HNSW_SYNC_THRESHOLD = 1000
+# A clean #6975 backlog can be actionable even when seq-drift is below
+# DRIFT_WARNING: a large embeddings_queue that no plain restart drains is itself
+# a reason to flush. Conservative default; override with --queue-backlog-min.
+FLUSH_QUEUE_BACKLOG_MIN = 300
 
 
 # ============================================================
@@ -669,9 +685,11 @@ def format_report_human(report: DriftReport, delta: Delta | None = None) -> str:
         newest = report.queue_newest_iso or "?"
         lines.append(f"  {report.queue_total} pending ops, from {oldest} to {newest}")
         lines.append(f"  Vector segment max_seq_id is behind metadata segment by these ops.")
-        lines.append(f"  Will be consumed on next MCP restart.")
-        lines.append(f"  WARNING: queue consumption on restart may itself trigger drift if HNSW")
-        lines.append(f"  persist races with shutdown. Re-run audit after restart to verify.")
+        lines.append(f"  Drained only by a GRACEFUL shutdown (System.stop()/atexit persist) or a")
+        lines.append(f"  threshold-crossing burst (--flush-queue-backlog). A `kickstart -k`/SIGKILL")
+        lines.append(f"  restart does NOT drain it: boot reloads the old pickle and the backlog stays.")
+        lines.append(f"  WARNING: queue consumption may itself trigger drift if HNSW persist races")
+        lines.append(f"  with shutdown. Re-run audit after any restart/flush to verify.")
         lines.append("")
 
     lines.append("UNEXPECTED DRIFT TYPES:")
@@ -1000,6 +1018,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--prune-hnsw-ghosts", action="store_true",
                    help="Remove HNSW-only ghosts (NOT IMPLEMENTED — see docs)")
+    p.add_argument(
+        "--queue-backlog-min",
+        type=int,
+        default=FLUSH_QUEUE_BACKLOG_MIN,
+        metavar="N",
+        help=(
+            "Queue-backlog size that makes --flush-queue-backlog actionable even "
+            f"when seq-drift < DRIFT_WARNING (default {FLUSH_QUEUE_BACKLOG_MIN})"
+        ),
+    )
     p.add_argument("--json", action="store_true", help="Emit JSON instead of human-readable")
     p.add_argument("--no-history", action="store_true", help="Do not write audit history JSON")
     return p.parse_args(argv)
@@ -1121,19 +1149,29 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             con.close()
 
-        if pre_seq["drift"] < DRIFT_WARNING:
+        queue_backlog_min = args.queue_backlog_min
+        drift_actionable = pre_seq["drift"] >= DRIFT_WARNING
+        queue_actionable = report.queue_total >= queue_backlog_min
+        if not drift_actionable and not queue_actionable:
             msg = (
                 f"\nWARNING --flush-queue-backlog not needed: drift={pre_seq['drift']} "
-                f"is below WARNING={DRIFT_WARNING}."
+                f"is below WARNING={DRIFT_WARNING} and queue_total={report.queue_total} "
+                f"is below QUEUE_BACKLOG_MIN={queue_backlog_min}."
             )
             _print(msg, args.json)
             if args.json:
                 print(json.dumps({
-                    "flush_queue_backlog": {"skipped": True, "reason": "drift_below_warning"},
+                    "flush_queue_backlog": {
+                        "skipped": True,
+                        "reason": "below_drift_and_queue_thresholds",
+                    },
                     "pre": pre_seq,
                     "drift_warning": DRIFT_WARNING,
+                    "queue_total": report.queue_total,
+                    "queue_backlog_min": queue_backlog_min,
                 }, indent=2))
             return 0
+        flush_trigger = "drift" if drift_actionable else "queue_backlog"
 
         if report.queue_total == 0:
             msg = (
@@ -1178,7 +1216,11 @@ def main(argv: list[str] | None = None) -> int:
             con.close()
         post_report = audit()
         vector_delta = post_seq["vector_seq"] - pre_seq["vector_seq"]
-        success = vector_delta >= sync_threshold and post_seq["drift"] < DRIFT_WARNING
+        success = (
+            vector_delta >= sync_threshold
+            and post_seq["drift"] < DRIFT_WARNING
+            and post_report.queue_total < queue_backlog_min
+        )
 
         try:
             con = _open_sqlite_rw(DB_PATH)
@@ -1198,6 +1240,8 @@ def main(argv: list[str] | None = None) -> int:
                         "embedding": embedding_info(),
                         "sync_threshold": sync_threshold,
                         "drift_warning": DRIFT_WARNING,
+                        "queue_backlog_min": queue_backlog_min,
+                        "flush_trigger": flush_trigger,
                         "burst_target": burst_n,
                         "pre_seq": pre_seq,
                         "post_seq": post_seq,
@@ -1220,6 +1264,8 @@ def main(argv: list[str] | None = None) -> int:
                 "post": post_seq,
                 "sync_threshold": sync_threshold,
                 "drift_warning": DRIFT_WARNING,
+                "queue_backlog_min": queue_backlog_min,
+                "flush_trigger": flush_trigger,
                 "burst_target": burst_n,
                 "vector_seq_delta": vector_delta,
                 "post_queue_total": post_report.queue_total,
@@ -1227,6 +1273,8 @@ def main(argv: list[str] | None = None) -> int:
             }, indent=2, default=str))
         else:
             print(f"\nFlush result: {result}")
+            print(f"Trigger: {flush_trigger} (drift={pre_seq['drift']}/WARNING={DRIFT_WARNING}, "
+                  f"queue={report.queue_total}/MIN={queue_backlog_min})")
             print(f"Vector seq: {pre_seq['vector_seq']} -> {post_seq['vector_seq']} ({vector_delta:+d})")
             print(f"Metadata seq: {pre_seq['metadata_seq']} -> {post_seq['metadata_seq']}")
             print(f"Drift: {pre_seq['drift']} -> {post_seq['drift']} (WARNING={DRIFT_WARNING})")
