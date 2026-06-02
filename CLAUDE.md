@@ -145,13 +145,15 @@ Edit a backend/runtime richiedono restart (operatore-side, sezione 3):
 
 | Modifica a | Componente da restartare | Comando |
 |---|---|---|
-| `mcp_server.py` o `scripts/lib/*.py` (importati da MCP) | MCP server | `sudo launchctl kickstart -k system/com.tailor.mcp` |
+| `mcp_server.py` o `scripts/lib/*.py` (importati da MCP) | MCP server | `sudo launchctl kickstart system/com.tailor.mcp` (graceful, **senza `-k`**) |
 | `scripts/services/telegram_bot.py` | Telegram bot | `sudo launchctl kickstart -k system/com.tailor.telegram` |
 | `dashboard/index.html` o `dashboard/*.jsx` | nessuno | hard-refresh in browser (Cmd+Shift+R) |
 | `config/tailor.yaml` (campi runtime) | dipende dal campo, spesso MCP | come sopra |
 | `/etc/tailor/env` | TUTTI i daemon che lo source | restart per service |
 
 L'agente riporta il comando, non lo esegue.
+
+**MCP — restart graceful di default (no `-k`)**: `-k` manda SIGKILL e salta lo shutdown pulito (`System.stop()`/atexit), che è l'unico momento in cui chromadb persiste l'indice HNSW e drena `embeddings_queue` (bug chromadb #6975). Un `kickstart -k` lascia il backlog non drenato e può lasciare l'HNSW su disco indietro rispetto a SQL. Usare il restart **graceful** (senza `-k`). `-k` resta accettabile solo per daemon che non scrivono Chroma (es. `com.tailor.telegram`), o subito dopo un `--flush-queue-backlog` che ha già persistito su disco. Procedura completa drift/queue: [docs/runbooks/RUNBOOK_drift_alert.md](docs/runbooks/RUNBOOK_drift_alert.md).
 
 ---
 
