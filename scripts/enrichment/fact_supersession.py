@@ -72,10 +72,58 @@ When in doubt: INDEPENDENT."""
 
 
 # ============================================================
+# MEMOIZATION — verdetti già giudicati (fix #2)
+# ============================================================
+
+def ensure_judged_pairs_table(conn):
+    """Crea la tabella judged_pairs se non esiste (self-bootstrap).
+
+    Schema canonico in db/migrations/005_judged_pairs.sql.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS judged_pairs (
+            fact_id_a INTEGER NOT NULL,
+            fact_id_b INTEGER NOT NULL,
+            verdict   TEXT NOT NULL,
+            judged_at TEXT NOT NULL,
+            PRIMARY KEY (fact_id_a, fact_id_b)
+        )
+    """)
+    conn.commit()
+
+
+def load_judged_memo(conn):
+    """Carica i verdetti memoizzati in un dict {(id_a, id_b): judged_at}.
+
+    Chiave normalizzata (id_a < id_b). judged_at è full ISO timestamp,
+    confrontabile lessicograficamente con facts.created_at.
+    """
+    memo = {}
+    for a, b, judged_at in conn.execute(
+        "SELECT fact_id_a, fact_id_b, judged_at FROM judged_pairs"
+    ):
+        memo[(a, b)] = judged_at
+    return memo
+
+
+def memo_is_valid(memo, old_f, new_f):
+    """True se la coppia ha un verdetto cached ancora valido.
+
+    Valido iff entrambi i fatti sono immutati dal giudizio:
+    created_at di entrambi < judged_at. old_f ha l'id più basso.
+    """
+    key = (old_f["id"], new_f["id"])
+    judged_at = memo.get(key)
+    if judged_at is None:
+        return False
+    return (old_f["created_at"] < judged_at) and (new_f["created_at"] < judged_at)
+
+
+# ============================================================
 # FIND CANDIDATE PAIRS — scalabile
 # ============================================================
 
-def find_candidate_pairs(max_pairs=MAX_COMPARISONS):
+def find_candidate_pairs(max_pairs=MAX_COMPARISONS, memo=None):
     """Trova coppie di fatti candidati per supersession.
 
     Strategia:
@@ -83,7 +131,13 @@ def find_candidate_pairs(max_pairs=MAX_COMPARISONS):
     2. For each category, group by primary entity (first entity_tag)
     3. Within each group, compare textual similarity with SequenceMatcher
     4. Returns only pairs with similarity > threshold
+
+    Memoization (fix #2): se `memo` è fornito, le coppie con un verdetto cached
+    ancora valido vengono skippate — non consumano né `max_pairs` né
+    MAX_PAIRS_PER_CLUSTER, così il budget LLM resta riempito di sole coppie nuove.
     """
+    memo = memo or {}
+    skipped_memo = 0
     conn = sqlite3.connect(FACTS_DB_PATH, timeout=30)
     conn.execute('PRAGMA journal_mode=WAL')
     cur = conn.cursor()
@@ -173,6 +227,11 @@ def find_candidate_pairs(max_pairs=MAX_COMPARISONS):
                     # The fact with higher id is the "new" (more recent)
                     new_f = facts[j]
                     old_f = facts[i]
+                    # Skip se già giudicata e entrambi i fatti immutati (memo).
+                    # Non consuma budget né cluster cap: solo coppie nuove pesano.
+                    if memo_is_valid(memo, old_f, new_f):
+                        skipped_memo += 1
+                        continue
                     pairs.append((new_f, old_f, sim))
                     cluster_pairs_count += 1
                     if cluster_pairs_count >= MAX_PAIRS_PER_CLUSTER:
@@ -182,7 +241,8 @@ def find_candidate_pairs(max_pairs=MAX_COMPARISONS):
         if groups_checked % 1000 == 0:
             print(f"    ...{groups_checked:,} gruppi, {len(pairs):,} coppie")
 
-    print(f"  Coppie candidate: {len(pairs):,} ({groups_checked:,} cluster esplorati)")
+    print(f"  Coppie candidate: {len(pairs):,} ({groups_checked:,} cluster esplorati, "
+          f"{skipped_memo:,} skippate da memo)")
     return pairs
 
 
@@ -409,12 +469,30 @@ def show_stats():
     """)
     examples = cur.fetchall()
 
+    # Memoization stats (fix #2) — graceful se la tabella non esiste ancora
+    memo_total = memo_sup = memo_ind = None
+    try:
+        cur.execute("SELECT verdict, COUNT(*) FROM judged_pairs GROUP BY verdict")
+        by_verdict = dict(cur.fetchall())
+        memo_sup = by_verdict.get("SUPERSEDES", 0)
+        memo_ind = by_verdict.get("INDEPENDENT", 0)
+        memo_total = memo_sup + memo_ind
+    except sqlite3.OperationalError:
+        pass
+
     conn.close()
     print(f"\n📊 Fact Supersession Stats")
     print(f"{'─' * 50}")
     print(f"  Fatti totali:              {total:>8,}")
     print(f"  Fatti superati:            {superseded:>8,}")
     print(f"  Chunk con fatti superati:  {chunks_affected:>5,}")
+    if memo_total is not None:
+        # Hit-rate atteso a regime: ogni coppia memoizzata è una chiamata LLM
+        # risparmiata finché i due fatti restano immutati. Gli INDEPENDENT sono
+        # il risparmio ricorrente (i SUPERSEDES non riappaiono come candidati).
+        hit_rate = (memo_ind / memo_total * 100) if memo_total else 0.0
+        print(f"  Verdetti memoizzati:       {memo_total:>8,}  "
+              f"(SUP={memo_sup:,} IND={memo_ind:,}, {hit_rate:.1f}% riusabili)")
     if examples:
         print(f"\n  Ultimi esempi:")
         for old, new, cat in examples:
@@ -452,9 +530,17 @@ async def main():
         print("❌ No backend available. Check enrichment.fact_supersession.backends in config/tailor.yaml")
         sys.exit(1)
 
+    # Carica i verdetti memoizzati (fix #2): skip coppie già giudicate e immutate
+    memo_conn = sqlite3.connect(FACTS_DB_PATH, timeout=30)
+    memo_conn.execute('PRAGMA journal_mode=WAL')
+    ensure_judged_pairs_table(memo_conn)
+    memo = load_judged_memo(memo_conn)
+    memo_conn.close()
+    print(f"🧠 Verdetti memoizzati: {len(memo):,}")
+
     # Trova coppie candidate
     print("🔍 Ricerca coppie candidate...")
-    pairs = find_candidate_pairs(args.max_pairs)
+    pairs = find_candidate_pairs(args.max_pairs, memo=memo)
 
     if args.test:
         pairs = pairs[:args.test]
@@ -478,6 +564,9 @@ async def main():
     superseded_count = 0
     errors = 0
     start_time = time.time()
+    # judged_at unico per l'intera run; full ISO timestamp così da essere
+    # confrontabile lessicograficamente con facts.created_at nella memo.
+    run_judged_at = datetime.now().isoformat()
 
     async with aiohttp.ClientSession() as session:
         BATCH_SIZE = 20
@@ -498,6 +587,14 @@ async def main():
 
                 verdict = result.get("result", "INDEPENDENT")
                 reason = result.get("reason", "")
+
+                # Memoizza il verdetto (entrambi: audit log + skip futuri).
+                # Chiave normalizzata: old_f ha sempre l'id più basso.
+                if facts_conn:
+                    facts_conn.execute(
+                        "INSERT OR REPLACE INTO judged_pairs "
+                        "(fact_id_a, fact_id_b, verdict, judged_at) VALUES (?, ?, ?, ?)",
+                        (old_f["id"], new_f["id"], verdict, run_judged_at))
 
                 if verdict == "SUPERSEDES":
                     superseded_count += 1
