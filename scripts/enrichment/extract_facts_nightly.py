@@ -74,7 +74,7 @@ Text (date: {date}, source: {source}):
 
 Respond with ONLY a JSON array. No other text, no markdown, no explanation.
 [
-  {{"fact": "concise standalone statement", "category": "category", "entity_tags": ["entity1"], "event_date": "YYYY-MM-DD or empty string"}},
+  {{"fact": "concise standalone statement", "category": "category", "entity_tags": ["entity1"], "event_date": "YYYY-MM-DD or empty string", "expires_at": "YYYY-MM-DD or empty string"}},
   ...
 ]
 
@@ -85,8 +85,32 @@ Rules:
 - Each fact must make sense on its own
 - Include entity names in entity_tags
 - event_date: date the fact refers to, NOT the document date. Empty if not inferable.
+- expires_at: ISO date (YYYY-MM-DD) after which this fact is no longer operationally relevant.
+  Set ONLY for time-bound facts (meetings, deadlines, flights, appointments, reservations).
+  Leave EMPTY ("") for permanent facts (decisions, preferences, relationships, status, financial positions).
+  Example: "Meeting with Alex on 2026-04-06 at 3pm" -> expires_at: "2026-04-07"
+  Example: "User lives in Rome" -> expires_at: ""
+  When in doubt, leave it EMPTY -- never expire a fact you are unsure about.
 - Aim for 3-15 facts per chunk. Return [] for noise/filler.
 - Write facts in {language}."""
+
+
+_EXPIRES_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+
+
+def _clean_expires(val):
+    """Normalizza il campo expires_at prodotto dall'LLM.
+
+    Accetta SOLO un ISO date YYYY-MM-DD; qualunque altro output
+    (stringa vuota, "tomorrow", "Q3", None, non-stringa) -> "" =
+    fatto permanente. Secondo strato di sicurezza contro la
+    misclassificazione: un output malformato non deve mai tradursi in
+    un expiry accidentale che nasconde il fatto dal search. Il filtro
+    MCP (get_facts_for_chunks) tratta "" e NULL come 'mai scade'."""
+    if not isinstance(val, str):
+        return ""
+    val = val.strip()
+    return val if _EXPIRES_RE.match(val) else ""
 
 
 def _parse_facts_json(content):
@@ -572,11 +596,12 @@ async def main():
                 backend_name = backend["name"]
                 for f in valid_facts:
                     cur.execute("""
-                        INSERT INTO facts (chunk_id, fact, category, entity_tags, event_date, confidence, created_at, document_date)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO facts (chunk_id, fact, category, entity_tags, event_date, expires_at, confidence, created_at, document_date)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (chunk["id"], f["fact"][:500], f.get("category", "")[:50].lower(),
                           json.dumps(f.get("entity_tags", [])[:10]),
-                          f.get("event_date", "") or "", 1.0, now_str, chunk.get("date", "")))
+                          f.get("event_date", "") or "", _clean_expires(f.get("expires_at", "")),
+                          1.0, now_str, chunk.get("date", "")))
                 cur.execute("""
                     INSERT OR REPLACE INTO extraction_log (chunk_id, facts_count, model, extracted_at)
                     VALUES (?, ?, ?, ?)
