@@ -81,8 +81,8 @@ BACKUP_FRESH_MAX_S = 120      # il backup verificato deve essere di QUESTO run (
 # Tempi di attesa
 MAINTENANCE_LOCK_WAIT_S = 12   # quanto attendere la comparsa/scomparsa di maintenance.lock
 MCP_SETTLE_S = 3              # pausa dopo unload prima di load
-MCP_HEALTH_TIMEOUT_S = 30     # polling PID nuovo + HTTP 200 post-load
-MCP_HEALTH_POLL_S = 1
+MCP_HEALTH_TIMEOUT_S = 90     # cold start HNSW: polling PID nuovo + HTTP 200 post-load
+MCP_HEALTH_POLL_S = 2
 MCP_HEALTH_URL = "http://localhost:8787/"
 
 TS_FMT = "%Y-%m-%d %H:%M:%S"

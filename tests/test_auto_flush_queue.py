@@ -208,7 +208,7 @@ def test_restart_mcp_load_failed_after_unload_ok_is_mcp_down(monkeypatch):
 def test_restart_mcp_http_health_timeout(monkeypatch):
     monkeypatch.setattr(afq.subprocess, "run", lambda cmd, **kw: _FakeProc(returncode=0))
     monkeypatch.setattr(afq.time, "sleep", lambda *_: None)
-    ticks = iter([0, 0, 31])
+    ticks = iter([0, 0, 91])
     monkeypatch.setattr(afq.time, "monotonic", lambda: next(ticks))
     monkeypatch.setattr(afq, "find_mcp_pid", lambda: 2222)
     monkeypatch.setattr(afq.requests, "get", lambda *a, **kw: _FakeProc())
