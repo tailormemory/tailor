@@ -18,6 +18,24 @@ Template for upcoming changes. Move entries under a new version heading on relea
 ### Docs
 -->
 
+### Added
+
+- **Auto-flush del backlog queue HNSW (chromadb #6975).** Nuovo job schedulato
+  `com.tailor.auto-flush-queue` (LaunchDaemon `UserName=jarvis`, orari fissi
+  08:00/14:00/20:00, fuori dal nightly delle 02:00; mitigazione B-lean della
+  race residua tra manutenzioni non coordinate) che esegue non-presidiato la procedura 5-step del runbook quando il
+  backlog è azionabile e #6975-puro: gate `queue ≥ 300 AND orphans=0 AND
+  ghosts=0 AND unknown=0`. Elimina il flush manuale ripetuto (5 incidenti in 9
+  giorni). Niente sudo interattivo: maintenance ON/OFF via `kill -USR1/-USR2`
+  (MCP gira come `jarvis`), restart MCP graceful via il grant NOPASSWD esistente
+  `/etc/sudoers.d/jarvis-mcp` (`launchctl unload`+`load`, SIGTERM = shutdown
+  pulito). Telegram START/SUCCESS/FAIL/ESCALATION, lock `fcntl`, log dedicato
+  `logs/auto_flush.log`, `maintenance OFF` garantito in `finally`. Con
+  orphans/ghosts/unknown > 0 NON auto-remedia: manda escalation e si ferma.
+  Nuovi: [`scripts/services/auto_flush_queue.py`](scripts/services/auto_flush_queue.py),
+  `run_auto_flush_queue.sh`, `launchd_proposed/com.tailor.auto-flush-queue.plist`,
+  `tests/test_auto_flush_queue.py`.
+
 <!-- Errata entry moved to [1.2.10] on release 2026-05-17 -->
 
 ---

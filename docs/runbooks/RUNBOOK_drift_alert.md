@@ -59,6 +59,8 @@ Queue backlog:     <Q>   pending ops in embeddings_queue
 
 Da eseguire **solo** sul verdetto `orphans=0, ghosts=0, queue≥300` (o `drift≥800`). La gate di azionabilità è: `drift ≥ DRIFT_WARNING(800)` **OR** `queue_total ≥ FLUSH_QUEUE_BACKLOG_MIN(300)` — vedi commit `ccef05d`. Override soglia: `--queue-backlog-min N`.
 
+> **Automazione (default).** Questa intera procedura 5-step è ora eseguita non-presidiata dal job `com.tailor.auto-flush-queue` ([scripts/services/auto_flush_queue.py](../../scripts/services/auto_flush_queue.py), alle 08:00/14:00/20:00, fuori dal nightly delle 02:00). Gli orari non sovrapposti sono la mitigazione B-lean della race residua tra manutenzioni non coordinate. Il job agisce sul caso #6975-puro (`queue ≥ 300, orphans=0, ghosts=0, unknown=0`). Maintenance via segnali (no sudo), restart via grant NOPASSWD `unload`+`load`. Telegram START/SUCCESS/FAIL e log in `logs/auto_flush.log`. La procedura manuale qui sotto resta il **fallback** quando il job è disabilitato, fallisce (Telegram FAIL → investigare, non ritentare alla cieca), o quando il verdetto NON è #6975-puro (orphans/ghosts/unknown > 0 → il job manda ESCALATION e non agisce).
+
 Il principio di sicurezza: **eliminare il secondo writer**. In maintenance mode il MCP è quiescente, quindi il `PersistentClient` del tool di flush è l'**unico** scrittore su Chroma → niente race subprocess-vs-MCP (SIGSEGV #6975 / 1.5.8). **Mai** lanciare flush/burst con MCP attivo e scrivente.
 
 ### 3.1 — Maintenance ON (operatore-side)
