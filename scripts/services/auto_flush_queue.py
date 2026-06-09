@@ -206,13 +206,13 @@ def run_backup() -> bool:
 
 
 def _newest_fresh_backup(max_age_s: int) -> tuple[str, float] | None:
-    """Path + età (s) del backup chroma_*.sqlite3.gz più recente in backups/,
+    """Path + età (s) del backup tailor_db_full_*.tar.gz più recente in backups/,
     solo se mtime entro max_age_s (deve essere di QUESTO run). None altrimenti."""
     if not os.path.isdir(BACKUPS_DIR):
         return None
     best: tuple[float, str] | None = None
     for fname in os.listdir(BACKUPS_DIR):
-        if fname.startswith("chroma_") and fname.endswith(".sqlite3.gz"):
+        if fname.startswith("tailor_db_full_") and fname.endswith(".tar.gz"):
             full = os.path.join(BACKUPS_DIR, fname)
             try:
                 mt = os.path.getmtime(full)
@@ -233,7 +233,7 @@ def verify_backup() -> bool:
     del backup fresco con `gzip -t` prima di toccare ChromaDB."""
     fresh = _newest_fresh_backup(BACKUP_FRESH_MAX_S)
     if fresh is None:
-        log("ERROR", f"nessun backup chroma_*.sqlite3.gz con mtime < {BACKUP_FRESH_MAX_S}s in {BACKUPS_DIR}")
+        log("ERROR", f"nessun backup tailor_db_full_*.tar.gz con mtime < {BACKUP_FRESH_MAX_S}s in {BACKUPS_DIR}")
         return False
     path, age = fresh
     try:

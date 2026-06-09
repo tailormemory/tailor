@@ -148,7 +148,7 @@ def test_classify_flush_none():
 # ───────────────────────── verify_backup ─────────────────────────────────────
 
 def test_verify_backup_accepts_fresh_valid_gzip(monkeypatch, tmp_path):
-    backup = tmp_path / "chroma_fresh.sqlite3.gz"
+    backup = tmp_path / "tailor_db_full_20260609_080000.tar.gz"
     backup.write_bytes(b"placeholder")
     monkeypatch.setattr(afq, "BACKUPS_DIR", str(tmp_path))
     monkeypatch.setattr(afq.subprocess, "run", lambda cmd, **kw: _FakeProc(returncode=0))
@@ -156,7 +156,7 @@ def test_verify_backup_accepts_fresh_valid_gzip(monkeypatch, tmp_path):
 
 
 def test_verify_backup_rejects_old_file(monkeypatch, tmp_path):
-    backup = tmp_path / "chroma_old.sqlite3.gz"
+    backup = tmp_path / "tailor_db_full_20260608_080000.tar.gz"
     backup.write_bytes(b"placeholder")
     old = time.time() - afq.BACKUP_FRESH_MAX_S - 10
     os.utime(backup, (old, old))
