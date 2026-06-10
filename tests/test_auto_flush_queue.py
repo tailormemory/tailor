@@ -191,9 +191,17 @@ def test_restart_mcp_healthy_new_pid(monkeypatch):
     monkeypatch.setattr(afq.subprocess, "run", lambda cmd, **kw: _FakeProc(returncode=0))
     monkeypatch.setattr(afq.time, "sleep", lambda *_: None)
     monkeypatch.setattr(afq, "find_mcp_pid", lambda: 2222)
-    monkeypatch.setattr(afq.requests, "get", lambda *a, **kw: _FakeProc(returncode=0))
+    health_calls = []
+
+    def fake_get(*a, **kw):
+        health_calls.append(a[0] if a else kw.get("url"))
+        return _FakeProc(returncode=0)
+
+    monkeypatch.setattr(afq.requests, "get", fake_get)
     monkeypatch.setattr(_FakeProc, "status_code", 200, raising=False)
     assert afq.restart_mcp(old_pid=1000) == "healthy"
+    # il probe deve colpire esattamente l'endpoint auth-check (no-ChromaDB, 200 su localhost)
+    assert health_calls == ["http://127.0.0.1:8787/api/auth/check"]
 
 
 def test_restart_mcp_load_failed_after_unload_ok_is_mcp_down(monkeypatch):

@@ -83,7 +83,7 @@ MAINTENANCE_LOCK_WAIT_S = 12   # quanto attendere la comparsa/scomparsa di maint
 MCP_SETTLE_S = 3              # pausa dopo unload prima di load
 MCP_HEALTH_TIMEOUT_S = 90     # cold start HNSW: polling PID nuovo + HTTP 200 post-load
 MCP_HEALTH_POLL_S = 2
-MCP_HEALTH_URL = "http://localhost:8787/"
+MCP_HEALTH_URL = "http://127.0.0.1:8787/api/auth/check"
 
 TS_FMT = "%Y-%m-%d %H:%M:%S"
 
