@@ -25,13 +25,25 @@ import auto_flush_queue as afq  # noqa: E402
 
 # ─────────────────────────── evaluate_gate ───────────────────────────
 
-def _audit(queue=0, orphans=0, ghosts=0, unknown=0):
-    return {
-        "queue_total": queue,
+def _audit(queue=0, orphans=0, ghosts=0, unknown=0, benign_ghosts=0,
+           anomalous_ghost_count="auto", blocking_unknown_count="auto",
+           with_benign_key=True, ghosts_list="auto", queue_total="auto"):
+    """ghosts/benign_ghosts costruiscono la lista; gli override 'raw'
+    (ghosts_list, queue_total, *_count) servono ai test di incoerenza schema."""
+    gl = [{"embedding_id": f"g{i}", **({"benign": False} if with_benign_key else {})}
+          for i in range(ghosts)]
+    gl += [{"embedding_id": f"b{i}", "benign": True} for i in range(benign_ghosts)]
+    a = {
         "sql_only_orphans": [{"embedding_id": f"o{i}"} for i in range(orphans)],
-        "hnsw_only_ghosts": [{"embedding_id": f"g{i}"} for i in range(ghosts)],
+        "hnsw_only_ghosts": gl if ghosts_list == "auto" else ghosts_list,
         "unknown_count": unknown,
     }
+    a["queue_total"] = queue if queue_total == "auto" else queue_total
+    if anomalous_ghost_count != "auto":
+        a["anomalous_ghost_count"] = anomalous_ghost_count
+    if blocking_unknown_count != "auto":
+        a["blocking_unknown_count"] = blocking_unknown_count
+    return a
 
 
 def test_gate_act_clean_backlog_above_min():
@@ -78,9 +90,124 @@ def test_gate_escalate_takes_priority_over_below_min():
     assert action == "escalate"
 
 
-def test_gate_handles_missing_keys():
-    action, _ = afq.evaluate_gate({}, qmin=300)
+def test_gate_empty_dict_is_schema_invalid_escalate():
+    # audit vuoto/malformato (hnsw_only_ghosts assente) → conservativo, non silenzioso.
+    # run_audit() ritorna None su fallimento (e main() aborta prima); {} è degenere.
+    action, reason = afq.evaluate_gate({}, qmin=300)
+    assert action == "escalate"
+    assert "schema_invalid" in reason
+
+
+# ─────────────────── _ghost_counts: JSON incoerente (round 3) ───────────────────
+
+def test_ghost_counts_contradiction_agg_vs_list():
+    # lista ha 1 ghost benign:False ma anomalous_ghost_count:0 → invalid
+    gc = afq._ghost_counts(_audit(ghosts=1, anomalous_ghost_count=0, blocking_unknown_count=0))
+    assert gc.schema_invalid is True
+
+
+def test_ghost_counts_agg_exceeds_list():
+    gc = afq._ghost_counts(_audit(ghosts=2, anomalous_ghost_count=5))
+    assert gc.schema_invalid is True
+
+
+def test_ghost_counts_negative_anomalous():
+    gc = afq._ghost_counts(_audit(ghosts=2, anomalous_ghost_count=-1))
+    assert gc.schema_invalid is True
+
+
+def test_ghost_counts_non_numeric_anomalous_no_crash():
+    gc = afq._ghost_counts(_audit(ghosts=2, anomalous_ghost_count="x"))
+    assert gc.schema_invalid is True           # niente eccezione
+
+
+def test_ghost_counts_negative_blocking_unknown():
+    gc = afq._ghost_counts(_audit(ghosts=0, anomalous_ghost_count=0, blocking_unknown_count=-3))
+    assert gc.schema_invalid is True
+
+
+def test_ghost_counts_list_absent():
+    gc = afq._ghost_counts(_audit(ghosts_list=None))   # hnsw_only_ghosts non-lista
+    assert gc.schema_invalid is True
+
+
+def test_ghost_counts_mixed_per_ghost_flags():
+    gl = [{"embedding_id": "g0", "benign": False}, {"embedding_id": "g1"}]  # uno senza flag
+    gc = afq._ghost_counts(_audit(ghosts_list=gl))
+    assert gc.schema_invalid is True
+
+
+def test_ghost_counts_queue_non_numeric_escalates():
+    action, reason = afq.evaluate_gate(
+        _audit(ghosts=0, anomalous_ghost_count=0, blocking_unknown_count=0, queue_total="NaN"),
+        qmin=300)
+    assert action == "escalate" and "schema_invalid" in reason
+
+
+def test_ghost_counts_legacy_distinct_from_invalid():
+    # ghost senza flag e senza aggregati → legacy (conservativo) ma NON invalid
+    gc = afq._ghost_counts(_audit(ghosts=2, with_benign_key=False))
+    assert gc.schema_invalid is False and gc.legacy is True and gc.anomalous == 2
+
+
+def test_ghost_counts_partial_json_blocking_defaults_conservative():
+    # anomalous presente, blocking assente, unknown_count=2 → bu=2 (non 0), valido
+    gc = afq._ghost_counts(_audit(ghosts=0, benign_ghosts=1, anomalous_ghost_count=0, unknown=2))
+    assert gc.schema_invalid is False and gc.blocking_unknown == 2
+
+
+def test_gate_schema_invalid_forces_escalate_over_skip():
+    # anche con queue sotto soglia, schema_invalid → escalate (non skip)
+    action, _ = afq.evaluate_gate(_audit(ghosts_list="not-a-list", queue_total=0), qmin=300)
+    assert action == "escalate"
+
+
+# ─────────────────── gate: benigni vs anomali (round 2/3) ───────────────────
+
+def test_gate_act_only_benign_ghosts():
+    # caso #6975 reale: solo ghost benigni, niente anomali → flush ammesso.
+    action, _ = afq.evaluate_gate(
+        _audit(queue=400, benign_ghosts=5, anomalous_ghost_count=0, blocking_unknown_count=0),
+        qmin=300)
+    assert action == "act"
+
+
+def test_gate_escalate_mixed_benign_anomalous():
+    action, reason = afq.evaluate_gate(_audit(queue=400, ghosts=1, benign_ghosts=3), qmin=300)
+    assert action == "escalate"
+    assert "anomalous_ghosts=1" in reason and "benign_ghosts=3" in reason
+
+
+def test_gate_skip_benign_below_min():
+    action, _ = afq.evaluate_gate(
+        _audit(queue=100, benign_ghosts=5, anomalous_ghost_count=0, blocking_unknown_count=0),
+        qmin=300)
     assert action == "skip"
+
+
+def _drive_main_escalation(monkeypatch, audit_obj, sent):
+    monkeypatch.setattr(afq.sys, "argv", ["auto_flush_queue.py"])
+    monkeypatch.setattr(afq, "log", lambda *a, **k: None)
+    monkeypatch.setattr(afq, "send_telegram", lambda t: sent.append(t) or True)
+    monkeypatch.setattr(afq, "run_audit", lambda: audit_obj)
+    monkeypatch.setattr(afq, "queue_min", lambda: 300)
+    monkeypatch.setattr(afq, "_acquire_run_lock", lambda: object())
+    monkeypatch.setattr(afq.os.path, "exists", lambda p: False)
+    return afq.main()
+
+
+def test_telegram_escalation_mixed_state_exact_counts(monkeypatch):
+    sent = []
+    rc = _drive_main_escalation(monkeypatch, _audit(queue=400, ghosts=2, benign_ghosts=3), sent)
+    assert rc == 0
+    assert any("3 ghost benigni in attesa DIETRO 2 anomali" in s for s in sent)
+
+
+def test_telegram_escalation_schema_invalid_message(monkeypatch):
+    sent = []
+    rc = _drive_main_escalation(monkeypatch, _audit(ghosts_list="bad", queue_total=400), sent)
+    assert rc == 0
+    assert any("schema invalid" in s.lower() for s in sent)
 
 
 # ───────────────────────── _extract_json_objects ─────────────────────────

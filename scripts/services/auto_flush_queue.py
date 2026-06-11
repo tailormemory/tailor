@@ -50,6 +50,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+from typing import NamedTuple
 
 import requests
 
@@ -376,24 +377,111 @@ def restart_mcp(old_pid: int | None) -> str:
 
 # ──────────────────────────────── gate logic ────────────────────────────────
 
+
+class GhostCounts(NamedTuple):
+    anomalous: int
+    benign: int
+    blocking_unknown: int
+    legacy: bool          # schema vecchio senza info benignità (conservativo)
+    schema_invalid: bool  # JSON incoerente/malformato (conservativo, FORZA escalate)
+
+
+def _nonneg_int(x) -> int | None:
+    """int >= 0, oppure None se non convertibile/negativo. Non solleva mai."""
+    try:
+        v = int(x)
+    except (TypeError, ValueError):
+        return None
+    return v if v >= 0 else None
+
+
+def _ghost_counts(audit: dict) -> GhostCounts:
+    """Conteggi ghost robusti a JSON incoerente.
+
+    Tre esiti conservativi distinti:
+      * schema_invalid=True → JSON malformato/incoerente → gate FORZA escalate.
+      * legacy=True         → schema vecchio senza benignità → tutti anomali.
+      * altrimenti          → conteggi affidabili.
+    Nessun int() solleva: valore non numerico → schema_invalid, non eccezione.
+    """
+    def invalid() -> GhostCounts:
+        # valori non-fuorvianti che escalerebbero anche se il flag fosse ignorato
+        # (difesa in profondità: anomalous=1>0).
+        return GhostCounts(1, 0, 1, legacy=False, schema_invalid=True)
+
+    raw = audit.get("hnsw_only_ghosts", None)
+    if not isinstance(raw, list):                      # assente o non-lista
+        return invalid()
+    total = len(raw)
+    if any(not isinstance(g, dict) for g in raw):      # elementi non-dict
+        return invalid()
+
+    # flag per-ghost: o su TUTTI o su NESSUNO
+    flags = [("benign" in g) for g in raw]
+    if any(flags) and not all(flags):                  # misti
+        return invalid()
+    per_ghost = sum(1 for g in raw if not g.get("benign")) if (total and all(flags)) else None
+
+    # aggregato anomalous: se presente dev'essere valido, in range, coerente
+    agg = None
+    if "anomalous_ghost_count" in audit:
+        agg = _nonneg_int(audit["anomalous_ghost_count"])
+        if agg is None or agg > total:
+            return invalid()
+        if per_ghost is not None and agg != per_ghost:
+            return invalid()
+
+    # blocking_unknown: se presente dev'essere valido; se assente → default
+    # CONSERVATIVO = unknown_count totale (NON 0).
+    if "blocking_unknown_count" in audit:
+        bu = _nonneg_int(audit["blocking_unknown_count"])
+        if bu is None:
+            return invalid()
+    else:
+        bu = _nonneg_int(audit.get("unknown_count", 0))
+        if bu is None:
+            return invalid()
+
+    if agg is not None:
+        anomalous, legacy = agg, False
+    elif per_ghost is not None:
+        anomalous, legacy = per_ghost, False
+    else:
+        anomalous, legacy = total, True                # vecchio schema → conservativo
+    benign = total - anomalous
+    if anomalous < 0 or benign < 0 or anomalous + benign != total:
+        return invalid()
+    return GhostCounts(anomalous, benign, bu, legacy, schema_invalid=False)
+
+
 def evaluate_gate(audit: dict, qmin: int) -> tuple[str, str]:
     """Funzione pura — decide l'azione dal JSON di audit.
 
     Ritorna (action, reason):
-      "act"      → caso #6975 puro azionabile (flush)
-      "skip"     → niente da fare (queue sotto soglia o sync)
-      "escalate" → orphans/ghosts/unknown > 0 (NON auto-remediabile)
+      "act"      → #6975 puro (eventuali ghost benigni inclusi) azionabile
+      "skip"     → niente da fare (queue sotto soglia, nessun drift anomalo)
+      "escalate" → drift anomalo / schema_invalid (NON auto-remediabile)
     """
-    queue = int(audit.get("queue_total", 0))
-    orphans = len(audit.get("sql_only_orphans", []) or [])
-    ghosts = len(audit.get("hnsw_only_ghosts", []) or [])
-    unknown = int(audit.get("unknown_count", 0))
+    gc = _ghost_counts(audit)
+    queue = _nonneg_int(audit.get("queue_total", 0))
+    orphans_raw = audit.get("sql_only_orphans", [])
+    orphans = len(orphans_raw) if isinstance(orphans_raw, list) else None
 
-    if orphans > 0 or ghosts > 0 or unknown > 0:
-        return "escalate", f"orphans={orphans} ghosts={ghosts} unknown={unknown} queue={queue}"
+    # schema_invalid / campi base non interpretabili → escalate forzato.
+    if gc.schema_invalid or queue is None or orphans is None:
+        return "escalate", (f"schema_invalid: audit JSON incoerente "
+                            f"(queue_total={audit.get('queue_total')!r}, "
+                            f"sql_only_orphans={type(orphans_raw).__name__}) → escalate conservativo")
+
+    leg = " [schema legacy: benignità sconosciuta, conservativo]" if gc.legacy else ""
+    if orphans > 0 or gc.anomalous > 0 or gc.blocking_unknown > 0:
+        return "escalate", (f"orphans={orphans} anomalous_ghosts={gc.anomalous} "
+                            f"blocking_unknown={gc.blocking_unknown} "
+                            f"(benign_ghosts={gc.benign} ignorati) queue={queue}{leg}")
     if queue < qmin:
-        return "skip", f"queue={queue} < min={qmin}, orphans=0 ghosts=0"
-    return "act", f"queue={queue} >= min={qmin}, indice pulito (#6975 puro)"
+        return "skip", f"queue={queue} < min={qmin}, nessun drift anomalo (benign_ghosts={gc.benign}){leg}"
+    return "act", (f"queue={queue} >= min={qmin}, indice pulito modulo {gc.benign} "
+                   f"ghost benigni (#6975 puro){leg}")
 
 
 # ───────────────────────────────── procedure ────────────────────────────────
@@ -425,10 +513,13 @@ def run_procedure(audit: dict, dry_run: bool) -> int:
         print(f"DRY-RUN would run 5-step flush (queue={queue0}, min={qmin})")
         return 0
 
+    gc = _ghost_counts(audit)
+    ghost_note = (f"orphans=0, {gc.benign} ghost benigni ammessi (compattati dal flush)"
+                  if gc.benign else "orphans=0, ghosts=0")
     send_telegram(
         "🧹 *TAILOR auto-flush — START*\n"
         f"Queue backlog: `{queue0}` (≥ min {qmin})\n"
-        "Indice pulito (orphans=0, ghosts=0) → flush #6975 automatico in corso."
+        f"Indice pulito ({ghost_note}) → flush #6975 automatico in corso."
     )
 
     mcp_pid = find_mcp_pid()
@@ -542,9 +633,14 @@ def run_procedure(audit: dict, dry_run: bool) -> int:
     # rc != 0 oppure contratto JSON incompleto/malformato → fallimento.
     log("FAIL", f"flush rc={flush_rc} kind={kind} post_queue={post_queue} "
                 f"json={json.dumps(flush_json or {})[:300]}")
+    pbg = (flush_json or {}).get("post_benign_ghost_count")
+    pag = (flush_json or {}).get("post_anomalous_ghost_count")
+    ghost_note = (f"Ghost post-flush: benigni=`{pbg}` anomali=`{pag}` "
+                  f"(post-condizione: entrambi devono essere 0).\n" if pbg is not None else "")
     send_telegram(
         "❌ *TAILOR auto-flush — FAIL*\n"
         f"Flush rc=`{flush_rc}` (queue `{queue0}` → `{post_queue}`).\n"
+        f"{ghost_note}"
         f"Restart MCP: `{restart_state}`.\n"
         "Non ritentare alla cieca: vedi `logs/auto_flush.log` e RUNBOOK_drift_alert.md §3."
     )
@@ -603,16 +699,41 @@ def main() -> int:
     qmin = queue_min()
     action, reason = evaluate_gate(audit, qmin)
     log("GATE", f"action={action} {reason}")
+    gc = _ghost_counts(audit)
+    if gc.schema_invalid:
+        log("WARN", "audit JSON incoerente/malformato (schema_invalid) → escalate conservativo. "
+                    "Verificare l'output di `repair_hnsw_index.py --audit --json`.")
+    elif gc.legacy:
+        log("WARN", "audit JSON schema legacy: benignità ghost sconosciuta → conservativo "
+                    "(tutti anomali). Allineare repair_hnsw_index.")
 
     if action == "skip":
         return 0
 
     if action == "escalate":
+        if gc.schema_invalid:
+            send_telegram(
+                "⚠️ *TAILOR auto-flush — ESCALATION (schema invalid)*\n"
+                "Audit JSON incoerente/malformato: impossibile valutare la benignità dei ghost. "
+                "Nessun flush eseguito. Verificare `repair_hnsw_index.py --audit --json` e i log."
+            )
+            log("ESCALATE", "schema_invalid")
+            return 0
+        orphans = len(audit.get("sql_only_orphans", []) or [])
+        mixed = ""
+        if gc.benign > 0 and gc.anomalous > 0:
+            mixed = (f"\n⚠️ *{gc.benign} ghost benigni in attesa DIETRO {gc.anomalous} anomali* "
+                     f"— bloccati finché gli anomali non sono risolti.")
+        elif gc.benign > 0:
+            mixed = f"\nℹ️ {gc.benign} ghost benigni presenti (compattati a sblocco avvenuto)."
         send_telegram(
             "⚠️ *TAILOR auto-flush — ESCALATION*\n"
-            f"Drift NON auto-remediabile: {reason}.\n"
-            "orphans/ghosts/unknown > 0 → caso non #6975-puro. Serve diagnosi manuale "
-            "(`--apply` per orphans, investigare ghosts). Vedi RUNBOOK_drift_alert.md §2."
+            f"Drift NON auto-remediabile: orphans=`{orphans}` anomalous_ghosts=`{gc.anomalous}` "
+            f"blocking_unknown=`{gc.blocking_unknown}` (benign_ghosts=`{gc.benign}`)."
+            f"{mixed}\n"
+            + ("⚠️ audit schema legacy: benignità sconosciuta, conservativo.\n" if gc.legacy else "")
+            + "`--apply` per orphans; ghost anomali → *investigare / rebuild manuale*. "
+            "Vedi RUNBOOK_drift_alert.md §2."
         )
         log("ESCALATE", reason)
         return 0

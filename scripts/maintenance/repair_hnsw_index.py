@@ -104,6 +104,8 @@ class GhostChunk:
                         # "known_kb_session_ghost" | "known_live_capture_ghost" |
                         # "unknown"
     note: str = ""
+    benign: bool = False                    # net pending WAL op (sopra watermark) = DELETE
+    pending_delete_seq: int | None = None   # seq_id di quel DELETE (forense)
 
 
 @dataclass
@@ -135,6 +137,30 @@ class DriftReport:
 
     def has_unknowns(self) -> bool:
         return self.unknown_count > 0
+
+    # ── Fix 1: split benigni / anomali ──────────────────────────────────────
+    @property
+    def benign_ghosts(self) -> list[GhostChunk]:
+        return [g for g in self.hnsw_only_ghosts if g.benign]
+
+    @property
+    def anomalous_ghosts(self) -> list[GhostChunk]:
+        return [g for g in self.hnsw_only_ghosts if not g.benign]
+
+    @property
+    def benign_ghost_count(self) -> int:
+        return len(self.benign_ghosts)
+
+    @property
+    def anomalous_ghost_count(self) -> int:
+        return len(self.anomalous_ghosts)
+
+    @property
+    def blocking_unknown_count(self) -> int:
+        """Unknown bloccanti: orphan SQL-only unknown + ghost ANOMALI unknown.
+        I ghost benigni unknown NON bloccano (il WAL ne ha già il DELETE)."""
+        return (sum(1 for o in self.sql_only_orphans if o.classification == "unknown")
+                + sum(1 for g in self.anomalous_ghosts if g.classification == "unknown"))
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -444,6 +470,48 @@ def _queue_extents(con: sqlite3.Connection) -> tuple[int, str | None, str | None
     return row[0], row[1], row[2]
 
 
+def _resolve_collection_topic(con: sqlite3.Connection, collection_id: str) -> str | None:
+    """Topic WAL esatto della collection (chromadb: persistent://<tenant>/<db>/<cid>).
+    Lo ricava dal suffisso /<collection_id> (UUID → unico) invece di costruirlo,
+    così è robusto a tenant/database diversi. Ritorna None se non risolvibile
+    (queue priva di righe per questa collection, o >1 topic ambiguo) → il
+    chiamante tratta conservativamente (nessun benigno)."""
+    cur = con.cursor()
+    cur.execute("SELECT DISTINCT topic FROM embeddings_queue WHERE topic LIKE ?",
+                ("%/" + collection_id,))
+    # endswith esatto: difesa contro il wildcard '_' di LIKE
+    topics = [t for (t,) in cur.fetchall() if t and t.endswith("/" + collection_id)]
+    return topics[0] if len(topics) == 1 else None
+
+
+def _load_final_queue_ops(
+    con: sqlite3.Connection,
+    *,
+    topic: str,
+    vector_max_seq_id: int,
+) -> dict[str, tuple[int, int]]:
+    """NET op pendente per id, SOLO per `topic` (la collection auditata) e SOLO
+    per righe con seq_id > vector_max_seq_id (la finestra che Chroma rileggerà
+    davvero al prossimo consume). {embedding_id: (operation, seq_id)} dal seq_id
+    PIÙ ALTO. Encoding WAL: 2 = upsert, 3 = delete.
+
+    Le due scoping sono entrambe necessarie:
+      * topic        → gli id sono unici solo DENTRO una collection.
+      * seq_id window → un DELETE <= watermark NON verrà riapplicato (è il ghost
+                        anomalo classico: delete perso dall'HNSW), quindi NON
+                        rende benigno."""
+    cur = con.cursor()
+    cur.execute(
+        "SELECT id, operation, seq_id FROM embeddings_queue "
+        "WHERE topic = ? AND seq_id > ? ORDER BY seq_id",
+        (topic, vector_max_seq_id),
+    )
+    final: dict[str, tuple[int, int]] = {}
+    for eid, op, seq in cur.fetchall():
+        final[eid] = (int(op), int(seq))  # seq crescente → l'ultimo sovrascrive
+    return final
+
+
 def audit(db_path: str | None = None, db_dir: str | None = None) -> DriftReport:
     """Read-only diagnosis. Returns a DriftReport."""
     if db_path is None:
@@ -473,10 +541,26 @@ def audit(db_path: str | None = None, db_dir: str | None = None) -> DriftReport:
             cls = _classify_orphan(eid, meta)
             orphans.append(OrphanChunk(embedding_id=eid, int_id=int_id, metadata=meta, classification=cls))
 
+        # Fix 1: benignità scoped per topic della collection e per la finestra
+        # seq_id > vector_max_seq_id che Chroma rileggerà davvero.
+        collection_id = _load_collection_id(con)
+        vector_max_seq_id = _load_segment_seq(con, vec_seg)
+        our_topic = _resolve_collection_topic(con, collection_id)
+        final_ops = (
+            _load_final_queue_ops(con, topic=our_topic, vector_max_seq_id=vector_max_seq_id)
+            if our_topic else {}
+        )
+
         ghosts: list[GhostChunk] = []
         for eid in sorted(hnsw_only):
             cls, note = _classify_ghost(eid, registry_hashes)
-            ghosts.append(GhostChunk(embedding_id=eid, classification=cls, note=note))
+            op_seq = final_ops.get(eid)
+            benign = op_seq is not None and op_seq[0] == 3
+            ghosts.append(GhostChunk(
+                embedding_id=eid, classification=cls, note=note,
+                benign=benign,
+                pending_delete_seq=op_seq[1] if benign else None,
+            ))
 
         queue_total, queue_oldest, queue_newest = _queue_extents(con)
         unknown = sum(1 for o in orphans if o.classification == "unknown") + \
@@ -725,6 +809,11 @@ def format_report_human(report: DriftReport, delta: Delta | None = None) -> str:
 
 def format_report_json(report: DriftReport, delta: Delta | None = None) -> dict[str, Any]:
     out: dict[str, Any] = report.to_dict()
+    # asdict() serializza i campi (inclusi g["benign"]/g["pending_delete_seq"]) ma
+    # NON le @property → li aggiungo per i consumer JSON (auto_flush_queue).
+    out["benign_ghost_count"] = report.benign_ghost_count
+    out["anomalous_ghost_count"] = report.anomalous_ghost_count
+    out["blocking_unknown_count"] = report.blocking_unknown_count
     if delta is not None:
         out["delta"] = asdict(delta)
     return out
@@ -952,19 +1041,27 @@ def flush_queue_backlog(
     chunk_ids: list[str],
     progress=None,
 ) -> dict[str, Any]:
-    """Force ChromaDB 1.5.9 to persist HNSW by idempotent re-upserts.
+    """Force ChromaDB #6975 HNSW persist via idempotent re-upsert burst.
 
-    This is the targeted workaround for chroma-core/chroma#6975 when SQL and
-    HNSW are both logically healthy (no orphans/ghosts), but VECTOR max_seq_id
-    is stuck behind METADATA because pending WAL rows remain in
-    embeddings_queue. Each write reuses the currently stored document and
-    metadata for an existing chunk id, so the operation is semantically a no-op
-    while still bumping Chroma's internal HNSW write counter.
+    MECCANISMO REALE (NON un bump del processo MCP vivo):
+      * PersistentClient SEPARATO mentre MCP è in maintenance (del client su
+        SIGUSR1). Race a due client evitata dall'handoff —
+        [[project_chromadb_1_5_8_segfault_race_condition]].
+      * Il segmento HNSW fresco riprende dal pickle persistito a vector_max_seq_id
+        e ri-consuma dal WAL SOLO i record della PROPRIA collection
+        (topic persistent://<tenant>/<db>/<cid>) con seq_id > vector_max_seq_id.
+        NON "l'intera queue": altri topic e i record sotto il watermark sono ignorati.
+      * I record di backlog riletti INCREMENTANO il contatore persist (non solo le
+        re-upsert idempotenti qui sotto). Al superamento di hnsw:sync_threshold
+        scatta _persist(): scrive il pickle coi DELETE riconsumati applicati e
+        avanza VECTOR max_seq_id.
+      * La queue si drena come SIDE EFFECT (purge quando METADATA+VECTOR superano la
+        riga). Per questo il burst pulisce anche i ghost benigni (DELETE sopra il
+        watermark) oltre al seq-drift.
+      * MCP lo vede solo dopo lazy-reopen (prima query post-SIGUSR2) o restart.
 
-    This mode is more conservative than the 2026-05-30 manual burst, which ran
-    with MCP up. It requires maintenance mode to avoid the chromadb 1.5.8
-    SIGSEGV race condition documented in
-    [[project_chromadb_1_5_8_segfault_race_condition]].
+    Dimensionare burst_n >= sync_threshold è una scelta DIFENSIVA conservativa
+    (vedi sopra), non "solo i nuovi write contano".
     """
     processed = 0
     skipped = 0
@@ -1119,20 +1216,28 @@ def main(argv: list[str] | None = None) -> int:
         return 3
 
     if flush_mode:
-        if report.sql_only_count or report.hnsw_only_count or report.has_unknowns():
+        # Fix 1: i ghost BENIGNI (DELETE pendente sopra il watermark, nel topic
+        # della collection) sono compattati dal flush stesso → non bloccano.
+        # Bloccano solo orphan SQL-only, ghost ANOMALI, e unknown bloccanti.
+        if report.sql_only_count or report.anomalous_ghost_count or report.blocking_unknown_count:
             msg = (
-                f"\nREFUSING --flush-queue-backlog: this mode only handles clean #6975 queue backlog.\n"
+                f"\nREFUSING --flush-queue-backlog: drift anomalo presente "
+                f"(flushabili solo backlog #6975 pulito + ghost benigni).\n"
                 f"  sql_only_orphans={report.sql_only_count}, "
-                f"hnsw_only_ghosts={report.hnsw_only_count}, unknown={report.unknown_count}\n"
-                f"  Use --apply for SQL-only orphans, or investigate ghosts/unknowns first."
+                f"anomalous_ghosts={report.anomalous_ghost_count}, "
+                f"blocking_unknown={report.blocking_unknown_count} "
+                f"(benign_ghosts={report.benign_ghost_count} OK, compattati dal flush)\n"
+                f"  Ghost benigno = id HNSW-only con DELETE pendente sopra il watermark.\n"
+                f"  Usa --apply per orphan SQL-only; ghost anomali → investigare / rebuild manuale."
             )
             _print(msg, args.json)
             if args.json:
                 print(json.dumps({
-                    "error": "not_clean_queue_backlog",
+                    "error": "anomalous_drift",
                     "sql_only_count": report.sql_only_count,
-                    "hnsw_only_count": report.hnsw_only_count,
-                    "unknown_count": report.unknown_count,
+                    "anomalous_ghost_count": report.anomalous_ghost_count,
+                    "benign_ghost_count": report.benign_ghost_count,
+                    "blocking_unknown_count": report.blocking_unknown_count,
                 }))
             return 4
 
@@ -1144,7 +1249,18 @@ def main(argv: list[str] | None = None) -> int:
                 collection_id=pre_seq["collection_id"],
                 vector_segment=pre_seq["vector_segment"],
             )
+            # Fix 2 — il flush gira in un PersistentClient SEPARATO (MCP ha rilasciato
+            # il suo su SIGUSR1). Il segmento fresco riprende dal pickle a
+            # vector_max_seq_id e ri-consuma dal WAL SOLO i record del proprio topic
+            # con seq_id > watermark. Quei record di backlog riletti GIÀ incrementano
+            # _num_log_records_since_last_persist (non solo le re-upsert nuove).
+            # Burstare l'intero sync_threshold è quindi una scelta DIFENSIVA
+            # conservativa per garantire l'attraversamento in TUTTI i casi.
             burst_n = max(sync_threshold + FLUSH_BURST_MARGIN, pre_seq["drift"] + FLUSH_BURST_MARGIN)
+            if burst_n < sync_threshold:
+                print(f"[flush] burst_n {burst_n} < sync_threshold {sync_threshold} → clamp",
+                      file=sys.stderr)
+                burst_n = sync_threshold
             chunk_ids = _load_existing_embedding_ids(con, pre_seq["metadata_segment"], burst_n)
         finally:
             con.close()
@@ -1220,6 +1336,10 @@ def main(argv: list[str] | None = None) -> int:
             vector_delta >= sync_threshold
             and post_seq["drift"] < DRIFT_WARNING
             and post_report.queue_total < queue_backlog_min
+            # Post-condizione: il flush deve aver compattato TUTTI i ghost.
+            # Niente assert in prod → success=False ⇒ rc=5 ⇒ auto_flush manda FAIL.
+            and post_report.benign_ghost_count == 0
+            and post_report.anomalous_ghost_count == 0
         )
 
         try:
@@ -1247,6 +1367,8 @@ def main(argv: list[str] | None = None) -> int:
                         "post_seq": post_seq,
                         "vector_seq_delta": vector_delta,
                         "post_queue_total": post_report.queue_total,
+                        "post_benign_ghost_count": post_report.benign_ghost_count,
+                        "post_anomalous_ghost_count": post_report.anomalous_ghost_count,
                         "result": result,
                         "success": success,
                     },
@@ -1269,6 +1391,8 @@ def main(argv: list[str] | None = None) -> int:
                 "burst_target": burst_n,
                 "vector_seq_delta": vector_delta,
                 "post_queue_total": post_report.queue_total,
+                "post_benign_ghost_count": post_report.benign_ghost_count,
+                "post_anomalous_ghost_count": post_report.anomalous_ghost_count,
                 "success": success,
             }, indent=2, default=str))
         else:

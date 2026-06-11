@@ -51,7 +51,8 @@ VEC_SEG_ID = "vec-seg-test"
 COLLECTION_ID = "coll-test"
 
 
-def _make_chroma_sqlite(db_path: str, *, embeddings: list[dict], queue_ids: list[str] | None = None) -> None:
+def _make_chroma_sqlite(db_path: str, *, embeddings: list[dict], queue_ids: list[str] | None = None,
+                        queue_ops: list[tuple] | None = None) -> None:
     """Create a minimal Chroma-shaped SQLite at db_path.
 
     Each entry in `embeddings` is a dict with keys:
@@ -134,14 +135,34 @@ def _make_chroma_sqlite(db_path: str, *, embeddings: list[dict], queue_ids: list
                 "INSERT INTO embedding_metadata (id, key, string_value, int_value, float_value, bool_value) VALUES (?, ?, ?, ?, ?, ?)",
                 (e["int_id"], key, sv, iv, fv, bv),
             )
+    OUR_TOPIC = f"persistent://default/default/{COLLECTION_ID}"
     seq = 1000
+    used: list[int] = []
     for qid in queue_ids:
         cur.execute(
             "INSERT INTO embeddings_queue (seq_id, operation, topic, id) VALUES (?, ?, ?, ?)",
-            (seq, 2, "default", qid),
+            (seq, 2, OUR_TOPIC, qid),
         )
+        used.append(seq)
         seq += 1
-    cur.execute("INSERT INTO max_seq_id VALUES (?, ?)", (META_SEG_ID, seq))
+    for item in (queue_ops or []):
+        # (op, id) | (op, id, topic) | (op, id, topic, seq)
+        op, qid = item[0], item[1]
+        topic = item[2] if len(item) > 2 else OUR_TOPIC
+        if len(item) > 3:
+            qseq = item[3]
+        else:
+            qseq = seq
+            seq += 1
+        cur.execute(
+            "INSERT INTO embeddings_queue (seq_id, operation, topic, id) VALUES (?, ?, ?, ?)",
+            (qseq, op, topic, qid),
+        )
+        used.append(qseq)
+    # META watermark deve coprire il MAX seq realmente inserito (anche con seq
+    # espliciti fuori sequenza), altrimenti il watermark metadata risulta < queue.
+    meta_max = (max(used) + 1) if used else 1000
+    cur.execute("INSERT INTO max_seq_id VALUES (?, ?)", (META_SEG_ID, meta_max))
     cur.execute("INSERT INTO max_seq_id VALUES (?, ?)", (VEC_SEG_ID, 1000))
     con.commit()
     con.close()
@@ -305,6 +326,9 @@ def test_audit_dry_run_reports_known_drift(synthetic_db):
     assert report.hnsw_only_count == 2
     assert report.queue_total == 0
     assert report.unknown_count == 0
+    # queue vuota → nessun DELETE pendente → entrambi i ghost anomali
+    assert report.anomalous_ghost_count == 2
+    assert report.benign_ghost_count == 0
     found_orphans = sorted(o.embedding_id for o in report.sql_only_orphans)
     assert found_orphans == sorted(synthetic_db["expected_orphan_ids"])
     found_ghosts = sorted(g.embedding_id for g in report.hnsw_only_ghosts)
@@ -918,3 +942,219 @@ def test_apply_proceeds_with_modern_ghosts_present(synthetic_db_with_modern_ghos
     assert upserted_ids == sorted(
         synthetic_db_with_modern_ghosts["expected_orphan_ids"]
     )
+
+
+# ============================================================
+# Fix 1/2 — benign ghost detection (topic + seq window) [round 2/3]
+# ============================================================
+
+OUR_TOPIC = f"persistent://default/default/{COLLECTION_ID}"
+_HEALTHY = [_make_doc_chunk(1, "doc_aaaaaaaaaaaa_chunk_0000", "doc_aaaaaaaaaaaa", "h.pdf", 0, "x")]
+_GHOST = "doc_dddddddddddd_chunk_0000"
+_HNSW = ["doc_aaaaaaaaaaaa_chunk_0000", _GHOST]   # _GHOST è HNSW-only
+
+
+def _build_drift_db(tmp_path, *, embeddings, hnsw_ids, queue_ops=None, registry=None):
+    """DB sintetico minimale per i test benigni. Ritorna (db_path, db_dir)."""
+    db_dir = tmp_path / "db"
+    db_dir.mkdir()
+    db_path = db_dir / "chroma.sqlite3"
+    _make_chroma_sqlite(str(db_path), embeddings=embeddings, queue_ops=queue_ops)
+    _make_hnsw_pickle(str(db_dir), VEC_SEG_ID, hnsw_ids)
+    (db_dir / "doc_registry.json").write_text(json.dumps(registry or {}))
+    return str(db_path), str(db_dir)
+
+
+def _build_and_patch(tmp_path, monkeypatch, **kw):
+    db_path, db_dir = _build_drift_db(tmp_path, **kw)
+    monkeypatch.setattr(rhi, "BASE_DIR", str(tmp_path))
+    monkeypatch.setattr(rhi, "DB_DIR", db_dir)
+    monkeypatch.setattr(rhi, "DB_PATH", db_path)
+    monkeypatch.setattr(rhi, "BACKUPS_DIR", str(tmp_path / "backups"))
+    monkeypatch.setattr(rhi, "MAINTENANCE_LOCK", str(tmp_path / "maintenance.lock"))
+    monkeypatch.setattr(rhi, "AUDIT_HISTORY_DIR", str(tmp_path / "logs" / "hnsw_audits"))
+    return db_path, db_dir
+
+
+def _enter_maint_and_backup(tmp_path):
+    (tmp_path / "maintenance.lock").write_text("123")
+    (tmp_path / "backups").mkdir(exist_ok=True)
+    (tmp_path / "backups" / "chroma_now.sqlite3.gz").write_text("fake")
+
+
+class FakeFlushCollection:
+    """Stand-in per il flush path: .get(ids, include) + .upsert(ids, documents, metadatas)."""
+
+    def __init__(self, docs):
+        self._docs = docs          # {id: (document, metadata)}
+        self.upserts = []
+
+    def get(self, ids, include=None):
+        oi, od, om = [], [], []
+        for i in ids:
+            if i in self._docs:
+                oi.append(i); od.append(self._docs[i][0]); om.append(self._docs[i][1])
+        return {"ids": oi, "documents": od, "metadatas": om}
+
+    def upsert(self, ids, documents, metadatas):
+        self.upserts.append({"ids": list(ids), "documents": list(documents), "metadatas": list(metadatas)})
+
+
+def _install_flush_mocks(monkeypatch, docs):
+    fake_collection = FakeFlushCollection(docs)
+
+    class _FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def get_collection(self, name, embedding_function=None):
+            return fake_collection
+
+    fake_chromadb = type(sys)("chromadb")
+    fake_chromadb.PersistentClient = _FakeClient
+    monkeypatch.setitem(sys.modules, "chromadb", fake_chromadb)
+
+    fake_embedding = type(sys)("embedding")
+    fake_embedding.get_embeddings = _deterministic_embed
+    fake_embedding.info = lambda: {"provider": "fake", "model": "fake", "dim": 4}
+    monkeypatch.setitem(sys.modules, "embedding", fake_embedding)
+    return fake_collection
+
+
+# ── audit-level: benignità (topic + finestra seq) ───────────────────────────
+
+def test_ghost_benign_when_delete_above_watermark(tmp_path):
+    db_path, db_dir = _build_drift_db(
+        tmp_path, embeddings=_HEALTHY, hnsw_ids=_HNSW,
+        queue_ops=[(3, _GHOST, OUR_TOPIC, 1500)])   # DELETE sopra VEC watermark (1000)
+    report = rhi.audit(db_path=db_path, db_dir=db_dir)
+    g = next(x for x in report.hnsw_only_ghosts if x.embedding_id == _GHOST)
+    assert g.benign is True
+    assert g.pending_delete_seq == 1500
+    assert report.benign_ghost_count == 1
+    assert report.anomalous_ghost_count == 0
+
+
+def test_ghost_anomalous_when_delete_at_or_below_watermark(tmp_path):
+    # DELETE a seq == watermark (1000): Chroma non lo rilegge → NON benigno.
+    db_path, db_dir = _build_drift_db(
+        tmp_path, embeddings=_HEALTHY, hnsw_ids=_HNSW,
+        queue_ops=[(3, _GHOST, OUR_TOPIC, 1000)])
+    report = rhi.audit(db_path=db_path, db_dir=db_dir)
+    g = next(x for x in report.hnsw_only_ghosts if x.embedding_id == _GHOST)
+    assert g.benign is False
+    assert report.benign_ghost_count == 0
+
+
+def test_ghost_anomalous_delete_then_upsert_above_watermark(tmp_path):
+    db_path, db_dir = _build_drift_db(
+        tmp_path, embeddings=_HEALTHY, hnsw_ids=_HNSW,
+        queue_ops=[(3, _GHOST, OUR_TOPIC, 1500), (2, _GHOST, OUR_TOPIC, 1600)])  # net=upsert
+    report = rhi.audit(db_path=db_path, db_dir=db_dir)
+    g = next(x for x in report.hnsw_only_ghosts if x.embedding_id == _GHOST)
+    assert g.benign is False
+
+
+def test_ghost_benign_upsert_then_delete_above_watermark(tmp_path):
+    db_path, db_dir = _build_drift_db(
+        tmp_path, embeddings=_HEALTHY, hnsw_ids=_HNSW,
+        queue_ops=[(2, _GHOST, OUR_TOPIC, 1500), (3, _GHOST, OUR_TOPIC, 1600)])  # net=delete
+    report = rhi.audit(db_path=db_path, db_dir=db_dir)
+    g = next(x for x in report.hnsw_only_ghosts if x.embedding_id == _GHOST)
+    assert g.benign is True
+    assert g.pending_delete_seq == 1600
+
+
+def test_ghost_delete_in_other_collection_is_not_benign(tmp_path):
+    OTHER = "persistent://default/default/other-collection-uuid"
+    db_path, db_dir = _build_drift_db(
+        tmp_path, embeddings=_HEALTHY, hnsw_ids=_HNSW,
+        queue_ops=[
+            (3, _GHOST, OTHER, 1500),                              # delete del ghost, topic altrui
+            (2, "doc_aaaaaaaaaaaa_chunk_0000", OUR_TOPIC, 1600),   # op sul nostro topic → resolve!=None
+        ])
+    report = rhi.audit(db_path=db_path, db_dir=db_dir)
+    g = next(x for x in report.hnsw_only_ghosts if x.embedding_id == _GHOST)
+    assert g.benign is False           # delete su topic altrui IGNORATO
+    assert report.benign_ghost_count == 0
+
+
+def test_ambiguous_topic_yields_no_benign(tmp_path):
+    T1 = f"persistent://default/default/{COLLECTION_ID}"
+    T2 = f"persistent://other-tenant/other-db/{COLLECTION_ID}"   # stesso suffisso /<cid>
+    GHOST2 = "doc_dddddddddddd_chunk_0001"
+    db_path, db_dir = _build_drift_db(
+        tmp_path, embeddings=_HEALTHY,
+        hnsw_ids=["doc_aaaaaaaaaaaa_chunk_0000", _GHOST, GHOST2],
+        queue_ops=[(3, _GHOST, T1, 1500), (3, GHOST2, T2, 1600)])
+    report = rhi.audit(db_path=db_path, db_dir=db_dir)
+    assert report.benign_ghost_count == 0
+    assert report.anomalous_ghost_count == 2
+
+
+def test_format_report_json_exposes_benign_fields(tmp_path):
+    db_path, db_dir = _build_drift_db(
+        tmp_path, embeddings=_HEALTHY, hnsw_ids=_HNSW,
+        queue_ops=[(3, _GHOST, OUR_TOPIC, 1500)])
+    report = rhi.audit(db_path=db_path, db_dir=db_dir)
+    j = rhi.format_report_json(report)
+    assert "anomalous_ghost_count" in j and "benign_ghost_count" in j and "blocking_unknown_count" in j
+    g = next(x for x in j["hnsw_only_ghosts"] if x["embedding_id"] == _GHOST)
+    assert g["benign"] is True and g["pending_delete_seq"] == 1500
+
+
+# ── CLI flush gate + post-condizione ────────────────────────────────────────
+
+def test_flush_cli_refuses_anomalous_ghost(tmp_path, monkeypatch):
+    # ghost SENZA delete pendente → anomalo → rc=4 (prima dell'import chromadb)
+    _build_and_patch(tmp_path, monkeypatch, embeddings=_HEALTHY, hnsw_ids=_HNSW, queue_ops=None)
+    _enter_maint_and_backup(tmp_path)
+    rc = rhi.main(["--flush-queue-backlog", "--no-history"])
+    assert rc == 4
+
+
+def test_flush_cli_allows_benign_ghost_reaches_burst(tmp_path, monkeypatch):
+    # benigno + drift actionable → gate passa; fake no-op → success False → rc=5 (NON 4)
+    _build_and_patch(tmp_path, monkeypatch, embeddings=_HEALTHY, hnsw_ids=_HNSW,
+                     queue_ops=[(3, _GHOST, OUR_TOPIC, 2000)])   # seq alto → drift>=800
+    _enter_maint_and_backup(tmp_path)
+    _install_flush_mocks(monkeypatch, {"doc_aaaaaaaaaaaa_chunk_0000": ("doc", {"source": "document"})})
+    rc = rhi.main(["--flush-queue-backlog", "--no-history"])
+    assert rc != 4          # gate ammette il benigno
+    assert rc == 5          # criterio di successo non soddisfatto (fake no-op)
+
+
+def test_flush_cli_postcondition_fails_when_ghost_remains(synthetic_db, monkeypatch):
+    # Simula flush che AVANZA vector_seq e DRENA la queue ma lascia un ghost benigno:
+    # tutti i criteri classici passano, solo la post-condizione ghost fallisce → rc=5.
+    Path(synthetic_db["lock_path"]).write_text("12345")
+    Path(synthetic_db["backups_dir"]).mkdir(exist_ok=True)
+    (Path(synthetic_db["backups_dir"]) / "chroma_now.sqlite3.gz").write_text("fake")
+
+    ghost = rhi.GhostChunk(embedding_id=_GHOST, classification="known_superseded_doc",
+                           note="", benign=True, pending_delete_seq=1500)
+
+    def _mk_report(queue_total):
+        return rhi.DriftReport(
+            timestamp="t", timestamp_unix=0, db_path="x",
+            metadata_segment=META_SEG_ID, vector_segment=VEC_SEG_ID,
+            sql_total=1, hnsw_total=2, queue_total=queue_total,
+            queue_oldest_iso=None, queue_newest_iso=None,
+            sql_only_orphans=[], hnsw_only_ghosts=[ghost], unknown_count=0)
+
+    reports = iter([_mk_report(400), _mk_report(0)])   # pre (actionable), post (drenata, ghost resta)
+    monkeypatch.setattr(rhi, "audit", lambda *a, **k: next(reports))
+    seqs = iter([
+        {"collection_id": "c", "metadata_segment": META_SEG_ID, "vector_segment": VEC_SEG_ID,
+         "vector_seq": 1000, "metadata_seq": 2000, "drift": 1000},   # pre
+        {"collection_id": "c", "metadata_segment": META_SEG_ID, "vector_segment": VEC_SEG_ID,
+         "vector_seq": 2000, "metadata_seq": 2000, "drift": 0},      # post avanzato
+    ])
+    monkeypatch.setattr(rhi, "_load_seq_state", lambda con, **k: next(seqs))
+    monkeypatch.setattr(rhi, "_load_existing_embedding_ids",
+                        lambda con, seg, n: ["doc_aaaaaaaaaaaa_chunk_0000"])
+    monkeypatch.setattr(rhi, "flush_queue_backlog",
+                        lambda **k: {"processed": 1, "skipped": 0, "errors": 0, "candidate_ids": 1})
+    _install_flush_mocks(monkeypatch, {})
+    rc = rhi.main(["--flush-queue-backlog", "--no-history"])
+    assert rc == 5
