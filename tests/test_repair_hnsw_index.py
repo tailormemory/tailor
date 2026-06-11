@@ -100,6 +100,10 @@ def _make_chroma_sqlite(db_path: str, *, embeddings: list[dict], queue_ids: list
             segment_id TEXT PRIMARY KEY,
             seq_id INTEGER
         );
+        CREATE TABLE collections (
+            id TEXT PRIMARY KEY,
+            name TEXT
+        );
         CREATE TABLE maintenance_log (
             id INT PRIMARY KEY,
             timestamp INT NOT NULL,
@@ -109,6 +113,7 @@ def _make_chroma_sqlite(db_path: str, *, embeddings: list[dict], queue_ids: list
     )
     cur.execute("INSERT INTO segments VALUES (?, ?, ?, ?)", (META_SEG_ID, "urn:chroma:segment/metadata/sqlite", "METADATA", COLLECTION_ID))
     cur.execute("INSERT INTO segments VALUES (?, ?, ?, ?)", (VEC_SEG_ID, "urn:chroma:segment/vector/hnsw-local-persisted", "VECTOR", COLLECTION_ID))
+    cur.execute("INSERT INTO collections VALUES (?, ?)", (COLLECTION_ID, rhi.COLLECTION_NAME))
 
     for e in embeddings:
         cur.execute(
