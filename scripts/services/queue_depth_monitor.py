@@ -20,8 +20,8 @@ Drift monitor (Path A azione 3): per ogni collection confronta
 max_seq_id VECTOR vs METADATA. Rileva drift e VECTOR-stuck PRIMA che la
 queue cresca oltre WARNING. Snapshot append-only in `drift_snapshots.jsonl`,
 alert state per (collection, level) in `drift_alert_state.json`.
-- WARNING      : drift > 100
-- CRITICAL     : drift > 500
+- WARNING      : drift > 800   (lazy compaction normale fino a sync_threshold=1000)
+- CRITICAL     : drift > 1500  (oltre sync_threshold → problema reale)
 - STUCK_VECTOR : vector_seq invariato e meta_seq avanzato tra 2 letture
 
 Skips silently when `maintenance.lock` is present.

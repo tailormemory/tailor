@@ -2,8 +2,10 @@
 
 Costruisce fixture sqlite minimali (collections/segments/max_seq_id) e invoca il
 monitor con --skip-queue --dry-run --ignore-snooze, così non tocca DB live né manda
-Telegram. Copre: WARNING (>100), CRITICAL (>500), NORMAL (0), STUCK_VECTOR,
+Telegram. Copre: WARNING (>800), CRITICAL (>1500), NORMAL (0), STUCK_VECTOR,
 decoding seq_id blob little-endian, e i campi dello snapshot jsonl.
+Soglie allineate a queue_depth_monitor.DRIFT_WARNING/DRIFT_CRITICAL (lazy
+compaction sotto sync_threshold=1000 è benigna).
 """
 
 import json
@@ -56,22 +58,24 @@ def _run(db, drift_snap, drift_state, extra=None):
 
 
 def test_drift_warning(tmp_path):
+    # drift 900: > DRIFT_WARNING(800), < DRIFT_CRITICAL(1500)
     db = tmp_path / "c.sqlite3"
-    _make_db(db, [{"name": "tailor_kb_v2", "vec_seq": 1000, "meta_seq": 1150}])
+    _make_db(db, [{"name": "tailor_kb_v2", "vec_seq": 1000, "meta_seq": 1900}])
     r = _run(db, tmp_path / "d.jsonl", tmp_path / "s.json")
     assert r.returncode == 0, r.stderr
     assert "would alert tailor_kb_v2:WARNING" in r.stdout
-    assert "`150`" in r.stdout
+    assert "`900`" in r.stdout
     assert "CRITICAL" not in r.stdout
 
 
 def test_drift_critical(tmp_path):
+    # drift 1600: > DRIFT_CRITICAL(1500)
     db = tmp_path / "c.sqlite3"
-    _make_db(db, [{"name": "tailor_kb_v2", "vec_seq": 317321, "meta_seq": 317917}])
+    _make_db(db, [{"name": "tailor_kb_v2", "vec_seq": 317321, "meta_seq": 318921}])
     r = _run(db, tmp_path / "d.jsonl", tmp_path / "s.json")
     assert r.returncode == 0, r.stderr
     assert "would alert tailor_kb_v2:CRITICAL" in r.stdout
-    assert "`596`" in r.stdout
+    assert "`1600`" in r.stdout
 
 
 def test_drift_normal(tmp_path):
@@ -85,8 +89,8 @@ def test_drift_normal(tmp_path):
 
 def test_stuck_vector(tmp_path):
     db = tmp_path / "c.sqlite3"
-    # vector fermo a 1000, meta avanzato 1100 -> 1200 (drift 200)
-    _make_db(db, [{"name": "tailor_kb_v2", "vec_seq": 1000, "meta_seq": 1200}])
+    # vector fermo a 1000, meta avanzato 1100 -> 1900 (drift 900 > WARNING 800)
+    _make_db(db, [{"name": "tailor_kb_v2", "vec_seq": 1000, "meta_seq": 1900}])
     drift_snap = tmp_path / "d.jsonl"
     drift_snap.write_text(json.dumps({
         "ts": "2026-05-28 20:00:00", "collection_name": "tailor_kb_v2",
@@ -97,7 +101,7 @@ def test_stuck_vector(tmp_path):
     r = _run(db, drift_snap, tmp_path / "s.json")
     assert r.returncode == 0, r.stderr
     assert "would alert tailor_kb_v2:STUCK_VECTOR" in r.stdout
-    # drift 200 → anche WARNING (trigger separato)
+    # drift 900 → anche WARNING (trigger separato)
     assert "would alert tailor_kb_v2:WARNING" in r.stdout
 
 
@@ -118,18 +122,19 @@ def test_no_stuck_when_vector_advances(tmp_path):
 
 
 def test_blob_seq_decoding(tmp_path):
+    # drift 1600 (> CRITICAL 1500) con seq_id blob little-endian
     db = tmp_path / "c.sqlite3"
-    _make_db(db, [{"name": "tailor_kb_v2", "vec_seq": 1000, "meta_seq": 1600,
+    _make_db(db, [{"name": "tailor_kb_v2", "vec_seq": 1000, "meta_seq": 2600,
                    "seq_as_blob": True}])
     r = _run(db, tmp_path / "d.jsonl", tmp_path / "s.json")
     assert r.returncode == 0, r.stderr
     assert "would alert tailor_kb_v2:CRITICAL" in r.stdout
-    assert "`600`" in r.stdout
+    assert "`1600`" in r.stdout
 
 
 def test_snapshot_fields_written(tmp_path):
     db = tmp_path / "c.sqlite3"
-    _make_db(db, [{"name": "tailor_kb_v2", "vec_seq": 1000, "meta_seq": 1150}])
+    _make_db(db, [{"name": "tailor_kb_v2", "vec_seq": 1000, "meta_seq": 1900}])
     drift_snap = tmp_path / "d.jsonl"
     _run(db, drift_snap, tmp_path / "s.json")
     lines = [json.loads(x) for x in drift_snap.read_text().splitlines() if x.strip()]
@@ -138,7 +143,7 @@ def test_snapshot_fields_written(tmp_path):
     for field in ("ts", "collection_name", "vector_seq", "meta_seq", "drift",
                   "vector_seq_delta_since_last", "meta_seq_delta_since_last", "status"):
         assert field in rec, f"campo mancante: {field}"
-    assert rec["drift"] == 150
+    assert rec["drift"] == 900
     assert rec["status"] == "WARNING"
 
 
@@ -146,7 +151,7 @@ def test_two_collections_independent(tmp_path):
     db = tmp_path / "c.sqlite3"
     _make_db(db, [
         {"name": "tailor_kb", "vec_seq": 5000, "meta_seq": 5000},      # NORMAL
-        {"name": "tailor_kb_v2", "vec_seq": 317321, "meta_seq": 317917},  # CRITICAL
+        {"name": "tailor_kb_v2", "vec_seq": 317321, "meta_seq": 318921},  # CRITICAL (drift 1600)
     ])
     r = _run(db, tmp_path / "d.jsonl", tmp_path / "s.json")
     assert r.returncode == 0, r.stderr
