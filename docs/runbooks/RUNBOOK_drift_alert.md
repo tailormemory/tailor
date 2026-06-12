@@ -8,15 +8,19 @@ Tutti i comandi `.venv/bin/python3` (non il `python3` di sistema — manca `chro
 
 ## 0. Contesto — chromadb #6975
 
-`PersistentLocalHnswSegment` (chromadb 1.5.x/1.5.9) **persiste l'indice su disco solo** quando una di due cose accade:
+`PersistentLocalHnswSegment` (chromadb 1.5.x/1.5.9) **persiste l'indice su disco solo** via `_persist()`, che ha **un solo** trigger automatico:
 
-1. il contatore di scritture in-memory supera `hnsw:sync_threshold` (default **1000**), **oppure**
-2. uno shutdown **graceful** (`System.stop()` / atexit) chiama `_persist()`.
+1. il contatore di scritture in-memory **cumulative** raggiunge `hnsw:sync_threshold` (default **1000** su `tailor_kb_v2`): `_persist()` applica gli UPSERT+DELETE pendenti, poi `purge_log()` ripulisce la WAL `embeddings_queue`.
+
+In assenza di quel trigger, l'unico modo di forzare il drain è un **burst manuale** di re-upsert ≥ `sync_threshold` via `repair_hnsw_index.py --flush-queue-backlog` — che è un **trigger di `_persist()`**, non un consumer della queue (vedi step 3).
+
+> ⚠️ **Non esiste un drain da shutdown.** L'atexit / `System.stop()` di chromadb 1.5.9 **non** persiste la WAL (verificato 10/06/2026). Il `PersistentClient` vive nei **globals del modulo**, slegato dal lifespan uvicorn: lo shutdown ASGI **non** chiama `System.stop()`. Quindi **nessun restart drena** — né graceful (bootout/bootstrap) né `kickstart -k`.
 
 Conseguenze pratiche:
 
-- Le scritture restano nel WAL `embeddings_queue` finché non scatta uno dei due trigger. Query e letture notturne **non** forzano il flush.
-- Un **restart non drena il backlog**: al boot il segmento ricarica il pickle alla `max_seq_id` vecchia e aspetta. In particolare `launchctl kickstart -k` (**SIGKILL**) salta lo shutdown graceful → la queue sopravvive **intatta**.
+- Le scritture restano nel WAL `embeddings_queue` finché non scatta `_persist()` (sync_threshold cumulative **oppure** burst flush). Query e letture notturne **non** forzano il flush.
+- Un **restart non drena il backlog** — in **qualunque** forma. Al boot il segmento ricarica il pickle alla `max_seq_id` vecchia e aspetta; il restart serve **solo a rinfrescare il client**, mai a drenare. `kickstart -k` (**SIGKILL**) è solo il caso più ovvio, ma anche il graceful lascia la queue **intatta**.
+- **Vincolo operativo:** mai riavviare l'MCP con upsert in-memory non ancora persistiti — un crash/restart pre-`_persist()` li perde e vanno ri-consumati. Restart sicuro **solo dopo** drain confermato (audit `queue=0` o flush riuscito).
 - Il **seq-drift** (gap `metadata_seq − vector_seq`) **non è perdita dati**: è lag del WAL. La perdita dati la misurano gli **orphans/ghosts** dell'audit, non il contatore seq.
 
 Ref upstream: chroma-core/chroma#6975. Tooling interno: [scripts/maintenance/repair_hnsw_index.py](../../scripts/maintenance/repair_hnsw_index.py).
@@ -105,13 +109,13 @@ ls ~/tailor/maintenance.lock 2>/dev/null && echo "ANCORA PRESENTE — verifica" 
 
 ### 3.5 — Restart MCP (operatore-side)
 
-Il flush ha scritto via client separato: l'HNSW in-memory del MCP in esecuzione è ora **stale** rispetto al disco. Restart per ricaricare il pickle fresco:
+Il flush ha scritto via client separato e ha **già persistito su disco** (`_persist()`): l'HNSW in-memory del MCP in esecuzione è ora **stale** rispetto al disco. Restart **solo per rinfrescare il client** e ricaricare il pickle fresco — il restart **non** drena nulla (§0):
 
 ```sh
-sudo launchctl kickstart system/com.tailor.mcp      # graceful (senza -k)
+sudo launchctl kickstart system/com.tailor.mcp      # rinfresca il client (vedi nota)
 ```
 
-> Preferire il restart **graceful** (senza `-k`): `-k` = SIGKILL salta lo shutdown pulito. Post-flush il disco è già persistito, quindi anche `-k` sarebbe data-safe, ma il graceful resta la regola (evita di reintrodurre un backlog non drenato su un futuro shutdown).
+> **Il restart non drena** — né graceful né `-k` (§0). Qui è sicuro perché il drain è **già** avvenuto via flush: il disco è persistito, quindi qualunque forma di restart è data-safe (vale il **vincolo §0**: mai riavviare con upsert in-memory non persistiti). Il graceful (senza `-k`) resta preferibile come buona prassi di shutdown pulito, **non** per un drain che non avviene.
 
 ### Verifica finale (post-flush)
 
@@ -128,7 +132,7 @@ Atteso: `orphans=0, ghosts=0, queue=0`, "no drift detected — index is in sync"
 - **`drift` alto ma `orphans=0`** → **non** è perdita dati, è lag WAL. Non serve `--apply`. Eventualmente flush se queue grande.
 - **`orphans>0`** → perdita reale lato HNSW → `--apply` (re-embed), **non** flush.
 - **`ghosts>0`** o **unknown** → **non** auto-remediare → investigare/escalation.
-- **queue immobile dopo un restart** → atteso con `kickstart -k`: il restart non drena (#6975). Serve flush o shutdown graceful.
+- **queue immobile dopo un restart** → atteso con **qualsiasi** restart (graceful o `-k`): il restart non drena (#6975, §0). Serve un `_persist()` reale → accumulo naturale a `sync_threshold` **oppure** burst `--flush-queue-backlog`.
 - **flush con MCP attivo e scrivente** → **mai**: race SIGSEGV. Sempre maintenance mode prima.
 - **`success=False` su run queue-triggered** → controllare `post_queue_total`: se non è sceso sotto `queue_backlog_min`, il persist non ha drenato → ri-audit.
 
@@ -136,7 +140,7 @@ Atteso: `orphans=0, ghosts=0, queue=0`, "no drift detected — index is in sync"
 
 ## Riferimenti
 
-- **Commit `ccef05d`** — `fix(maintenance): gate --flush-queue-backlog su queue_total oltre a drift`: introduce la gate dual `drift OR queue_total`, `--queue-backlog-min`, success-check stretto su `post_queue_total`, e correzione della stringa audit fuorviante ("Will be consumed on next MCP restart" → drena solo via shutdown graceful o flush).
+- **Commit `ccef05d`** — `fix(maintenance): gate --flush-queue-backlog su queue_total oltre a drift`: introduce la gate dual `drift OR queue_total`, `--queue-backlog-min`, success-check stretto su `post_queue_total`, e correzione della stringa audit fuorviante ("Will be consumed on next MCP restart" → drena solo via `_persist()` a `sync_threshold` o burst flush, **mai** da restart/shutdown).
 - **Sessione 02/06/2026** — diagnosi del caso `drift 362 / queue 363 / orphans 0`: il restart `kickstart -k` non drenò la queue; identificata la causa (SIGKILL salta `System.stop()`) e formalizzata questa procedura.
 - **Sessione 30/05/2026** — incidente live `drift 821 → 21` via burst idempotente sopra soglia (primo uso documentato del pattern flush).
 - Codice: [scripts/maintenance/repair_hnsw_index.py](../../scripts/maintenance/repair_hnsw_index.py) · [scripts/lib/chroma_persist.py](../../scripts/lib/chroma_persist.py)
