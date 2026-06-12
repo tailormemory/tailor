@@ -120,6 +120,9 @@ class DriftReport:
     queue_total: int
     queue_oldest_iso: str | None
     queue_newest_iso: str | None
+    collection_queue_pending_count: int = 0
+    collection_topic: str | None = None
+    collection_topic_ambiguous: bool = False
     sql_only_orphans: list[OrphanChunk] = field(default_factory=list)
     hnsw_only_ghosts: list[GhostChunk] = field(default_factory=list)
     unknown_count: int = 0  # orphans + ghosts of class "unknown"
@@ -470,18 +473,29 @@ def _queue_extents(con: sqlite3.Connection) -> tuple[int, str | None, str | None
     return row[0], row[1], row[2]
 
 
-def _resolve_collection_topic(con: sqlite3.Connection, collection_id: str) -> str | None:
+def _resolve_collection_topic(
+    con: sqlite3.Connection,
+    collection_id: str,
+) -> tuple[str | None, bool]:
     """Topic WAL esatto della collection (chromadb: persistent://<tenant>/<db>/<cid>).
     Lo ricava dal suffisso /<collection_id> (UUID → unico) invece di costruirlo,
-    così è robusto a tenant/database diversi. Ritorna None se non risolvibile
-    (queue priva di righe per questa collection, o >1 topic ambiguo) → il
-    chiamante tratta conservativamente (nessun benigno)."""
+    così è robusto a tenant/database diversi.
+
+    Ritorna (topic, ambiguous):
+      * 0 match  → (None, False): nessuna op pendente per la collection.
+      * 1 match  → (topic, False): topic risolto.
+      * >1 match → (None, True): stato ambiguo, non-actionable.
+    """
     cur = con.cursor()
     cur.execute("SELECT DISTINCT topic FROM embeddings_queue WHERE topic LIKE ?",
                 ("%/" + collection_id,))
     # endswith esatto: difesa contro il wildcard '_' di LIKE
     topics = [t for (t,) in cur.fetchall() if t and t.endswith("/" + collection_id)]
-    return topics[0] if len(topics) == 1 else None
+    if not topics:
+        return None, False
+    if len(topics) == 1:
+        return topics[0], False
+    return None, True
 
 
 def _load_final_queue_ops(
@@ -520,15 +534,25 @@ def audit(db_path: str | None = None, db_dir: str | None = None) -> DriftReport:
         db_dir = DB_DIR
     con = _open_sqlite_ro(db_path)
     try:
+        # Una singola read transaction mantiene tutte le SELECT sulla stessa
+        # fotografia WAL per l'intera diagnosi.
+        con.execute("BEGIN")
         meta_seg, vec_seg = _load_segment_ids(con)
+        collection_id = _load_collection_id(con)
+        vector_max_seq_id = _load_segment_seq(con, vec_seg)
+        our_topic, topic_ambiguous = _resolve_collection_topic(con, collection_id)
+        final_ops = (
+            _load_final_queue_ops(con, topic=our_topic, vector_max_seq_id=vector_max_seq_id)
+            if our_topic else {}
+        )
+
         cur = con.cursor()
         cur.execute("SELECT embedding_id FROM embeddings WHERE segment_id=?", (meta_seg,))
         sql_ids = {r[0] for r in cur.fetchall()}
         hnsw_ids = _load_hnsw_pickle_ids(db_dir, vec_seg)
-        cur.execute("SELECT id FROM embeddings_queue")
-        queue_ids = {r[0] for r in cur.fetchall()}
 
-        sql_only = sql_ids - hnsw_ids - queue_ids
+        pending_ids = set(final_ops)
+        sql_only = sql_ids - hnsw_ids - pending_ids
         hnsw_only = hnsw_ids - sql_ids
 
         sql_only_meta = _load_metadata_for(con, sql_only, meta_seg)
@@ -540,16 +564,6 @@ def audit(db_path: str | None = None, db_dir: str | None = None) -> DriftReport:
             int_id = meta.get("__int_id__", -1)
             cls = _classify_orphan(eid, meta)
             orphans.append(OrphanChunk(embedding_id=eid, int_id=int_id, metadata=meta, classification=cls))
-
-        # Fix 1: benignità scoped per topic della collection e per la finestra
-        # seq_id > vector_max_seq_id che Chroma rileggerà davvero.
-        collection_id = _load_collection_id(con)
-        vector_max_seq_id = _load_segment_seq(con, vec_seg)
-        our_topic = _resolve_collection_topic(con, collection_id)
-        final_ops = (
-            _load_final_queue_ops(con, topic=our_topic, vector_max_seq_id=vector_max_seq_id)
-            if our_topic else {}
-        )
 
         ghosts: list[GhostChunk] = []
         for eid in sorted(hnsw_only):
@@ -578,6 +592,9 @@ def audit(db_path: str | None = None, db_dir: str | None = None) -> DriftReport:
             queue_total=queue_total,
             queue_oldest_iso=queue_oldest,
             queue_newest_iso=queue_newest,
+            collection_queue_pending_count=len(final_ops),
+            collection_topic=our_topic,
+            collection_topic_ambiguous=topic_ambiguous,
             sql_only_orphans=orphans,
             hnsw_only_ghosts=ghosts,
             unknown_count=unknown,
@@ -682,7 +699,12 @@ def format_report_human(report: DriftReport, delta: Delta | None = None) -> str:
     lines.append("")
     lines.append(f"Collection: {COLLECTION_NAME}")
     lines.append(f"Active vector segment: {report.vector_segment}")
-    lines.append(f"SQL total: {report.sql_total}    HNSW total: {report.hnsw_total}    Queue: {report.queue_total}")
+    lines.append(
+        f"SQL total: {report.sql_total}    HNSW total: {report.hnsw_total}    "
+        f"Queue: {report.queue_total} (collection pending: {report.collection_queue_pending_count})"
+    )
+    if report.collection_topic_ambiguous:
+        lines.append("WARNING: collection WAL topic is ambiguous — mutating modes are blocked.")
     lines.append("")
     lines.append("DRIFT SUMMARY")
     lines.append(f"  SQL-only orphans:    {report.sql_only_count:>4}  (in SQL, missing from HNSW)")
@@ -796,7 +818,9 @@ def format_report_human(report: DriftReport, delta: Delta | None = None) -> str:
         lines.append("  --apply will REFUSE while these exist. Investigate before proceeding.")
     lines.append("")
 
-    if report.is_clean():
+    if report.collection_topic_ambiguous:
+        lines.append("EXIT: audit diagnostic only — collection WAL topic ambiguous; mutating modes blocked.")
+    elif report.is_clean():
         lines.append("EXIT: no drift detected — index is in sync.")
     elif report.has_unknowns():
         lines.append(f"EXIT: drift with {report.unknown_count} unknown chunk(s) — --apply blocked.")
@@ -945,6 +969,8 @@ def repair(
 ) -> dict[str, Any]:
     """Re-embed and upsert all SQL-only orphans. Caller is responsible for
     preconditions (maintenance mode, backup) and for the collection handle."""
+    if report.collection_topic_ambiguous:
+        raise RuntimeError("Cannot --apply while the collection WAL topic is ambiguous.")
     if report.has_unknowns():
         raise RuntimeError(
             f"Cannot --apply while {report.unknown_count} unknown drift entries exist. "
@@ -1188,6 +1214,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if report.is_clean() else 1
 
     # ----- MUTATING MODES -----
+    if report.collection_topic_ambiguous:
+        mode_name = "--flush-queue-backlog" if flush_mode else "--apply"
+        msg = (
+            f"\nREFUSING {mode_name}: collection WAL topic is ambiguous. "
+            f"Audit diagnostics are available, but mutation is not safe."
+        )
+        _print(msg, args.json)
+        if args.json:
+            print(json.dumps({"error": "ambiguous_collection_topic"}))
+        return 4
+
     if not is_in_maintenance_mode():
         mode_name = "--flush-queue-backlog" if flush_mode else "--apply"
         msg = (

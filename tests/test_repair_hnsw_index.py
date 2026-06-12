@@ -952,6 +952,8 @@ OUR_TOPIC = f"persistent://default/default/{COLLECTION_ID}"
 _HEALTHY = [_make_doc_chunk(1, "doc_aaaaaaaaaaaa_chunk_0000", "doc_aaaaaaaaaaaa", "h.pdf", 0, "x")]
 _GHOST = "doc_dddddddddddd_chunk_0000"
 _HNSW = ["doc_aaaaaaaaaaaa_chunk_0000", _GHOST]   # _GHOST è HNSW-only
+_ORPHAN = _make_doc_chunk(2, "doc_bbbbbbbbbbbb_chunk_0000", "doc_bbbbbbbbbbbb", "o.pdf", 0, "orphan")
+_ORPHAN_ID = _ORPHAN["embedding_id"]
 
 
 def _build_drift_db(tmp_path, *, embeddings, hnsw_ids, queue_ops=None, registry=None):
@@ -1023,6 +1025,62 @@ def _install_flush_mocks(monkeypatch, docs):
 
 # ── audit-level: benignità (topic + finestra seq) ───────────────────────────
 
+def _audit_orphan_with_ops(tmp_path, queue_ops):
+    db_path, db_dir = _build_drift_db(
+        tmp_path,
+        embeddings=[*_HEALTHY, _ORPHAN],
+        hnsw_ids=["doc_aaaaaaaaaaaa_chunk_0000"],
+        queue_ops=queue_ops,
+    )
+    return rhi.audit(db_path=db_path, db_dir=db_dir)
+
+
+def test_orphan_pending_op_in_other_topic_stays_orphan(tmp_path):
+    other = "persistent://default/default/other-collection-uuid"
+    report = _audit_orphan_with_ops(
+        tmp_path,
+        [(2, _ORPHAN_ID, other, 1500), (2, "other-id", OUR_TOPIC, 1600)],
+    )
+    assert [o.embedding_id for o in report.sql_only_orphans] == [_ORPHAN_ID]
+
+
+def test_orphan_upsert_above_watermark_is_pending_not_orphan(tmp_path):
+    report = _audit_orphan_with_ops(tmp_path, [(2, _ORPHAN_ID, OUR_TOPIC, 1500)])
+    assert report.sql_only_orphans == []
+
+
+@pytest.mark.parametrize("seq", [999, 1000])
+def test_orphan_upsert_at_or_below_watermark_stays_orphan(tmp_path, seq):
+    report = _audit_orphan_with_ops(tmp_path, [(2, _ORPHAN_ID, OUR_TOPIC, seq)])
+    assert [o.embedding_id for o in report.sql_only_orphans] == [_ORPHAN_ID]
+
+
+def test_orphan_delete_above_watermark_is_never_repaired(tmp_path):
+    report = _audit_orphan_with_ops(tmp_path, [(3, _ORPHAN_ID, OUR_TOPIC, 1500)])
+    coll = FakeCollection()
+    result = rhi.repair(report, embed_fn=_deterministic_embed, collection=coll)
+    assert report.sql_only_orphans == []
+    assert result["repaired"] == 0
+    assert coll.upsert_calls == []
+
+
+@pytest.mark.parametrize("seq", [999, 1000])
+def test_orphan_delete_at_or_below_watermark_stays_orphan(tmp_path, seq):
+    report = _audit_orphan_with_ops(tmp_path, [(3, _ORPHAN_ID, OUR_TOPIC, seq)])
+    assert [o.embedding_id for o in report.sql_only_orphans] == [_ORPHAN_ID]
+
+
+@pytest.mark.parametrize(
+    "ops",
+    [
+        [(3, _ORPHAN_ID, OUR_TOPIC, 1500), (2, _ORPHAN_ID, OUR_TOPIC, 1600)],
+        [(2, _ORPHAN_ID, OUR_TOPIC, 1500), (3, _ORPHAN_ID, OUR_TOPIC, 1600)],
+    ],
+)
+def test_orphan_uses_final_pending_operation(tmp_path, ops):
+    report = _audit_orphan_with_ops(tmp_path, ops)
+    assert report.sql_only_orphans == []
+
 def test_ghost_benign_when_delete_above_watermark(tmp_path):
     db_path, db_dir = _build_drift_db(
         tmp_path, embeddings=_HEALTHY, hnsw_ids=_HNSW,
@@ -1088,6 +1146,7 @@ def test_ambiguous_topic_yields_no_benign(tmp_path):
         hnsw_ids=["doc_aaaaaaaaaaaa_chunk_0000", _GHOST, GHOST2],
         queue_ops=[(3, _GHOST, T1, 1500), (3, GHOST2, T2, 1600)])
     report = rhi.audit(db_path=db_path, db_dir=db_dir)
+    assert report.collection_topic_ambiguous is True
     assert report.benign_ghost_count == 0
     assert report.anomalous_ghost_count == 2
 
@@ -1124,6 +1183,20 @@ def test_flush_cli_allows_benign_ghost_reaches_burst(tmp_path, monkeypatch):
     assert rc == 5          # criterio di successo non soddisfatto (fake no-op)
 
 
+@pytest.mark.parametrize("mode", ["--apply", "--flush-queue-backlog"])
+def test_mutating_modes_refuse_ambiguous_topic(tmp_path, monkeypatch, mode):
+    t1 = f"persistent://default/default/{COLLECTION_ID}"
+    t2 = f"persistent://other-tenant/other-db/{COLLECTION_ID}"
+    _build_and_patch(
+        tmp_path,
+        monkeypatch,
+        embeddings=_HEALTHY,
+        hnsw_ids=["doc_aaaaaaaaaaaa_chunk_0000"],
+        queue_ops=[(2, "one", t1, 1500), (2, "two", t2, 1600)],
+    )
+    assert rhi.main([mode, "--no-history"]) == 4
+
+
 def test_flush_cli_postcondition_fails_when_ghost_remains(synthetic_db, monkeypatch):
     # Simula flush che AVANZA vector_seq e DRENA la queue ma lascia un ghost benigno:
     # tutti i criteri classici passano, solo la post-condizione ghost fallisce → rc=5.
@@ -1140,6 +1213,7 @@ def test_flush_cli_postcondition_fails_when_ghost_remains(synthetic_db, monkeypa
             metadata_segment=META_SEG_ID, vector_segment=VEC_SEG_ID,
             sql_total=1, hnsw_total=2, queue_total=queue_total,
             queue_oldest_iso=None, queue_newest_iso=None,
+            collection_queue_pending_count=queue_total,
             sql_only_orphans=[], hnsw_only_ghosts=[ghost], unknown_count=0)
 
     reports = iter([_mk_report(400), _mk_report(0)])   # pre (actionable), post (drenata, ghost resta)
