@@ -141,7 +141,7 @@ Atteso: `orphans=0, ghosts=0, queue=0`, "no drift detected — index is in sync"
 ## Riferimenti
 
 - **Commit `ccef05d`** — `fix(maintenance): gate --flush-queue-backlog su queue_total oltre a drift`: introduce la gate dual `drift OR queue_total`, `--queue-backlog-min`, success-check stretto su `post_queue_total`, e correzione della stringa audit fuorviante ("Will be consumed on next MCP restart" → drena solo via `_persist()` a `sync_threshold` o burst flush, **mai** da restart/shutdown).
-- **Sessione 02/06/2026** — diagnosi del caso `drift 362 / queue 363 / orphans 0`: il restart `kickstart -k` non drenò la queue; identificata la causa (SIGKILL salta `System.stop()`) e formalizzata questa procedura.
+- **Sessione 02/06/2026** — diagnosi del caso `drift 362 / queue 363 / orphans 0`: il restart `kickstart -k` non drenò la queue; identificata la causa (SIGKILL salta `System.stop()`) e formalizzata questa procedura. **[Nota: causa superata dal §0 (10/06) — il drain non dipende dal tipo di restart; NESSUN restart drena, né graceful né `-k`.]**
 - **Sessione 30/05/2026** — incidente live `drift 821 → 21` via burst idempotente sopra soglia (primo uso documentato del pattern flush).
 - Codice: [scripts/maintenance/repair_hnsw_index.py](../../scripts/maintenance/repair_hnsw_index.py) · [scripts/lib/chroma_persist.py](../../scripts/lib/chroma_persist.py)
 - Note convenzioni: [docs/conventions.md](../conventions.md) · [CLAUDE.md](../../CLAUDE.md) §3 (authority boundaries), §7 (restart daemons)
