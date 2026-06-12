@@ -61,7 +61,9 @@ Queue backlog:     <Q>   pending ops in embeddings_queue
 
 ## 3. STEP 3 — Procedura flush completa (5 step)
 
-Da eseguire **solo** sul verdetto `orphans=0, ghosts=0, queue≥300` (o `drift≥800`). La gate di azionabilità è: `drift ≥ DRIFT_WARNING(800)` **OR** `queue_total ≥ FLUSH_QUEUE_BACKLOG_MIN(300)` — vedi commit `ccef05d`. Override soglia: `--queue-backlog-min N`.
+Da eseguire **solo** sul verdetto `orphans=0, ghosts=0, collection_pending≥300` (o `drift≥800`). La gate di azionabilità è: `drift ≥ DRIFT_WARNING(800)` **OR** `collection_queue_pending_count ≥ FLUSH_QUEUE_BACKLOG_MIN(300)` — vedi commit `ccef05d` (gate dual) e lo switch a `collection_queue_pending_count` (#6975). Override soglia: `--queue-backlog-min N`.
+
+> **Metrica di gating = `collection_queue_pending_count`, non `queue_total`.** La gate (tool e auto-flush) si basa sul backlog **azionabile per la collection** sopra il watermark (`collection_queue_pending_count`), non sul `queue_total` **globale** dell'`embeddings_queue`. Motivo: con WAL multi-topic un backlog di *altri* topic gonfia `queue_total` senza rendere questa collection flushabile (e viceversa). `queue_total` resta esposto come **metrica globale di osservabilità** in audit/log/Telegram, ma NON decide il gate. Missing-field in auto-flush: campo `collection_queue_pending_count` assente (tool vecchio) → fallback a `queue_total` (status-quo, WARN); presente ma malformato/negativo → `schema_invalid` → escalate. Refuse del tool quando il drift è ≥ soglia ma `collection_pending=0`: error `collection_queue_empty` (erede di `queue_empty`, entrambi allowlistati nel rolling deploy).
 
 > **Automazione (default).** Questa intera procedura 5-step è ora eseguita non-presidiata dal job `com.tailor.auto-flush-queue` ([scripts/services/auto_flush_queue.py](../../scripts/services/auto_flush_queue.py), alle 08:00/14:00/20:00, fuori dal nightly delle 02:00). Gli orari non sovrapposti sono la mitigazione B-lean della race residua tra manutenzioni non coordinate. Il job agisce sul caso #6975-puro (`queue ≥ 300, orphans=0, ghosts=0, unknown=0`). Maintenance via segnali (no sudo), restart via grant NOPASSWD `unload`+`load`. Telegram START/SUCCESS/FAIL e log in `logs/auto_flush.log`. La procedura manuale qui sotto resta il **fallback** quando il job è disabilitato, fallisce (Telegram FAIL → investigare, non ritentare alla cieca), o quando il verdetto NON è #6975-puro (orphans/ghosts/unknown > 0 → il job manda ESCALATION e non agisce).
 
@@ -96,7 +98,7 @@ Esegue un burst idempotente di `max(sync_threshold+100, drift+100)` re-upsert �
 **Successo** (exit 0) richiede tutte e tre:
 - `vector_seq_delta ≥ sync_threshold` (il burst ha superato la soglia → persist avvenuto)
 - `post_drift < DRIFT_WARNING`
-- `post_queue_total < queue_backlog_min` (la queue è davvero scesa)
+- `post_collection_queue_pending_count < queue_backlog_min` (il backlog azionabile della collection è davvero sceso; `post_queue_total` resta esposto come metrica globale)
 
 Se `WARN — flush did not meet success criteria`: **non ritentare alla cieca**, ri-audit e investigare.
 
@@ -134,7 +136,7 @@ Atteso: `orphans=0, ghosts=0, queue=0`, "no drift detected — index is in sync"
 - **`ghosts>0`** o **unknown** → **non** auto-remediare → investigare/escalation.
 - **queue immobile dopo un restart** → atteso con **qualsiasi** restart (graceful o `-k`): il restart non drena (#6975, §0). Serve un `_persist()` reale → accumulo naturale a `sync_threshold` **oppure** burst `--flush-queue-backlog`.
 - **flush con MCP attivo e scrivente** → **mai**: race SIGSEGV. Sempre maintenance mode prima.
-- **`success=False` su run queue-triggered** → controllare `post_queue_total`: se non è sceso sotto `queue_backlog_min`, il persist non ha drenato → ri-audit.
+- **`success=False` su run queue-triggered** → controllare `post_collection_queue_pending_count` (metrica di gating): se non è sceso sotto `queue_backlog_min`, il persist non ha drenato il backlog azionabile della collection → ri-audit. `post_queue_total` (globale) può restare alto per backlog di altri topic senza implicare un fallimento.
 
 ---
 

@@ -36,9 +36,14 @@ def _isolate_log_path(monkeypatch, tmp_path):
 
 def _audit(queue=0, orphans=0, ghosts=0, unknown=0, benign_ghosts=0,
            anomalous_ghost_count="auto", blocking_unknown_count="auto",
-           with_benign_key=True, ghosts_list="auto", queue_total="auto"):
+           with_benign_key=True, ghosts_list="auto", queue_total="auto",
+           collection_pending="absent"):
     """ghosts/benign_ghosts costruiscono la lista; gli override 'raw'
-    (ghosts_list, queue_total, *_count) servono ai test di incoerenza schema."""
+    (ghosts_list, queue_total, *_count) servono ai test di incoerenza schema.
+
+    collection_pending: 'absent' (default) → campo collection_queue_pending_count
+    NON iniettato (deploy misto / tool vecchio → fallback queue_total). Un valore
+    esplicito (int o malformato) inietta il campo → metrica primaria del gate."""
     gl = [{"embedding_id": f"g{i}", **({"benign": False} if with_benign_key else {})}
           for i in range(ghosts)]
     gl += [{"embedding_id": f"b{i}", "benign": True} for i in range(benign_ghosts)]
@@ -48,6 +53,8 @@ def _audit(queue=0, orphans=0, ghosts=0, unknown=0, benign_ghosts=0,
         "unknown_count": unknown,
     }
     a["queue_total"] = queue if queue_total == "auto" else queue_total
+    if collection_pending != "absent":
+        a["collection_queue_pending_count"] = collection_pending
     if anomalous_ghost_count != "auto":
         a["anomalous_ghost_count"] = anomalous_ghost_count
     if blocking_unknown_count != "auto":
@@ -213,7 +220,7 @@ def test_gate_act_on_drift_with_queue_below_min():
                      anomalous_ghost_count=0, blocking_unknown_count=0),
         qmin=300)
     assert action == "act"
-    assert "drift=850" in reason and "queue=10" in reason
+    assert "drift=850" in reason and "queue_total=10" in reason
 
 
 def test_gate_skip_drift_below_warning_queue_below_min():
@@ -223,7 +230,7 @@ def test_gate_skip_drift_below_warning_queue_below_min():
                      anomalous_ghost_count=0, blocking_unknown_count=0),
         qmin=300)
     assert action == "skip"
-    assert "drift=500" in reason and "queue=100" in reason
+    assert "drift=500" in reason and "queue_total=100" in reason
 
 
 def test_gate_drift_missing_falls_back_to_queue_only_no_escalate():
@@ -260,6 +267,62 @@ def test_gate_drift_fields_do_not_bypass_orphan_escalate():
         _audit_drift(drift=900, drift_warning=800, queue=10, orphans=2),
         qmin=300)
     assert action == "escalate"
+
+
+# ──────── gate: metrica collection_queue_pending_count (#6975, switch) ────────
+
+def test_gate_act_on_collection_pending_queue_total_irrelevant():
+    # collection_pending >= min con queue_total basso → act sul backlog azionabile.
+    action, reason = afq.evaluate_gate(
+        _audit(queue_total=5, collection_pending=363,
+               anomalous_ghost_count=0, blocking_unknown_count=0),
+        qmin=300)
+    assert action == "act"
+    assert "collection_pending=363>=min=300" in reason
+    assert "queue_total=5" in reason                   # globale riportato (osservabilità)
+
+
+def test_gate_skip_high_global_queue_but_collection_pending_below_min():
+    # backlog globale alto (altro topic) ma collection_pending < min → NO act.
+    action, reason = afq.evaluate_gate(
+        _audit(queue_total=5000, collection_pending=50,
+               anomalous_ghost_count=0, blocking_unknown_count=0),
+        qmin=300)
+    assert action == "skip"
+    assert "collection_pending=50" in reason and "queue_total=5000" in reason
+
+
+def test_gate_act_on_drift_safety_net_with_collection_pending_below_min():
+    # drift >= warning, collection_pending < min → act via drift (rete di sicurezza).
+    action, reason = afq.evaluate_gate(
+        _audit_drift(drift=850, drift_warning=800, collection_pending=10, queue_total=5000,
+                     anomalous_ghost_count=0, blocking_unknown_count=0),
+        qmin=300)
+    assert action == "act"
+    assert "drift=850>=warning=800" in reason
+
+
+def test_gate_collection_pending_absent_falls_back_to_queue_total():
+    # campo assente (tool vecchio / deploy misto) → fallback queue_total, NO escalate.
+    action_act, reason_act = afq.evaluate_gate(_audit(queue_total=400), qmin=300)
+    assert action_act == "act"
+    assert "fallback queue_total=400" in reason_act
+    action_skip, _ = afq.evaluate_gate(_audit(queue_total=100), qmin=300)
+    assert action_skip == "skip"
+
+
+def test_gate_collection_pending_malformed_escalates_schema_invalid():
+    # campo PRESENTE ma malformato/negativo → schema_invalid escalate (≠ fallback).
+    action_neg, reason_neg = afq.evaluate_gate(
+        _audit(queue_total=400, collection_pending=-5,
+               anomalous_ghost_count=0, blocking_unknown_count=0),
+        qmin=300)
+    assert action_neg == "escalate" and "schema_invalid" in reason_neg
+    action_nan, _ = afq.evaluate_gate(
+        _audit(queue_total=400, collection_pending="NaN",
+               anomalous_ghost_count=0, blocking_unknown_count=0),
+        qmin=300)
+    assert action_nan == "escalate"
 
 
 def _drive_main_escalation(monkeypatch, audit_obj, sent):
@@ -598,6 +661,32 @@ def test_run_procedure_rc4_queue_empty_is_managed_escalation(monkeypatch, tmp_pa
     assert rc == 0                                          # gestito (alert inviato), non sano
     assert any("DRIFT NON FLUSHABILE" in m for m in calls["telegram"])
     assert not any("FAIL" in m for m in calls["telegram"])  # NON il ramo FAIL generico
+
+
+def test_run_procedure_rc4_collection_queue_empty_is_managed_escalation(monkeypatch, tmp_path):
+    # Nuovo error code post-switch: drift ≥ soglia ma collection_pending=0 → escalation
+    # gestita con messaggio collection-scoped (NON il vecchio "embeddings_queue è vuota").
+    flush = {"error": "collection_queue_empty", "collection_queue_pending_count": 0,
+             "queue_total": 5000, "pre": {"drift": 850}}
+    calls = _stub_procedure(monkeypatch, tmp_path, flush=(4, flush), restart="healthy")
+    rc = afq.run_procedure(_audit_act(), dry_run=False)
+    assert rc == 0
+    msg = next(m for m in calls["telegram"] if "DRIFT NON FLUSHABILE" in m)
+    assert "collection_queue_pending=0" in msg              # messaggio collection-scoped
+    assert "embeddings_queue" not in msg.lower()            # NON il vecchio testo queue-globale
+    assert not any("— FAIL" in m for m in calls["telegram"])
+
+
+@pytest.mark.parametrize("err", ["queue_empty", "collection_queue_empty"])
+def test_run_procedure_rc4_both_empty_errors_same_classification(monkeypatch, tmp_path, err):
+    # Rolling deploy: il daemon nuovo riconosce ENTRAMBI gli error code (tool vecchio
+    # emette ancora "queue_empty", nuovo "collection_queue_empty") → stessa escalation.
+    flush = {"error": err, "pre": {"drift": 850}}
+    calls = _stub_procedure(monkeypatch, tmp_path, flush=(4, flush), restart="healthy")
+    rc = afq.run_procedure(_audit_act(), dry_run=False)
+    assert rc == 0
+    assert any("DRIFT NON FLUSHABILE" in m for m in calls["telegram"])
+    assert not any("— FAIL" in m for m in calls["telegram"])
 
 
 def test_run_procedure_rc4_ambiguous_topic_is_managed_escalation(monkeypatch, tmp_path):

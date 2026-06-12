@@ -464,30 +464,47 @@ def evaluate_gate(audit: dict, qmin: int) -> tuple[str, str]:
 
     Con indice pulito (no orphans/anomali/blocking_unknown, guard schema_invalid
     intatto) si AGISCE se la queue è sopra soglia OPPURE se il seq-drift è ≥
-    drift_warning. La metrica queue resta `queue_total` (INVARIATA: lo switch a
-    collection_pending è DEFERRED, fuori scope).
+    drift_warning. La metrica queue è `collection_queue_pending_count` (backlog
+    AZIONABILE per la collection sopra il watermark), NON `queue_total` (globale,
+    multi-topic: un backlog di altri topic non rende flushabile questa collection).
 
-    Missing-field (deploy window: daemon nuovo + tool vecchio): se drift o
-    drift_warning mancano, il ramo drift è inerte e il gate degrada al
-    comportamento odierno (solo queue_total). Status quo safe: niente escalate,
-    niente default drift=0. La WARN relativa la logga main() (qui è funzione pura).
+    Missing-field a DUE rami distinti sulla metrica queue (input primario):
+      * collection_queue_pending_count ASSENTE → deploy misto (tool vecchio) →
+        fallback a queue_total, status-quo safe, niente escalate (WARN in main()).
+      * collection_queue_pending_count PRESENTE ma malformato/negativo (_nonneg_int
+        → None) → schema_invalid → escalate (valore corrotto della metrica
+        primaria ≠ incompatibilità di versione).
+    Per drift/drift_warning resta il degrado inerte (assenti → ramo drift spento,
+    fallback queue-only). queue_total resta SEMPRE riportato (osservabilità globale).
     """
     gc = _ghost_counts(audit)
-    queue = _nonneg_int(audit.get("queue_total", 0))
+    queue_total = _nonneg_int(audit.get("queue_total", 0))
     orphans_raw = audit.get("sql_only_orphans", [])
     orphans = len(orphans_raw) if isinstance(orphans_raw, list) else None
 
+    # Metrica queue primaria: collection_queue_pending_count. Assente → fallback
+    # queue_total. Presente-ma-malformata → cqp=None → escalate (sotto).
+    cqp_present = "collection_queue_pending_count" in audit
+    cqp = _nonneg_int(audit["collection_queue_pending_count"]) if cqp_present else None
+
     # schema_invalid / campi base non interpretabili → escalate forzato.
-    if gc.schema_invalid or queue is None or orphans is None:
+    # cqp malformato escala SOLO se la chiave è presente (assente = deploy misto).
+    if gc.schema_invalid or queue_total is None or orphans is None or (cqp_present and cqp is None):
         return "escalate", (f"schema_invalid: audit JSON incoerente "
-                            f"(queue_total={audit.get('queue_total')!r}, "
+                            f"(collection_queue_pending_count={audit.get('collection_queue_pending_count')!r}, "
+                            f"queue_total={audit.get('queue_total')!r}, "
                             f"sql_only_orphans={type(orphans_raw).__name__}) → escalate conservativo")
+
+    # Metrica decisionale: collection_pending se presente, altrimenti fallback globale.
+    queue = cqp if cqp_present else queue_total
+    qmetric = (f"collection_pending={cqp} queue_total={queue_total}" if cqp_present
+               else f"collection_pending=n/d→fallback queue_total={queue_total}")
 
     leg = " [schema legacy: benignità sconosciuta, conservativo]" if gc.legacy else ""
     if orphans > 0 or gc.anomalous > 0 or gc.blocking_unknown > 0:
         return "escalate", (f"orphans={orphans} anomalous_ghosts={gc.anomalous} "
                             f"blocking_unknown={gc.blocking_unknown} "
-                            f"(benign_ghosts={gc.benign} ignorati) queue={queue}{leg}")
+                            f"(benign_ghosts={gc.benign} ignorati) {qmetric}{leg}")
 
     # Ramo drift (additivo). _nonneg_int su entrambi i campi: assente/malformato →
     # None → ramo inerte → fallback queue-only (status quo safe, no crash).
@@ -503,12 +520,13 @@ def evaluate_gate(audit: dict, qmin: int) -> tuple[str, str]:
     if queue_actionable or drift_actionable:
         triggers = []
         if queue_actionable:
-            triggers.append(f"queue={queue}>=min={qmin}")
+            triggers.append(f"collection_pending={queue}>=min={qmin}" if cqp_present
+                            else f"queue_total={queue}>=min={qmin}")
         if drift_actionable:
             triggers.append(f"drift={drift}>=warning={drift_warning}")
-        return "act", (f"{' & '.join(triggers)}; queue={queue} {drift_note}; indice pulito "
+        return "act", (f"{' & '.join(triggers)}; {qmetric} {drift_note}; indice pulito "
                        f"modulo {gc.benign} ghost benigni (#6975 puro){leg}")
-    return "skip", (f"queue={queue}<min={qmin}, {drift_note}, nessun drift anomalo "
+    return "skip", (f"{qmetric}<min={qmin}, {drift_note}, nessun drift anomalo "
                     f"(benign_ghosts={gc.benign}){leg}")
 
 
@@ -520,8 +538,12 @@ def evaluate_gate(audit: dict, qmin: int) -> tuple[str, str]:
 # Validazione stretta: serve la COPPIA (rc=4, error ∈ allowlist), mai rc=4 da solo.
 # NON allargare: ogni altro error / rc → FAIL generico (return 1).
 # `unknown_drift_types` è apply-only oggi (il flush non lo emette): sola difesa futura.
+# "collection_queue_empty" è l'erede di "queue_empty" dopo lo switch del gate a
+# collection_queue_pending_count: entrambi restano allowlistati durante il rolling
+# deploy (daemon nuovo + tool vecchio che emette ancora "queue_empty", o viceversa).
 REFUSE_ALLOWLIST = frozenset({
-    "ambiguous_collection_topic", "anomalous_drift", "queue_empty", "unknown_drift_types",
+    "ambiguous_collection_topic", "anomalous_drift", "queue_empty",
+    "collection_queue_empty", "unknown_drift_types",
 })
 
 
@@ -546,10 +568,11 @@ def run_procedure(audit: dict, dry_run: bool) -> int:
     """Esegue la 5-step. Ritorna exit code (0 = success pieno)."""
     qmin = queue_min()
     queue0 = int(audit.get("queue_total", 0))
+    cqp0 = audit.get("collection_queue_pending_count")   # metrica decisionale (pre); None se tool vecchio
 
     if dry_run:
-        log("DRY_RUN", f"agirei: 5-step flush, queue={queue0} min={qmin}")
-        print(f"DRY-RUN would run 5-step flush (queue={queue0}, min={qmin})")
+        log("DRY_RUN", f"agirei: 5-step flush, collection_pending={cqp0} queue_total={queue0} min={qmin}")
+        print(f"DRY-RUN would run 5-step flush (collection_pending={cqp0}, queue_total={queue0}, min={qmin})")
         return 0
 
     gc = _ghost_counts(audit)
@@ -557,7 +580,7 @@ def run_procedure(audit: dict, dry_run: bool) -> int:
                   if gc.benign else "orphans=0, ghosts=0")
     send_telegram(
         "🧹 *TAILOR auto-flush — START*\n"
-        f"Queue backlog: `{queue0}` (≥ min {qmin})\n"
+        f"Collection pending: `{cqp0}` (min {qmin}) · queue_total globale: `{queue0}`\n"
         f"Indice pulito ({ghost_note}) → flush #6975 automatico in corso."
     )
 
@@ -624,8 +647,14 @@ def run_procedure(audit: dict, dry_run: bool) -> int:
     kind, skipped_n = _classify_flush(flush_json)
     success = (flush_rc == 0)
     post_queue = (flush_json or {}).get("post_queue_total")
+    post_cqp = (flush_json or {}).get("post_collection_queue_pending_count")
+    flush_trigger = (flush_json or {}).get("flush_trigger")
     pre = (flush_json or {}).get("pre", {}) or {}
     post = (flush_json or {}).get("post", {}) or {}
+    # Quintupla di strumentazione (ogni esito flush): queue_total / collection_pending
+    # / drift / trigger / valori pre+post — per il forensic in logs/auto_flush.log.
+    metrics5 = (f"queue_total={queue0}->{post_queue} collection_pending={cqp0}->{post_cqp} "
+                f"drift={pre.get('drift')}->{post.get('drift')} trigger={flush_trigger}")
 
     # ── Rifiuto strutturato del tool (rc=4 + error allowlisted) ───────────────
     # Stato non auto-remediabile diagnosticato dal tool, NESSUNA mutazione: il
@@ -644,12 +673,13 @@ def run_procedure(audit: dict, dry_run: bool) -> int:
                 "Restart manuale: `sudo launchctl unload/load /Library/LaunchDaemons/com.tailor.mcp.plist`."
             )
             return 1
-        if refuse_err == "queue_empty":
-            log("ESCALATE", f"drift non flushabile (queue_empty, rc=4) restart={restart_state}")
+        if refuse_err in ("queue_empty", "collection_queue_empty"):
+            log("ESCALATE", f"drift non flushabile ({refuse_err}, rc=4) restart={restart_state}")
             send_telegram(
                 "⚠️ *TAILOR auto-flush — ESCALATION — DRIFT NON FLUSHABILE*\n"
-                "Drift ≥ soglia ma `embeddings_queue` è vuota: il WAL non è replayable "
-                "(write/persist persi). NON ritentare il flush — investigare i write "
+                "Drift ≥ soglia ma nessuna op netta replayable per la collection sopra il "
+                "watermark (`collection_queue_pending=0`): il WAL non ha backlog flushabile "
+                "per questa collection. NON ritentare il flush — investigare i write/persist "
                 "mancanti o valutare un rebuild dell'indice.\n"
                 f"Restart MCP: `{restart_state}`."
             )
@@ -702,11 +732,11 @@ def run_procedure(audit: dict, dry_run: bool) -> int:
     if flush_contract_ok:
         partial_note = f" ({skipped_n} upsert saltati)" if (skipped_n or 0) > 0 else ""
         if restarted:
-            log("SUCCESS", f"flush queue {queue0}->{post_queue} drift {pre.get('drift')}->{post.get('drift')} "
-                           f"skipped={skipped_n} restart=OK")
+            log("SUCCESS", f"flush {metrics5} skipped={skipped_n} restart=OK")
             send_telegram(
                 "✅ *TAILOR auto-flush — SUCCESS*\n"
-                f"Queue: `{queue0}` → `{post_queue}`\n"
+                f"Collection pending: `{cqp0}` → `{post_cqp}`\n"
+                f"Queue total (globale): `{queue0}` → `{post_queue}`\n"
                 f"Drift: `{pre.get('drift')}` → `{post.get('drift')}`\n"
                 f"Vector seq Δ: `{(flush_json or {}).get('vector_seq_delta')}`{partial_note}\n"
                 "Restart MCP: OK (graceful)"
@@ -723,7 +753,7 @@ def run_procedure(audit: dict, dry_run: bool) -> int:
         return 1
 
     # rc != 0 oppure contratto JSON incompleto/malformato → fallimento.
-    log("FAIL", f"flush rc={flush_rc} kind={kind} post_queue={post_queue} "
+    log("FAIL", f"flush rc={flush_rc} kind={kind} {metrics5} "
                 f"json={json.dumps(flush_json or {})[:300]}")
     pbg = (flush_json or {}).get("post_benign_ghost_count")
     pag = (flush_json or {}).get("post_anomalous_ghost_count")

@@ -1316,12 +1316,17 @@ def main(argv: list[str] | None = None) -> int:
 
         queue_backlog_min = args.queue_backlog_min
         drift_actionable = pre_seq["drift"] >= DRIFT_WARNING
-        queue_actionable = report.queue_total >= queue_backlog_min
+        # Metrica gate = collection_queue_pending_count (backlog AZIONABILE per la
+        # collection sopra il watermark), NON queue_total (globale, multi-topic:
+        # backlog di altri topic non rende flushabile questa collection). queue_total
+        # resta riportato per osservabilità. Ramo drift e min=300 invariati.
+        queue_actionable = report.collection_queue_pending_count >= queue_backlog_min
         if not drift_actionable and not queue_actionable:
             msg = (
                 f"\nWARNING --flush-queue-backlog not needed: drift={pre_seq['drift']} "
-                f"is below WARNING={DRIFT_WARNING} and queue_total={report.queue_total} "
-                f"is below QUEUE_BACKLOG_MIN={queue_backlog_min}."
+                f"is below WARNING={DRIFT_WARNING} and collection_queue_pending="
+                f"{report.collection_queue_pending_count} is below "
+                f"QUEUE_BACKLOG_MIN={queue_backlog_min} (queue_total={report.queue_total}, globale)."
             )
             _print(msg, args.json)
             if args.json:
@@ -1332,20 +1337,28 @@ def main(argv: list[str] | None = None) -> int:
                     },
                     "pre": pre_seq,
                     "drift_warning": DRIFT_WARNING,
+                    "collection_queue_pending_count": report.collection_queue_pending_count,
                     "queue_total": report.queue_total,
                     "queue_backlog_min": queue_backlog_min,
                 }, indent=2))
             return 0
         flush_trigger = "drift" if drift_actionable else "queue_backlog"
 
-        if report.queue_total == 0:
+        if report.collection_queue_pending_count == 0:
             msg = (
-                f"\nREFUSING --flush-queue-backlog: drift={pre_seq['drift']} but embeddings_queue is empty. "
+                f"\nREFUSING --flush-queue-backlog: drift={pre_seq['drift']} but no net replayable "
+                f"op pending for this collection above the watermark "
+                f"(collection_queue_pending=0, queue_total={report.queue_total} globale). "
                 f"This does not match the chromadb#6975 queue-backlog pattern."
             )
             _print(msg, args.json)
             if args.json:
-                print(json.dumps({"error": "queue_empty", "pre": pre_seq}, indent=2))
+                print(json.dumps({
+                    "error": "collection_queue_empty",
+                    "collection_queue_pending_count": report.collection_queue_pending_count,
+                    "queue_total": report.queue_total,
+                    "pre": pre_seq,
+                }, indent=2))
             return 4
 
         # Lazy imports — only needed for the mutating Chroma flush path.
@@ -1384,7 +1397,7 @@ def main(argv: list[str] | None = None) -> int:
         success = (
             vector_delta >= sync_threshold
             and post_seq["drift"] < DRIFT_WARNING
-            and post_report.queue_total < queue_backlog_min
+            and post_report.collection_queue_pending_count < queue_backlog_min
             # Post-condizione: il flush deve aver compattato TUTTI i ghost.
             # Niente assert in prod → success=False ⇒ rc=5 ⇒ auto_flush manda FAIL.
             and post_report.benign_ghost_count == 0
@@ -1415,7 +1428,10 @@ def main(argv: list[str] | None = None) -> int:
                         "pre_seq": pre_seq,
                         "post_seq": post_seq,
                         "vector_seq_delta": vector_delta,
+                        "queue_total": report.queue_total,
                         "post_queue_total": post_report.queue_total,
+                        "collection_queue_pending_count": report.collection_queue_pending_count,
+                        "post_collection_queue_pending_count": post_report.collection_queue_pending_count,
                         "post_benign_ghost_count": post_report.benign_ghost_count,
                         "post_anomalous_ghost_count": post_report.anomalous_ghost_count,
                         "result": result,
@@ -1439,7 +1455,10 @@ def main(argv: list[str] | None = None) -> int:
                 "flush_trigger": flush_trigger,
                 "burst_target": burst_n,
                 "vector_seq_delta": vector_delta,
+                "queue_total": report.queue_total,
                 "post_queue_total": post_report.queue_total,
+                "collection_queue_pending_count": report.collection_queue_pending_count,
+                "post_collection_queue_pending_count": post_report.collection_queue_pending_count,
                 "post_benign_ghost_count": post_report.benign_ghost_count,
                 "post_anomalous_ghost_count": post_report.anomalous_ghost_count,
                 "success": success,
@@ -1447,11 +1466,14 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(f"\nFlush result: {result}")
             print(f"Trigger: {flush_trigger} (drift={pre_seq['drift']}/WARNING={DRIFT_WARNING}, "
-                  f"queue={report.queue_total}/MIN={queue_backlog_min})")
+                  f"collection_pending={report.collection_queue_pending_count}/MIN={queue_backlog_min}, "
+                  f"queue_total={report.queue_total} globale)")
             print(f"Vector seq: {pre_seq['vector_seq']} -> {post_seq['vector_seq']} ({vector_delta:+d})")
             print(f"Metadata seq: {pre_seq['metadata_seq']} -> {post_seq['metadata_seq']}")
             print(f"Drift: {pre_seq['drift']} -> {post_seq['drift']} (WARNING={DRIFT_WARNING})")
-            print(f"Queue: {report.queue_total} -> {post_report.queue_total}")
+            print(f"Collection pending: {report.collection_queue_pending_count} -> "
+                  f"{post_report.collection_queue_pending_count} (MIN={queue_backlog_min})")
+            print(f"Queue total (globale): {report.queue_total} -> {post_report.queue_total}")
             if success:
                 print("OK — HNSW backlog flushed below warning.")
             else:

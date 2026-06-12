@@ -1232,3 +1232,64 @@ def test_flush_cli_postcondition_fails_when_ghost_remains(synthetic_db, monkeypa
     _install_flush_mocks(monkeypatch, {})
     rc = rhi.main(["--flush-queue-backlog", "--no-history"])
     assert rc == 5
+
+
+def test_flush_cli_postcondition_uses_collection_pending_not_global_queue(synthetic_db, monkeypatch):
+    # Post-condizione di successo su collection_queue_pending_count, NON queue_total:
+    # il backlog azionabile della collection è drenato (post=0) ma il queue_total
+    # globale resta alto (backlog di ALTRO topic) → NON deve essere un falso FAIL → rc=0.
+    Path(synthetic_db["lock_path"]).write_text("12345")
+    Path(synthetic_db["backups_dir"]).mkdir(exist_ok=True)
+    (Path(synthetic_db["backups_dir"]) / "chroma_now.sqlite3.gz").write_text("fake")
+
+    def _mk_report(queue_total, collection_pending):
+        return rhi.DriftReport(
+            timestamp="t", timestamp_unix=0, db_path="x",
+            metadata_segment=META_SEG_ID, vector_segment=VEC_SEG_ID,
+            sql_total=1, hnsw_total=1, queue_total=queue_total,
+            queue_oldest_iso=None, queue_newest_iso=None,
+            collection_queue_pending_count=collection_pending,
+            sql_only_orphans=[], hnsw_only_ghosts=[], unknown_count=0)
+
+    # pre: collection_pending=400 (actionable); post: collection_pending=0 (drenato)
+    # ma queue_total=5000 globale residuo in entrambi.
+    reports = iter([_mk_report(5000, 400), _mk_report(5000, 0)])
+    monkeypatch.setattr(rhi, "audit", lambda *a, **k: next(reports))
+    seqs = iter([
+        {"collection_id": "c", "metadata_segment": META_SEG_ID, "vector_segment": VEC_SEG_ID,
+         "vector_seq": 1000, "metadata_seq": 2000, "drift": 1000},   # pre
+        {"collection_id": "c", "metadata_segment": META_SEG_ID, "vector_segment": VEC_SEG_ID,
+         "vector_seq": 2000, "metadata_seq": 2000, "drift": 0},      # post avanzato
+    ])
+    monkeypatch.setattr(rhi, "_load_seq_state", lambda con, **k: next(seqs))
+    monkeypatch.setattr(rhi, "_load_existing_embedding_ids",
+                        lambda con, seg, n: ["doc_aaaaaaaaaaaa_chunk_0000"])
+    monkeypatch.setattr(rhi, "flush_queue_backlog",
+                        lambda **k: {"processed": 1, "skipped": 0, "errors": 0, "candidate_ids": 1})
+    _install_flush_mocks(monkeypatch, {})
+    rc = rhi.main(["--flush-queue-backlog", "--no-history"])
+    assert rc == 0          # post collection_pending=0<min, drift=0, no ghost → success
+
+
+def test_flush_cli_refuses_collection_queue_empty_with_global_backlog(synthetic_db, monkeypatch):
+    # drift ≥ soglia ma collection_pending=0 (queue_total globale alto): refuse rc=4
+    # con error code 'collection_queue_empty' (non 'queue_empty'). Solo gate, niente mutazione.
+    Path(synthetic_db["lock_path"]).write_text("12345")
+    Path(synthetic_db["backups_dir"]).mkdir(exist_ok=True)
+    (Path(synthetic_db["backups_dir"]) / "chroma_now.sqlite3.gz").write_text("fake")
+
+    report = rhi.DriftReport(
+        timestamp="t", timestamp_unix=0, db_path="x",
+        metadata_segment=META_SEG_ID, vector_segment=VEC_SEG_ID,
+        sql_total=1, hnsw_total=1, queue_total=5000,
+        queue_oldest_iso=None, queue_newest_iso=None,
+        collection_queue_pending_count=0,            # niente backlog azionabile per la collection
+        sql_only_orphans=[], hnsw_only_ghosts=[], unknown_count=0)
+    monkeypatch.setattr(rhi, "audit", lambda *a, **k: report)
+    monkeypatch.setattr(rhi, "_load_seq_state", lambda con, **k: {
+        "collection_id": "c", "metadata_segment": META_SEG_ID, "vector_segment": VEC_SEG_ID,
+        "vector_seq": 1000, "metadata_seq": 2000, "drift": 1000})   # drift≥800 → gate passa
+    monkeypatch.setattr(rhi, "_load_existing_embedding_ids", lambda con, seg, n: [])
+    _install_flush_mocks(monkeypatch, {})
+    rc = rhi.main(["--flush-queue-backlog", "--no-history"])
+    assert rc == 4
