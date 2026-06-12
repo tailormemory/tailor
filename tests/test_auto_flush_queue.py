@@ -194,6 +194,74 @@ def test_gate_skip_benign_below_min():
     assert action == "skip"
 
 
+# ─────────────────── gate: ramo drift (close drift-blind gap) ───────────────────
+
+def _audit_drift(drift=None, drift_warning=None, **kw):
+    """_audit() + iniezione opzionale dei campi drift/drift_warning (additivi)."""
+    a = _audit(**kw)
+    if drift is not None:
+        a["drift"] = drift
+    if drift_warning is not None:
+        a["drift_warning"] = drift_warning
+    return a
+
+
+def test_gate_act_on_drift_with_queue_below_min():
+    # drift >= warning, queue sotto soglia, indice pulito → act (ramo drift).
+    action, reason = afq.evaluate_gate(
+        _audit_drift(drift=850, drift_warning=800, queue=10,
+                     anomalous_ghost_count=0, blocking_unknown_count=0),
+        qmin=300)
+    assert action == "act"
+    assert "drift=850" in reason and "queue=10" in reason
+
+
+def test_gate_skip_drift_below_warning_queue_below_min():
+    # drift < warning E queue < min → skip.
+    action, reason = afq.evaluate_gate(
+        _audit_drift(drift=500, drift_warning=800, queue=100,
+                     anomalous_ghost_count=0, blocking_unknown_count=0),
+        qmin=300)
+    assert action == "skip"
+    assert "drift=500" in reason and "queue=100" in reason
+
+
+def test_gate_drift_missing_falls_back_to_queue_only_no_escalate():
+    # Campi drift assenti (tool vecchio): gate degrada a queue-only, NON escalate.
+    action_skip, reason = afq.evaluate_gate(_audit(queue=100), qmin=300)
+    assert action_skip == "skip"
+    assert "n/d" in reason                                  # nota campo-assente
+    action_act, _ = afq.evaluate_gate(_audit(queue=400), qmin=300)
+    assert action_act == "act"                              # queue alta → act comunque
+
+
+def test_gate_act_on_drift_with_empty_queue():
+    # drift >= warning con queue == 0 → act. Il rifiuto queue-empty lo gestisce
+    # do_flush (il tool), NON il gate.
+    action, _ = afq.evaluate_gate(
+        _audit_drift(drift=900, drift_warning=800, queue=0,
+                     anomalous_ghost_count=0, blocking_unknown_count=0),
+        qmin=300)
+    assert action == "act"
+
+
+def test_gate_drift_fields_do_not_bypass_schema_invalid_guard():
+    # Anche con drift >= warning, schema_invalid resta intatto → escalate.
+    action, reason = afq.evaluate_gate(
+        _audit_drift(drift=900, drift_warning=800, ghosts_list="not-a-list"),
+        qmin=300)
+    assert action == "escalate"
+    assert "schema_invalid" in reason
+
+
+def test_gate_drift_fields_do_not_bypass_orphan_escalate():
+    # drift >= warning ma orphans > 0 → escalate (drift anomalo ha priorità).
+    action, _ = afq.evaluate_gate(
+        _audit_drift(drift=900, drift_warning=800, queue=10, orphans=2),
+        qmin=300)
+    assert action == "escalate"
+
+
 def _drive_main_escalation(monkeypatch, audit_obj, sent):
     monkeypatch.setattr(afq.sys, "argv", ["auto_flush_queue.py"])
     monkeypatch.setattr(afq, "log", lambda *a, **k: None)

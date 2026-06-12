@@ -126,6 +126,12 @@ class DriftReport:
     sql_only_orphans: list[OrphanChunk] = field(default_factory=list)
     hnsw_only_ghosts: list[GhostChunk] = field(default_factory=list)
     unknown_count: int = 0  # orphans + ghosts of class "unknown"
+    # Seq-drift esposto per i consumer (auto_flush_queue): additivo, nessuna
+    # logica gate del tool dipende da questi campi.
+    drift: int = 0                       # metadata_seq - vector_seq
+    vector_seq: int = 0                  # = vector_max_seq_id (watermark HNSW)
+    metadata_seq: int = 0                # seq_id del segmento METADATA
+    drift_warning: int = DRIFT_WARNING   # soglia di allerta (costante)
 
     @property
     def sql_only_count(self) -> int:
@@ -540,6 +546,8 @@ def audit(db_path: str | None = None, db_dir: str | None = None) -> DriftReport:
         meta_seg, vec_seg = _load_segment_ids(con)
         collection_id = _load_collection_id(con)
         vector_max_seq_id = _load_segment_seq(con, vec_seg)
+        metadata_seq = _load_segment_seq(con, meta_seg)
+        drift = metadata_seq - vector_max_seq_id
         our_topic, topic_ambiguous = _resolve_collection_topic(con, collection_id)
         final_ops = (
             _load_final_queue_ops(con, topic=our_topic, vector_max_seq_id=vector_max_seq_id)
@@ -598,6 +606,10 @@ def audit(db_path: str | None = None, db_dir: str | None = None) -> DriftReport:
             sql_only_orphans=orphans,
             hnsw_only_ghosts=ghosts,
             unknown_count=unknown,
+            drift=drift,
+            vector_seq=vector_max_seq_id,
+            metadata_seq=metadata_seq,
+            drift_warning=DRIFT_WARNING,
         )
     finally:
         con.close()

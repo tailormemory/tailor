@@ -458,9 +458,19 @@ def evaluate_gate(audit: dict, qmin: int) -> tuple[str, str]:
     """Funzione pura — decide l'azione dal JSON di audit.
 
     Ritorna (action, reason):
-      "act"      → #6975 puro (eventuali ghost benigni inclusi) azionabile
-      "skip"     → niente da fare (queue sotto soglia, nessun drift anomalo)
+      "act"      → #6975 puro (ghost benigni inclusi) azionabile per queue O drift
+      "skip"     → niente da fare (queue sotto soglia E drift sotto warning/assente)
       "escalate" → drift anomalo / schema_invalid (NON auto-remediabile)
+
+    Con indice pulito (no orphans/anomali/blocking_unknown, guard schema_invalid
+    intatto) si AGISCE se la queue è sopra soglia OPPURE se il seq-drift è ≥
+    drift_warning. La metrica queue resta `queue_total` (INVARIATA: lo switch a
+    collection_pending è DEFERRED, fuori scope).
+
+    Missing-field (deploy window: daemon nuovo + tool vecchio): se drift o
+    drift_warning mancano, il ramo drift è inerte e il gate degrada al
+    comportamento odierno (solo queue_total). Status quo safe: niente escalate,
+    niente default drift=0. La WARN relativa la logga main() (qui è funzione pura).
     """
     gc = _ghost_counts(audit)
     queue = _nonneg_int(audit.get("queue_total", 0))
@@ -478,10 +488,28 @@ def evaluate_gate(audit: dict, qmin: int) -> tuple[str, str]:
         return "escalate", (f"orphans={orphans} anomalous_ghosts={gc.anomalous} "
                             f"blocking_unknown={gc.blocking_unknown} "
                             f"(benign_ghosts={gc.benign} ignorati) queue={queue}{leg}")
-    if queue < qmin:
-        return "skip", f"queue={queue} < min={qmin}, nessun drift anomalo (benign_ghosts={gc.benign}){leg}"
-    return "act", (f"queue={queue} >= min={qmin}, indice pulito modulo {gc.benign} "
-                   f"ghost benigni (#6975 puro){leg}")
+
+    # Ramo drift (additivo). _nonneg_int su entrambi i campi: assente/malformato →
+    # None → ramo inerte → fallback queue-only (status quo safe, no crash).
+    drift = _nonneg_int(audit.get("drift"))
+    drift_warning = _nonneg_int(audit.get("drift_warning"))
+    drift_actionable = (drift is not None and drift_warning is not None
+                        and drift >= drift_warning)
+    drift_note = (f"drift={drift}/warning={drift_warning}"
+                  if drift is not None and drift_warning is not None
+                  else "drift=n/d (campo assente → gate queue-only)")
+
+    queue_actionable = queue >= qmin
+    if queue_actionable or drift_actionable:
+        triggers = []
+        if queue_actionable:
+            triggers.append(f"queue={queue}>=min={qmin}")
+        if drift_actionable:
+            triggers.append(f"drift={drift}>=warning={drift_warning}")
+        return "act", (f"{' & '.join(triggers)}; queue={queue} {drift_note}; indice pulito "
+                       f"modulo {gc.benign} ghost benigni (#6975 puro){leg}")
+    return "skip", (f"queue={queue}<min={qmin}, {drift_note}, nessun drift anomalo "
+                    f"(benign_ghosts={gc.benign}){leg}")
 
 
 # ───────────────────────────────── procedure ────────────────────────────────
@@ -706,6 +734,10 @@ def main() -> int:
     elif gc.legacy:
         log("WARN", "audit JSON schema legacy: benignità ghost sconosciuta → conservativo "
                     "(tutti anomali). Allineare repair_hnsw_index.")
+    if audit.get("drift") is None or audit.get("drift_warning") is None:
+        log("WARN", "audit JSON senza campi drift/drift_warning (tool vecchio?) → gate "
+                    "degrada a queue-only (comportamento odierno, nessuna regressione). "
+                    "Aggiornare repair_hnsw_index per coprire anche il caso drift.")
 
     if action == "skip":
         return 0
