@@ -36,6 +36,64 @@ Template for upcoming changes. Move entries under a new version heading on relea
   `run_auto_flush_queue.sh`, `launchd_proposed/com.tailor.auto-flush-queue.plist`,
   `tests/test_auto_flush_queue.py`.
 
+### Changed
+
+- **Daemon gate drift-aware.** `evaluate_gate` agisce ora anche su `drift ≥
+  soglia`, non più solo sul backlog queue: chiude il gap latente drift-blind per
+  cui un drift senza backlog azionabile passava inosservato. Il valore di drift è
+  esposto nel JSON di audit. Commit
+  [`088f2bf`](https://github.com/tailormemory/tailor/commit/088f2bf).
+- **Gate flush su `collection_queue_pending_count`.** Il gate valuta il backlog
+  azionabile della collection invece del `queue_total` globale; `_queue_extents`
+  resta come metrica globale. Commit
+  [`6be02c4`](https://github.com/tailormemory/tailor/commit/6be02c4).
+- **`rc=4` del tool classificato come escalation gestita.** I refuse con `rc=4`
+  non sono più trattati come FAIL ma come escalation gestite (non auto-remediabili,
+  notificate e ferme). Commit
+  [`7025058`](https://github.com/tailormemory/tailor/commit/7025058).
+- **Pin `chromadb==1.5.9` in `requirements.txt`.** Allineato al venv installato:
+  elimina il falso alert di update e rende riproducibile il drift #6975. Commit
+  [`cc090f2`](https://github.com/tailormemory/tailor/commit/cc090f2).
+
+### Fixed
+
+- **Ghost benigni distinti dagli anomali nell'auto-flush gate.** Il gate
+  riconosce ora i ghost benigni — vettori HNSW residui di una `DELETE` pendente
+  topic-scoped, attesi e recuperabili — e non li conta come anomalia: niente più
+  escalation a ogni GC notturno. Soglie drift-monitor allineate (100/500 →
+  800/1500) tra test, docstring e runtime. Commit
+  [`49d6130`](https://github.com/tailormemory/tailor/commit/49d6130), test fixture
+  (tabella `collections` in `_make_chroma_sqlite`)
+  [`49c85e8`](https://github.com/tailormemory/tailor/commit/49c85e8), soglie
+  [`d563def`](https://github.com/tailormemory/tailor/commit/d563def).
+- **Health probe auto-flush corretto.** La sonda di liveness MCP usa ora
+  `/api/auth/check` (200, nessun hit ChromaDB) invece di `/` (404). Consolida il
+  filone auto-flush di cui il timeout cold-start 30s→90s
+  ([`b6ebe08`](https://github.com/tailormemory/tailor/commit/b6ebe08)) e il pattern
+  `verify_backup()` su `tailor_db_full_*.tar.gz`
+  ([`c9dd2a6`](https://github.com/tailormemory/tailor/commit/c9dd2a6)) erano fix
+  intermedi. Commit
+  [`877ddb1`](https://github.com/tailormemory/tailor/commit/877ddb1).
+- **Orphan path topic-scoped + risoluzione topic tri-state.** Il calcolo degli
+  orphan filtra ora per `final_ops` topic-scoped, chiudendo il difetto
+  cross-collection (orphan contati su collection non pertinenti), simmetrico al
+  path già applicato ai ghost. Commit
+  [`eeb0fec`](https://github.com/tailormemory/tailor/commit/eeb0fec).
+- **Log-isolation del test auto-flush.** `LOG_PATH` isolato a `tmp_path` nei test,
+  stop all'inquinamento del log di produzione. Commit
+  [`47382f7`](https://github.com/tailormemory/tailor/commit/47382f7).
+
+### Docs
+
+- **Drain mechanics HNSW corrette nel runbook (#6975).** Nessun restart drena né
+  fa replay: il segmento ricarica il pickle alla `max_seq_id` precedente e
+  attende; l'unico drain è `_persist()` a `sync_threshold` o un burst flush. Il
+  session log 02/06 è annotato come superato da §0. Commit
+  [`2b02a84`](https://github.com/tailormemory/tailor/commit/2b02a84), annotazione
+  [`231bc43`](https://github.com/tailormemory/tailor/commit/231bc43). Rimosso il
+  pointer morto `--prune-hnsw-ghosts` dall'output di audit. Commit
+  [`5d6ef38`](https://github.com/tailormemory/tailor/commit/5d6ef38).
+
 <!-- Errata entry moved to [1.2.10] on release 2026-05-17 -->
 
 ---

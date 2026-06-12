@@ -21,7 +21,7 @@ In both cases the API call returned without error, no logs were written, and the
 ## When to run it
 
 - **As a smoke test**: after any pipeline run that touches `collection.upsert` or `collection.delete` (document ingest, supersession, GC).
-- **Around an MCP restart**: the queue replays during startup. If shutdown was unclean, the replay can produce drift. Audit before and after.
+- **Around mutation or flush operations** (not the restart itself): an MCP restart does **not** drain or replay the queue — the segment reloads the pickle at its prior `max_seq_id` and waits, so a restart alone introduces no drift. The queue drains only at `_persist()` (when the pending count hits `sync_threshold`) or on a burst flush. Audit around those mutation/flush events, not around the restart (#6975).
 - **On user-visible symptoms**: `kb_search` errors mentioning `Error finding id`, or documents that should match a query producing no hits.
 - **As a periodic check**: nightly or weekly. Audit-mode is cheap (sub-second) and produces a JSON history that lets you spot drift drift-rate trends.
 
