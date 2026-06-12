@@ -589,5 +589,86 @@ def test_run_procedure_aborts_on_race_lock_present(monkeypatch, tmp_path):
     assert any("ABORT" in m for m in calls["telegram"])
 
 
+# ──────────── run_procedure: rc=4 refuse strutturati → escalation gestita ────────────
+
+def test_run_procedure_rc4_queue_empty_is_managed_escalation(monkeypatch, tmp_path):
+    flush = {"error": "queue_empty", "pre": {"drift": 850}}
+    calls = _stub_procedure(monkeypatch, tmp_path, flush=(4, flush), restart="healthy")
+    rc = afq.run_procedure(_audit_act(), dry_run=False)
+    assert rc == 0                                          # gestito (alert inviato), non sano
+    assert any("DRIFT NON FLUSHABILE" in m for m in calls["telegram"])
+    assert not any("FAIL" in m for m in calls["telegram"])  # NON il ramo FAIL generico
+
+
+def test_run_procedure_rc4_ambiguous_topic_is_managed_escalation(monkeypatch, tmp_path):
+    flush = {"error": "ambiguous_collection_topic"}
+    calls = _stub_procedure(monkeypatch, tmp_path, flush=(4, flush), restart="healthy")
+    rc = afq.run_procedure(_audit_act(), dry_run=False)
+    assert rc == 0
+    assert any("topic WAL ambiguo" in m for m in calls["telegram"])
+    assert not any("FAIL" in m for m in calls["telegram"])
+
+
+def test_run_procedure_rc4_anomalous_drift_reports_three_counts(monkeypatch, tmp_path):
+    flush = {"error": "anomalous_drift", "sql_only_count": 7,
+             "anomalous_ghost_count": 3, "blocking_unknown_count": 2}
+    calls = _stub_procedure(monkeypatch, tmp_path, flush=(4, flush), restart="healthy")
+    rc = afq.run_procedure(_audit_act(), dry_run=False)
+    assert rc == 0
+    msg = next(m for m in calls["telegram"] if "DRIFT ANOMALO" in m)
+    assert "sql_only_orphans=`7`" in msg
+    assert "anomalous_ghosts=`3`" in msg
+    assert "blocking_unknown=`2`" in msg
+
+
+def test_run_procedure_rc4_unknown_error_is_generic_fail(monkeypatch, tmp_path):
+    # error fuori allowlist (no_recent_backup) → FAIL generico, NON escalation.
+    flush = {"error": "no_recent_backup"}
+    calls = _stub_procedure(monkeypatch, tmp_path, flush=(4, flush), restart="healthy")
+    rc = afq.run_procedure(_audit_act(), dry_run=False)
+    assert rc == 1
+    assert any("— FAIL" in m for m in calls["telegram"])
+    assert not any("ESCALATION" in m for m in calls["telegram"])
+
+
+def test_run_procedure_rc4_missing_error_is_generic_fail(monkeypatch, tmp_path):
+    # rc=4 senza campo error → mai escalation (coppia non verificata) → FAIL.
+    calls = _stub_procedure(monkeypatch, tmp_path, flush=(4, {"post_queue_total": 10}),
+                            restart="healthy")
+    rc = afq.run_procedure(_audit_act(), dry_run=False)
+    assert rc == 1
+    assert any("— FAIL" in m for m in calls["telegram"])
+    assert not any("ESCALATION" in m for m in calls["telegram"])
+
+
+def test_run_procedure_rc4_allowlisted_but_restart_failed_is_partial(monkeypatch, tmp_path):
+    # Refuse gestito ma restart fallito → il restart fallito prevale → return 1.
+    flush = {"error": "queue_empty", "pre": {"drift": 850}}
+    calls = _stub_procedure(monkeypatch, tmp_path, flush=(4, flush), restart="MCP-DOWN")
+    rc = afq.run_procedure(_audit_act(), dry_run=False)
+    assert rc == 1
+    assert any("PARTIAL / FAIL-RESTART" in m for m in calls["telegram"])
+    assert any("MCP-DOWN" in m for m in calls["telegram"])
+
+
+def test_run_procedure_rc1_still_generic_fail(monkeypatch, tmp_path):
+    calls = _stub_procedure(monkeypatch, tmp_path, flush=(1, None), restart="healthy")
+    rc = afq.run_procedure(_audit_act(), dry_run=False)
+    assert rc == 1
+    assert any("— FAIL" in m for m in calls["telegram"])
+    assert not any("ESCALATION" in m for m in calls["telegram"])
+
+
+def test_run_procedure_rc5_still_generic_fail(monkeypatch, tmp_path):
+    # rc=5 (criteria-non-met) NON è un refuse allowlistato → FAIL come prima.
+    calls = _stub_procedure(monkeypatch, tmp_path,
+                            flush=(5, {"error": "below_drift_and_queue_thresholds"}),
+                            restart="healthy")
+    rc = afq.run_procedure(_audit_act(), dry_run=False)
+    assert rc == 1
+    assert any("— FAIL" in m for m in calls["telegram"])
+    assert not any("ESCALATION" in m for m in calls["telegram"])
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

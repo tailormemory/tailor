@@ -514,6 +514,17 @@ def evaluate_gate(audit: dict, qmin: int) -> tuple[str, str]:
 
 # ───────────────────────────────── procedure ────────────────────────────────
 
+# Rifiuti STRUTTURATI del tool (rc=4 con `error` noto): stati non auto-remediabili
+# che il tool DIAGNOSTICA senza mutare. Un rifiuto allowlistato = il daemon ha
+# funzionato → escalation gestita (return 0 se restart sano), NON FAIL generico.
+# Validazione stretta: serve la COPPIA (rc=4, error ∈ allowlist), mai rc=4 da solo.
+# NON allargare: ogni altro error / rc → FAIL generico (return 1).
+# `unknown_drift_types` è apply-only oggi (il flush non lo emette): sola difesa futura.
+REFUSE_ALLOWLIST = frozenset({
+    "ambiguous_collection_topic", "anomalous_drift", "queue_empty", "unknown_drift_types",
+})
+
+
 def _classify_flush(flush_json: dict | None) -> tuple[str, int | None]:
     """Disambigua `flush_queue_backlog.skipped` (overloaded):
       - dict con skipped is True (bool)  → ("gate_skip", None)    NO-OP (queue già bassa)
@@ -615,6 +626,59 @@ def run_procedure(audit: dict, dry_run: bool) -> int:
     post_queue = (flush_json or {}).get("post_queue_total")
     pre = (flush_json or {}).get("pre", {}) or {}
     post = (flush_json or {}).get("post", {}) or {}
+
+    # ── Rifiuto strutturato del tool (rc=4 + error allowlisted) ───────────────
+    # Stato non auto-remediabile diagnosticato dal tool, NESSUNA mutazione: il
+    # daemon ha fatto il suo lavoro. Escalation gestita (return 0 se restart sano,
+    # coerente col return dell'escalation del gate iniziale — NON significa "sano",
+    # significa "gestito + alert inviato"). Un restart FALLITO prevale comunque:
+    # l'MCP post-SIGUSR1 ha _collection=None e DEVE ripartire pulito.
+    refuse_err = flush_json.get("error") if isinstance(flush_json, dict) else None
+    if flush_rc == 4 and isinstance(refuse_err, str) and refuse_err in REFUSE_ALLOWLIST:
+        if not restarted:
+            log("PARTIAL", f"tool refuse '{refuse_err}' (rc=4) ma restart MCP stato={restart_state}")
+            send_telegram(
+                "⚠️ *TAILOR auto-flush — PARTIAL / FAIL-RESTART*\n"
+                f"Mutazione rifiutata dal tool (`{refuse_err}`, gestito) ma **restart MCP "
+                f"FALLITO**: `{restart_state}`.\n"
+                "Restart manuale: `sudo launchctl unload/load /Library/LaunchDaemons/com.tailor.mcp.plist`."
+            )
+            return 1
+        if refuse_err == "queue_empty":
+            log("ESCALATE", f"drift non flushabile (queue_empty, rc=4) restart={restart_state}")
+            send_telegram(
+                "⚠️ *TAILOR auto-flush — ESCALATION — DRIFT NON FLUSHABILE*\n"
+                "Drift ≥ soglia ma `embeddings_queue` è vuota: il WAL non è replayable "
+                "(write/persist persi). NON ritentare il flush — investigare i write "
+                "mancanti o valutare un rebuild dell'indice.\n"
+                f"Restart MCP: `{restart_state}`."
+            )
+            return 0
+        if refuse_err == "ambiguous_collection_topic":
+            log("ESCALATE", f"topic WAL ambiguo (rc=4) restart={restart_state}")
+            send_telegram(
+                "⚠️ *TAILOR auto-flush — ESCALATION — MUTAZIONE RIFIUTATA (topic WAL ambiguo)*\n"
+                "Il tool non ha risolto univocamente il topic della collection nel WAL: "
+                "mutazione rifiutata, nessuna scrittura. Investigare i topic duplicati.\n"
+                f"Restart MCP: `{restart_state}`."
+            )
+            return 0
+        # anomalous_drift + unknown_drift_types (difesa futura) → stessa escalation.
+        sql_only = flush_json.get("sql_only_count")
+        anomalous = flush_json.get("anomalous_ghost_count")
+        blocking = flush_json.get("blocking_unknown_count")
+        log("ESCALATE", f"drift anomalo ({refuse_err}, rc=4) sql_only={sql_only} "
+                        f"anomalous_ghosts={anomalous} blocking_unknown={blocking} "
+                        f"restart={restart_state}")
+        send_telegram(
+            "⚠️ *TAILOR auto-flush — ESCALATION — DRIFT ANOMALO*\n"
+            f"Mutazione rifiutata dal tool (`{refuse_err}`): drift non #6975-puro.\n"
+            f"sql_only_orphans=`{sql_only}` anomalous_ghosts=`{anomalous}` "
+            f"blocking_unknown=`{blocking}`.\n"
+            "Non auto-remediabile: investigare / rebuild manuale. Vedi RUNBOOK_drift_alert.md §2.\n"
+            f"Restart MCP: `{restart_state}`."
+        )
+        return 0
 
     # NO-OP: il tool ha skippato (queue scesa sotto soglia tra gate e flush)
     if success and kind == "gate_skip":
