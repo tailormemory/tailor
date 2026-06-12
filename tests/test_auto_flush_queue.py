@@ -23,6 +23,15 @@ sys.path.insert(0, os.path.join(ROOT, "scripts", "services"))
 import auto_flush_queue as afq  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _isolate_log_path(monkeypatch, tmp_path):
+    """log() scrive in afq.LOG_PATH (default = logs/auto_flush.log di produzione).
+    Solo _drive_main_escalation patcha afq.log a no-op; tutti gli altri test che
+    arrivano a log() inquinerebbero il log reale. Reindirizza LOG_PATH a tmp_path
+    per ogni test."""
+    monkeypatch.setattr(afq, "LOG_PATH", str(tmp_path / "auto_flush.log"))
+
+
 # ─────────────────────────── evaluate_gate ───────────────────────────
 
 def _audit(queue=0, orphans=0, ghosts=0, unknown=0, benign_ghosts=0,
