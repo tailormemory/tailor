@@ -839,7 +839,7 @@ def format_report_human(report: DriftReport, delta: Delta | None = None) -> str:
     else:
         lines.append(f"EXIT: drift detected — run --apply to repair ({report.sql_only_count} chunks will be re-embedded)")
         if report.hnsw_only_count:
-            lines.append(f"      ({report.hnsw_only_count} HNSW-only ghosts NOT repaired in this version — see --prune-hnsw-ghosts)")
+            lines.append(f"      ({report.hnsw_only_count} HNSW-only ghosts non riparati in questa versione — pruning deferred; investigare / rebuild manuale)")
     return "\n".join(lines)
 
 
