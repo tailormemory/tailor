@@ -510,11 +510,36 @@ class AnthropicClient(LLMClient):
         # already in `msgs` (the last batch was appended just above). This is a
         # single direct request, NOT recursive, and runs outside the for loop.
         deterministic = "Non sono riuscito a sintetizzare una risposta dai risultati raccolti."
+
+        # The bare tools-free re-send used to come back empty: the request ended
+        # on a tool_result block with no instruction, so the model — primed to
+        # call another tool — had nothing to answer. Append a synthesis nudge as
+        # a text block AFTER the tool_results, in the SAME user message. The nudge
+        # is anti-hallucination on purpose (answer only from collected results,
+        # don't invent, say so if insufficient, cite download_url if present).
+        SYNTHESIS_NUDGE = (
+            "Rispondi ora alla richiesta originale usando esclusivamente le informazioni "
+            "presenti nei risultati degli strumenti raccolti sopra. Non chiamare altri "
+            "strumenti e non inventare informazioni mancanti. Se i risultati non contengono "
+            "elementi sufficienti, dichiaralo chiaramente. Quando un risultato pertinente "
+            "contiene un download_url, includilo esattamente come link Markdown alla fonte."
+        )
+        # Build a COPY so the persisted/replayed `msgs` are never poisoned by the
+        # nudge — future turns must not see this injected text block.
+        final_messages = list(msgs)
+        last = dict(final_messages[-1])
+        last_content = list(last["content"])
+        last_content.append({"type": "text", "text": SYNTHESIS_NUDGE})
+        last["content"] = last_content
+        final_messages[-1] = last
+
         final_payload = {
             "model": self.model,
-            "max_tokens": self.max_tokens,
+            # Larger budget than the per-turn default: a from-scratch synthesis
+            # over several tool batches needs room. Scoped to THIS call only.
+            "max_tokens": 1500,
             "system": system,
-            "messages": msgs,
+            "messages": final_messages,
             "temperature": self.temperature,
             "stream": True,
             # NOTE: no "tools" key on purpose. Passing [] is useless — line 329
@@ -548,6 +573,7 @@ class AnthropicClient(LLMClient):
             return
 
         final_blocks: dict[int, dict] = {}
+        final_stop_reason = ""
         for event_name, data in _iter_anthropic_sse(resp):
             if event_name == "content_block_start":
                 idx = data.get("index", 0)
@@ -563,6 +589,9 @@ class AnthropicClient(LLMClient):
                         final_blocks.setdefault(idx, {"text": ""})["text"] += chunk
                         yield {"type": "token", "delta": chunk}
             elif event_name == "message_delta":
+                delta = data.get("delta", {}) or {}
+                if delta.get("stop_reason"):
+                    final_stop_reason = delta["stop_reason"]
                 usage = data.get("usage", {}) or {}
                 if usage.get("output_tokens"):
                     total_output_tokens = usage["output_tokens"]
@@ -577,8 +606,14 @@ class AnthropicClient(LLMClient):
         if not synthesized.strip():
             # Fallback's fallback: never leave a mute empty bubble. Emit a
             # deterministic line (persisted/rendered) AND an observable error.
+            # The stop_reason disambiguates the failure mode (e.g. end_turn =
+            # model chose silence despite the nudge; max_tokens = truncated to
+            # nothing; "" = SSE anomaly / no message_delta).
             yield {"type": "token", "delta": deterministic}
-            yield {"type": "error", "error": "final synthesis returned empty text"}
+            yield {
+                "type": "error",
+                "error": f"final synthesis returned empty text (stop_reason={final_stop_reason or 'unknown'})",
+            }
             return
         yield {"type": "done", "tokens": total_output_tokens or None}
 

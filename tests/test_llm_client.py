@@ -23,6 +23,27 @@ from lib.llm_client import AnthropicClient  # noqa: E402
 
 
 DETERMINISTIC = "Non sono riuscito a sintetizzare una risposta dai risultati raccolti."
+NUDGE_FRAGMENT = "Rispondi ora alla richiesta originale usando esclusivamente le informazioni"
+
+
+def _last_user_blocks(payload):
+    """Content-block type list of the payload's last message (str content → [])."""
+    content = payload["messages"][-1]["content"]
+    if not isinstance(content, list):
+        return []
+    return [b.get("type") for b in content]
+
+
+def _nudge_text(payload):
+    """The nudge text block anywhere in the payload's messages, or None."""
+    for msg in payload["messages"]:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text" and NUDGE_FRAGMENT in b.get("text", ""):
+                return b["text"]
+    return None
 
 TOOLS = [{"name": "kb_hybrid_search", "description": "d", "input_schema": {"type": "object", "properties": {}}}]
 
@@ -136,23 +157,54 @@ def test_iteration_cap_triggers_final_synthesis(client, monkeypatch):
 
     # 5 loop requests + 1 synthesis request.
     assert len(post.payloads) == 6
+    synth = post.payloads[5]
     # Loop requests carry tools; the synthesis request OMITS the field entirely
     # (passing [] would be re-defaulted to TOOLS upstream).
     assert "tools" in post.payloads[0]
-    assert "tools" not in post.payloads[5]
+    assert "tools" not in synth
+
+    # The synthesis nudge is appended as a text block AFTER the tool_result(s),
+    # in the SAME last user message.
+    assert _last_user_blocks(synth) == ["tool_result", "text"]
+    assert _nudge_text(synth) is not None
+
+    # Larger token budget scoped to this call only; loop requests keep the default.
+    assert synth["max_tokens"] == 1500
+    assert post.payloads[0]["max_tokens"] == 50
+
+
+def test_fallback_does_not_mutate_original_msgs(client, monkeypatch):
+    # The nudge lives only in the synthesis COPY. The original msgs (aliased by
+    # the loop request payloads) must never carry it — else future turns get
+    # poisoned by an injected text block.
+    responses = [tool_turn() for _ in range(5)] + [text_turn("ok")]
+    events, post = _run(client, monkeypatch, responses)
+
+    # payloads[4]["messages"] is the live `msgs` list (loop sends it by ref);
+    # its last message must NOT have gained the nudge.
+    original_last = post.payloads[4]["messages"][-1]
+    assert all(NUDGE_FRAGMENT not in (b.get("text", "") or "")
+               for b in original_last["content"] if b.get("type") == "text")
+    # The synthesis copy DOES carry it.
+    assert _nudge_text(post.payloads[5]) is not None
+    # And exactly one nudge block exists in the synthesis last message.
+    assert _last_user_blocks(post.payloads[5]).count("text") == 1
 
 
 def test_final_synthesis_empty_emits_deterministic_and_error(client, monkeypatch):
-    # Synthesis returns empty text → deterministic line + observable error, never mute.
-    responses = [tool_turn() for _ in range(5)] + [text_turn("")]
+    # Synthesis returns empty text → deterministic line + observable error with
+    # the captured stop_reason, never mute. Safety-net branch stays intact.
+    responses = [tool_turn() for _ in range(5)] + [text_turn("")]  # text_turn → stop_reason=end_turn
     events, post = _run(client, monkeypatch, responses)
 
     deltas = [e["delta"] for e in events if e["type"] == "token"]
     assert DETERMINISTIC in deltas
 
     errors = [e["error"] for e in events if e["type"] == "error"]
-    assert any("final synthesis returned empty text" in e for e in errors)
+    assert any("final synthesis returned empty text (stop_reason=end_turn)" in e for e in errors)
     assert len(post.payloads) == 6
+    # Nudge was still injected on the (empty) synthesis attempt.
+    assert _nudge_text(post.payloads[5]) is not None
 
 
 # ── within-turn whitespace text block guard ────────────────────
@@ -186,6 +238,10 @@ def test_one_tool_then_answer_no_fallback(client, monkeypatch):
     assert _types(events)[-1] == "done"
     assert "Ecco la risposta." in _joined_tokens(events)
     assert DETERMINISTIC not in [e.get("delta") for e in events if e["type"] == "token"]
+    # Convergent branch is untouched: no nudge, default token budget on every request.
+    for p in post.payloads:
+        assert _nudge_text(p) is None
+        assert p["max_tokens"] == 50
 
 
 def test_direct_answer_zero_tools(client, monkeypatch):
@@ -195,3 +251,6 @@ def test_direct_answer_zero_tools(client, monkeypatch):
     assert len(post.payloads) == 1
     assert _types(events)[-1] == "done"
     assert _joined_tokens(events) == "Diretta."
+    # No fallback path: no nudge, default token budget.
+    assert _nudge_text(post.payloads[0]) is None
+    assert post.payloads[0]["max_tokens"] == 50
