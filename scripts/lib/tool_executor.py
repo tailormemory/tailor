@@ -41,6 +41,17 @@ def _call_kb_search_docs(args: dict) -> str:
         n_results=args.get("n_results", 5),
     )
 
+def _call_kb_find_document(args: dict) -> str:
+    m = _get_mcp()
+    # kb_find_document è -> list[dict] (unico tra i kb_* a non ritornare str):
+    # serializza qui in stringa leggibile, perché tool_result["content"] deve
+    # essere una stringa (contratto API Anthropic).
+    result = m.kb_find_document(
+        query=args["query"],
+        n_results=args.get("n_results", 10),
+    )
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
 def _call_get_user_profile(args: dict) -> str:
     m = _get_mcp()
     return m.get_user_profile()
@@ -202,6 +213,7 @@ def _call_read_personal_doc(args: dict) -> str:
 TOOL_HANDLERS = {
     "kb_hybrid_search": _call_kb_hybrid_search,
     "kb_search_docs": _call_kb_search_docs,
+    "kb_find_document": _call_kb_find_document,
     "get_user_profile": _call_get_user_profile,
     "kb_add": _call_kb_add,
     "system_status": _call_system_status,

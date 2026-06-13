@@ -62,6 +62,18 @@ TOOLS = [
         }
     },
     {
+        "name": "kb_find_document",
+        "description": "Trova un DOCUMENTO specifico per nome/oggetto via match fuzzy su filename/cartella/path (NON sul contenuto). Ritorna title, file_path, folder, download_url. Usa quando cerchi un documento noto per nome, non per ricerca concettuale.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Nome, cartella o frammento di path del documento (es. 'integrazione aprile', 'Salute & Fitness', 'report.pdf')"},
+                "n_results": {"type": "integer", "description": "Numero massimo di risultati (default 10)", "default": 10},
+            },
+            "required": ["query"]
+        }
+    },
+    {
         "name": "get_user_profile",
         "description": "Get the full user profile (identity, preferences, projects, recent activity). Call this when you need context about the user.",
         "input_schema": {"type": "object", "properties": {}}
