@@ -498,7 +498,14 @@ def _write_default_llm(
 def _build_llm_history(store, session_id: str, max_history: int) -> list[dict]:
     """Flatten persisted messages into the LLM's expected [{'role', 'content'}] format.
     Tool-call metadata is not replayed to the LLM: the assistant's reasoning is
-    stateless across turns and the final text is what matters."""
+    stateless across turns and the final text is what matters.
+
+    Assistant rows whose content is empty/whitespace-only (tool-only turns, or
+    turns that hit the iteration cap with no synthesized text) are skipped: the
+    persisted tool_calls stay for the UI, but replaying a whitespace-only text
+    block to Anthropic triggers a 400 ("text content blocks must contain
+    non-whitespace text"). The skip happens here so every outgoing request —
+    including the final-synthesis fallback — is protected from corrupted old rows."""
     rows = store.get_messages(session_id, limit=max_history)
     out = []
     for m in rows:
@@ -507,7 +514,10 @@ def _build_llm_history(store, session_id: str, max_history: int) -> list[dict]:
             continue
         if role not in ("user", "assistant"):
             continue
-        out.append({"role": role, "content": m["content"]})
+        content = m["content"]
+        if role == "assistant" and not (content or "").strip():
+            continue
+        out.append({"role": role, "content": content})
     return out
 
 
@@ -590,13 +600,21 @@ def _sse_generator(store, session_id: str, created: bool, events):
     duration_ms = int((time.monotonic() - started) * 1000)
     final_text = "".join(assistant_text_parts)
 
+    # Persist only meaningful turns. A whitespace-only final_text (e.g. the
+    # "\n\n" separators streamed between tool batches with no real text) must
+    # NOT be stored verbatim: replayed next turn it produces an Anthropic 400.
+    # Preserve the ORIGINAL text when it carries non-whitespace; otherwise, if
+    # there were tool calls, persist "" (schema is content TEXT NOT NULL — ""
+    # is mandatory, never None/omitted). No text and no tool_calls → no record.
     message_id = None
-    if final_text or tool_calls:
+    has_text = bool(final_text.strip())
+    if has_text or tool_calls:
+        persisted_content = final_text if has_text else ""
         try:
             message_id = store.append_message(
                 session_id,
                 "assistant",
-                final_text,
+                persisted_content,
                 tool_calls=tool_calls or None,
                 tool_results=tool_results or None,
                 tokens=total_tokens,

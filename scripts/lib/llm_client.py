@@ -452,7 +452,11 @@ class AnthropicClient(LLMClient):
             for idx in sorted(blocks):
                 blk = blocks[idx]
                 if blk["type"] == "text":
-                    if blk["text"]:
+                    # Test on .strip() but keep the text verbatim: a whitespace-only
+                    # text block (e.g. just "\n") is truthy yet Anthropic rejects it
+                    # on the loop-back ("text content blocks must contain non-whitespace
+                    # text"). Drop those; preserve real text untouched.
+                    if blk["text"].strip():
                         assistant_content.append({"type": "text", "text": blk["text"]})
                 elif blk["type"] == "tool_use":
                     # Prefer streamed input (input_json_delta accumulation) when
@@ -499,7 +503,84 @@ class AnthropicClient(LLMClient):
             yield {"type": "token", "delta": "\n\n"}
             msgs.append({"role": "user", "content": tool_results})
 
-        yield {"type": "error", "error": "max tool iterations reached"}
+        # Iteration cap reached: the model kept calling tools without converging.
+        # Rather than bail with a bare error (which surfaces to the user as a mute
+        # "(empty response)"), make ONE final request with the `tools` field
+        # OMITTED, forcing the model to synthesize an answer from the tool_results
+        # already in `msgs` (the last batch was appended just above). This is a
+        # single direct request, NOT recursive, and runs outside the for loop.
+        deterministic = "Non sono riuscito a sintetizzare una risposta dai risultati raccolti."
+        final_payload = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "system": system,
+            "messages": msgs,
+            "temperature": self.temperature,
+            "stream": True,
+            # NOTE: no "tools" key on purpose. Passing [] is useless — line 329
+            # does `tools = tools or TOOLS` and re-enables them; only by OMITTING
+            # the field does this synthesis turn run tool-free.
+        }
+        try:
+            resp = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": self.api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json=final_payload,
+                stream=True,
+                timeout=120,
+            )
+        except Exception as e:
+            yield {"type": "token", "delta": deterministic}
+            yield {"type": "error", "error": f"final synthesis request failed: {e}"}
+            return
+
+        if resp.status_code != 200:
+            try:
+                err = resp.json().get("error", {}).get("message") or resp.text[:500]
+            except Exception:
+                err = resp.text[:500]
+            yield {"type": "token", "delta": deterministic}
+            yield {"type": "error", "error": f"anthropic {resp.status_code}: {err}"}
+            return
+
+        final_blocks: dict[int, dict] = {}
+        for event_name, data in _iter_anthropic_sse(resp):
+            if event_name == "content_block_start":
+                idx = data.get("index", 0)
+                cb = data.get("content_block", {}) or {}
+                if cb.get("type") == "text":
+                    final_blocks[idx] = {"text": ""}
+            elif event_name == "content_block_delta":
+                idx = data.get("index", 0)
+                delta = data.get("delta", {}) or {}
+                if delta.get("type") == "text_delta":
+                    chunk = delta.get("text", "")
+                    if chunk:
+                        final_blocks.setdefault(idx, {"text": ""})["text"] += chunk
+                        yield {"type": "token", "delta": chunk}
+            elif event_name == "message_delta":
+                usage = data.get("usage", {}) or {}
+                if usage.get("output_tokens"):
+                    total_output_tokens = usage["output_tokens"]
+            elif event_name == "message_stop":
+                break
+            elif event_name == "error":
+                err = data.get("error", {}).get("message") or str(data)
+                yield {"type": "error", "error": f"anthropic stream error: {err}"}
+                return
+
+        synthesized = "".join(b.get("text", "") for b in final_blocks.values())
+        if not synthesized.strip():
+            # Fallback's fallback: never leave a mute empty bubble. Emit a
+            # deterministic line (persisted/rendered) AND an observable error.
+            yield {"type": "token", "delta": deterministic}
+            yield {"type": "error", "error": "final synthesis returned empty text"}
+            return
+        yield {"type": "done", "tokens": total_output_tokens or None}
 
 
 def _try_json(raw: str):

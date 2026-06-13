@@ -327,6 +327,75 @@ def test_delete_session_404(store):
     assert resp.status_code == 404
 
 
+# ── whitespace-only / tool-only assistant rows ────────────────
+
+def test_history_excludes_whitespace_only_assistant_from_replay(store):
+    """An old assistant row with whitespace-only content (e.g. left behind by a
+    pre-fix cap turn) must be dropped from the LLM replay — replaying it would
+    trigger an Anthropic 400 ('text content blocks must contain non-whitespace
+    text'). It is NOT sent, and the request still succeeds."""
+    sid = store.create_session()
+    store.append_message(sid, "user", "old question")
+    store.append_message(sid, "assistant", "\n\n")  # corrupted/old whitespace row
+
+    client, llm = build(store, [
+        {"type": "token", "delta": "ok"},
+        {"type": "done", "tokens": 1},
+    ])
+    resp = client.post("/api/chat", json={"session_id": sid, "message": "next"})
+    assert resp.status_code == 200
+
+    sent = llm.calls[0]["messages"]
+    # The whitespace assistant row is gone; only the two user turns remain.
+    assert [m["role"] for m in sent] == ["user", "user"]
+    assert all((m["content"] or "").strip() for m in sent)
+
+
+def test_tool_only_turn_persists_empty_content_and_is_excluded_from_replay(store):
+    """A turn with tool calls but only whitespace text persists content=''
+    (schema is NOT NULL — '' mandatory, never None), keeps tool_calls for the
+    UI, and is excluded from the next turn's LLM replay."""
+    client, llm = build(store, [
+        {"type": "tool_start", "tool": "kb_hybrid_search", "input": {"query": "x"}},
+        {"type": "tool_end", "tool": "kb_hybrid_search", "duration_ms": 12},
+        {"type": "token", "delta": "\n\n"},   # whitespace separator only, no real text
+        {"type": "done", "tokens": 3},
+    ])
+
+    # Turn 1: produces the tool-only assistant row.
+    resp1 = client.post("/api/chat", json={"session_id": None, "message": "cerca"})
+    assert resp1.status_code == 200
+    sid = parse_sse(resp1.text)[0][1]["session_id"]
+
+    assistant = [m for m in store.get_messages(sid) if m["role"] == "assistant"][0]
+    assert assistant["content"] == ""           # persisted as "", not None, not "\n\n"
+    assert assistant["tool_calls"] is not None    # tool_calls retained for the UI
+
+    # Turn 2: the empty assistant row must not be replayed to the LLM.
+    resp2 = client.post("/api/chat", json={"session_id": sid, "message": "ancora"})
+    assert resp2.status_code == 200
+    sent = llm.calls[-1]["messages"]
+    assert [m["role"] for m in sent] == ["user", "user"]
+    assert all((m["content"] or "").strip() for m in sent)
+
+
+def test_real_text_with_tools_preserved_verbatim(store):
+    """A turn with real text + tools persists the ORIGINAL text untouched (no
+    destructive strip) and replays normally."""
+    client, llm = build(store, [
+        {"type": "tool_start", "tool": "kb_hybrid_search", "input": {"query": "x"}},
+        {"type": "tool_end", "tool": "kb_hybrid_search", "duration_ms": 9},
+        {"type": "token", "delta": "  Ecco "},
+        {"type": "token", "delta": "il risultato.  "},
+        {"type": "done", "tokens": 5},
+    ])
+    resp = client.post("/api/chat", json={"session_id": None, "message": "cerca"})
+    sid = parse_sse(resp.text)[0][1]["session_id"]
+    assistant = [m for m in store.get_messages(sid) if m["role"] == "assistant"][0]
+    # Leading/trailing whitespace preserved verbatim — strip was a TEST, not a mutation.
+    assert assistant["content"] == "  Ecco il risultato.  "
+
+
 # ── history truncation ────────────────────────────────────────
 
 def test_history_respects_max_history(store):
