@@ -1814,6 +1814,28 @@ def kb_search(query: str, n_results: int = 5, source_filter: str = "", include_s
         return f"Search error: {str(e)}"
 
 
+def _compose_rerank_pool(items: list, n_results: int) -> list:
+    """Ordina i candidati ibridi e seleziona il pool che entra nel re-ranker.
+
+    Funzione PURA: opera solo su `items` (lista di tuple (key, dict) dove dict
+    contiene almeno 'source_type', 'score', 'date'). Non tocca ChromaDB/SQLite.
+
+    Ordine (comportamento ATTUALE, invariato — il ranking vero è B2b-core):
+      1. semantic prima di entity  (chiave 0/1)
+      2. score DESC                (-score)
+      3. date ASC                  (tie-break)
+    Slice finale: i primi min(len, n_results*3) candidati.
+
+    Returns: lista di tuple (key, dict) nell'ordine/selezione del pool.
+    """
+    ordered = sorted(items, key=lambda x: (
+        0 if x[1]["source_type"] == "semantic" else 1,
+        -x[1]["score"],
+        x[1]["date"] if x[1]["date"] else ""
+    ))
+    return ordered[:min(len(ordered), n_results * 3)]
+
+
 @mcp.tool()
 def kb_hybrid_search(query: str, n_results: int = 10, source_filter: str = "", include_superseded: bool = False) -> str:
     """Hybrid search: combines semantic search + entity search in a single query.
@@ -1893,9 +1915,11 @@ def kb_hybrid_search(query: str, n_results: int = 10, source_filter: str = "", i
                     candidates.add(f"{w1} {w2} {w3}")
 
             # Search each candidate nell'entity index
-            for candidate in candidates:
+            # sorted() → ordine d'iterazione deterministico (candidates è un set):
+            # entity_hits e a valle new_entity_ids risultano ripetibili a parità di query.
+            for candidate in sorted(candidates):
                 idx_cursor.execute(
-                    "SELECT DISTINCT chunk_id FROM entity_index WHERE entity LIKE ? COLLATE NOCASE LIMIT 100",
+                    "SELECT DISTINCT chunk_id FROM entity_index WHERE entity LIKE ? COLLATE NOCASE ORDER BY chunk_id LIMIT 100",
                     (f"%{candidate}%",)
                 )
                 chunk_ids = [r[0] for r in idx_cursor.fetchall()]
@@ -1912,7 +1936,12 @@ def kb_hybrid_search(query: str, n_results: int = 10, source_filter: str = "", i
                     new_entity_ids.append(cid)
 
         if new_entity_ids:
-            # Limita per non esplodere
+            # Limita per non esplodere. Deterministico è SOLO *quali* 100 chunk
+            # entrano qui: sorted(candidates) + ORDER BY chunk_id rendono questo
+            # slice ripetibile a parità di query. NON è garantito l'ordine finale
+            # degli entity nei risultati: collection.get(ids=...) non assicura di
+            # preservare l'ordine richiesto, e con score 0.5 fisso + date spesso
+            # uguali il rank entity può ereditare l'ordine di ritorno di Chroma.
             new_entity_ids = new_entity_ids[:100]
             FETCH_BATCH = 40
             for i in range(0, len(new_entity_ids), FETCH_BATCH):
@@ -1940,22 +1969,18 @@ def kb_hybrid_search(query: str, n_results: int = 10, source_filter: str = "", i
         if not seen_ids:
             return "No results found in the KB (all results have been superseded by more recent info)."
 
-        # --- STEP 4: Ordina e formatta ---
-        # Semantic results first (by score), then entity (by date)
+        # --- STEP 4: Ordina e seleziona il pool (logica pura, testabile) ---
+        # Semantic results first (by score), then entity (by date).
         items = list(seen_ids.items())
-        items.sort(key=lambda x: (
-            0 if x[1]["source_type"] == "semantic" else 1,
-            -x[1]["score"],
-            x[1]["date"] if x[1]["date"] else ""
-        ), reverse=False)
+        pool = _compose_rerank_pool(items, n_results)
 
         # Re-rank i candidati con cross-encoder
-        rerank_candidates = [{"key": k, **v} for k, v in items[:min(len(items), n_results * 3)]]
+        rerank_candidates = [{"key": k, **v} for k, v in pool]
         if len(rerank_candidates) > 1:
             reranked = rerank_results(query, rerank_candidates, n_results=n_results, doc_key="doc")
             top_items = [(item["key"], {k: v for k, v in item.items() if k != "key"}) for item in reranked]
         else:
-            top_items = items[:n_results]
+            top_items = pool[:n_results]
 
         # Entity summary
         entity_summary = ""
