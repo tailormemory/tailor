@@ -1820,20 +1820,47 @@ def _compose_rerank_pool(items: list, n_results: int) -> list:
     Funzione PURA: opera solo su `items` (lista di tuple (key, dict) dove dict
     contiene almeno 'source_type', 'score', 'date'). Non tocca ChromaDB/SQLite.
 
-    Ordine (comportamento ATTUALE, invariato — il ranking vero è B2b-core):
-      1. semantic prima di entity  (chiave 0/1)
-      2. score DESC                (-score)
-      3. date ASC                  (tie-break)
-    Slice finale: i primi min(len, n_results*3) candidati.
+    Policy ADDITIVA (B2b-core): i due flussi hanno quote separate invece di un
+    unico ordinamento "tutti semantic poi tutti entity" con slice singolo — che
+    relegava gli entity-hit validi (score 0.5 fisso) in coda e li tagliava fuori
+    dal pool del cross-encoder.
+
+      - semantic: ordinati per (-score, date ASC), primi  n_results*3
+      - entity:   ordinati per (-score, date ASC), primi  n_results
+      - pool = semantic[:3n] + entity[:n]   (entity AGGIUNTI, mai sostituiscono semantic)
+
+    Conseguenze:
+      - Query senza entity → pool = semantic[:3n], IDENTICO al comportamento
+        pre-fix (zero regressione sulle query puramente semantiche).
+      - Query con entity → pool max = n_results*4; nessun semantic espulso.
+      - Dedup difensivo: se una key comparisse in entrambi i flussi (non dovrebbe,
+        seen_ids dedup a monte) tiene la prima occorrenza (semantic), niente duplicati.
+
+    Il tie-break date ASC resta invariato (policy separata, fuori scope).
 
     Returns: lista di tuple (key, dict) nell'ordine/selezione del pool.
     """
-    ordered = sorted(items, key=lambda x: (
-        0 if x[1]["source_type"] == "semantic" else 1,
-        -x[1]["score"],
-        x[1]["date"] if x[1]["date"] else ""
-    ))
-    return ordered[:min(len(ordered), n_results * 3)]
+    def _sort_key(x):
+        return (-x[1]["score"], x[1]["date"] if x[1]["date"] else "")
+
+    semantic = sorted(
+        (it for it in items if it[1]["source_type"] == "semantic"), key=_sort_key
+    )
+    entity = sorted(
+        (it for it in items if it[1]["source_type"] == "entity"), key=_sort_key
+    )
+
+    pool = semantic[:n_results * 3] + entity[:n_results]
+
+    # Dedup preservando l'ordine, prima occorrenza vince (semantic prima di entity).
+    seen = set()
+    deduped = []
+    for key, val in pool:
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((key, val))
+    return deduped
 
 
 @mcp.tool()
