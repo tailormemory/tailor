@@ -66,6 +66,7 @@ ENDPOINT_PERMISSIONS = {
     "/api/fetch/": "read",
     "/api/kb/document": "read",
     "/api/chat/models": "read",
+    "/api/diag/hybrid-search": "read",
     # Write
     "/api/dashboard/upload": "write",
     "/api/ingest-live": "write",

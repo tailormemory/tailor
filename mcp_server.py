@@ -364,6 +364,33 @@ class BearerAuthMiddleware:
                     })
                 return _json_response({"results": out})
 
+            # /api/diag/hybrid-search?q=<query>&n=<n>&source=<src>&include_superseded=<0|1>
+            # Read-only: stessa pipeline di kb_hybrid_search, output per-stage strutturato
+            # (nessun testo dei chunk). Gira in-process → riusa il client Chroma vivo.
+            elif path == "/api/diag/hybrid-search":
+                from urllib.parse import unquote
+                # Parsing+validazione DENTRO try: int(...) su valore non numerico
+                # solleva ValueError → errore pubblico fisso, nessun dettaglio fuori (FAIL 5).
+                try:
+                    qs = scope.get("query_string", b"").decode()
+                    params = dict(p.split("=", 1) for p in qs.split("&") if "=" in p)
+                    query = unquote(params.get("q", ""))
+                    if not query:
+                        return _json_response({"error": "Missing query param q"}, 400)
+                    n = min(max(int(params.get("n", "10")), 1), 30)
+                    source = unquote(params.get("source", ""))
+                    inc = params.get("include_superseded", "").lower() in ("1", "true", "yes")
+                except (ValueError, TypeError):
+                    return _json_response({"error": "invalid parameters"}, 400)
+                try:
+                    return _json_response(_hybrid_diagnostic(
+                        query, n_results=n, source_filter=source, include_superseded=inc))
+                except Exception:
+                    # Errore sanitizzato all'esterno; dettaglio completo solo in stderr (FAIL 6).
+                    import traceback as _tb
+                    print("[DIAG] hybrid-search failed:\n" + _tb.format_exc(), file=sys.stderr)
+                    return _json_response({"error": "diagnostic failed"}, 500)
+
             # /api/kb/document?path=<relative_path>  → raw file bytes
             elif path == "/api/kb/document":
                 from scripts.lib.kb_document_api import handle_kb_document_request
@@ -1288,11 +1315,12 @@ class BearerAuthMiddleware:
             is_ingest_api = path == "/api/ingest-live"
             is_chat = path == "/api/chat" or path.startswith("/api/chat/")
             is_kb = path.startswith("/api/kb/")
+            is_diag = path.startswith("/api/diag/")
 
             # Localhost: allow all API calls without auth
-            # Remote: allow dashboard + secrets + auth API + ingest-live + native chat + kb with cookie/token auth
+            # Remote: allow dashboard + secrets + auth API + ingest-live + native chat + kb + diag with cookie/token auth
             _resolved_token = ""
-            if is_localhost or is_dashboard or is_secrets or is_auth_api or is_ingest_api or is_chat or is_kb:
+            if is_localhost or is_dashboard or is_secrets or is_auth_api or is_ingest_api or is_chat or is_kb or is_diag:
                 # Remote calls need auth (except /api/auth/login which verifies itself)
                 if not is_localhost and path not in ("/api/auth/login", "/api/dashboard/setup"):
                     token_ok = False
@@ -1452,6 +1480,27 @@ def get_collection() -> chromadb.Collection | None:
         _chromadb_client = chromadb.PersistentClient(path=DB_DIR)
         _collection = _chromadb_client.get_or_create_collection(name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
     return _collection
+
+
+def _get_collection_readonly() -> chromadb.Collection:
+    """Read-only collection accessor per il path DIAGNOSTICO.
+
+    Differenza da get_collection(): NON crea la collection (no get_or_create).
+    Se non esiste → errore esplicito (read-only-by-contract), non la materializza.
+    Riusa la collection/client già vivi nel daemon → nessun secondo PersistentClient
+    (SIGSEGV due-processi). Non usata dal path produzione (kb_hybrid_search invariato).
+    """
+    global _collection, _chromadb_client
+    if _maintenance_mode:
+        raise RuntimeError("collection unavailable (maintenance mode)")
+    # Collection già aperta in questo processo (caso normale nel daemon): riusala.
+    if _collection is not None:
+        return _collection
+    # Non ancora aperta: apri il client (riusa quello vivo se presente) e prendi la
+    # collection SENZA crearla. get_collection() (no _or_create) solleva se assente.
+    if _chromadb_client is None:
+        _chromadb_client = chromadb.PersistentClient(path=DB_DIR)
+    return _chromadb_client.get_collection(name=COLLECTION_NAME)
 
 
 # get_embedding() imported from lib.embedding
@@ -1863,6 +1912,190 @@ def _compose_rerank_pool(items: list, n_results: int) -> list:
     return deduped
 
 
+def _hybrid_collect(query: str, n_results: int, source_filter: str,
+                    include_superseded: bool, *, diag: bool = False) -> dict:
+    """STEP 1-3b della pipeline hybrid: retrieval semantic + entity + supersede filter.
+
+    Logica CONDIVISA tra kb_hybrid_search (path produzione) e l'endpoint diagnostico
+    read-only. Estratta verbatim da kb_hybrid_search → i due path producono gli stessi
+    candidati a parità di (query, n_results, source_filter, include_superseded).
+
+    Read-only: legge la collection Chroma (client vivo via get_collection) e
+    entity_index.sqlite3 in mode=ro. Nessuna scrittura su DB/queue/file.
+
+    Args:
+        diag: se True popola stages/timings con snapshot per-stage (semantic pre-merge,
+            entity pre-cap, entity post-cap). In produzione (False) gli snapshot non
+            vengono costruiti → overhead nullo, comportamento invariato.
+
+    Returns dict:
+        seen_ids:    {cid: {"doc","meta","score","source_type","date"}} POST supersede
+        entity_hits: [{"entity","chunk_ids"}]
+        raw_count:   n. candidati PRIMA del supersede filter (distingue i due messaggi
+                     "no results" di kb_hybrid_search)
+        stages:      dict snapshot se diag else None
+        timings:     dict ms per step se diag else None
+    """
+    import sqlite3 as _sqlite3
+    import re as _re
+    import time as _time
+    ENTITY_DB_PATH = os.path.join(DB_DIR, "entity_index.sqlite3")
+
+    stages = {} if diag else None
+    timings = {} if diag else None
+    def _now():
+        return _time.perf_counter() if diag else 0.0
+
+    # Path produzione: get_collection() (get_or_create, invariato). Path diagnostico:
+    # accessor read-only-by-contract che NON crea la collection (FAIL 4).
+    collection = _get_collection_readonly() if diag else get_collection()
+    seen_ids = {}  # chunk_id -> {"doc", "meta", "score", "source_type", "date"}
+
+    # --- STEP 1: Semantic search (over-fetch for re-ranking) ---
+    _t0 = _now()
+    semantic_n = min(n_results * 3, 30)
+    embedding = get_embedding(query)
+    sem_kwargs = dict(query_embeddings=[embedding], n_results=semantic_n)
+    if source_filter in ("document", "chatgpt", "claude", "email"):
+        sem_kwargs["where"] = {"source": source_filter}
+    sem_results = collection.query(**sem_kwargs)
+
+    sem_snapshot = [] if diag else None
+    if sem_results and sem_results["documents"] and sem_results["documents"][0]:
+        for _rank, (doc, meta, dist, cid) in enumerate(zip(
+            sem_results["documents"][0], sem_results["metadatas"][0],
+            sem_results["distances"][0], sem_results["ids"][0]
+        )):
+            relevance = max(0, 1 - dist)
+            seen_ids[cid] = {
+                "doc": doc, "meta": meta, "score": relevance,
+                "source_type": "semantic", "date": meta.get("date", "")
+            }
+            if diag:
+                sem_snapshot.append({
+                    "chunk_id": cid, "rank": _rank, "score": relevance,
+                    "source_type": "semantic", "doc_type": str(meta.get("doc_type", ""))[:64]
+                })
+    if diag:
+        timings["semantic_ms"] = (_now() - _t0) * 1000.0
+        stages["semantic_candidates"] = {"count": len(sem_snapshot), "items": sem_snapshot}
+
+    # --- STEP 2: Extract candidate entities from the query ---
+    _t1 = _now()
+    entity_hits = []
+    if os.path.exists(ENTITY_DB_PATH):
+        idx_conn = _sqlite3.connect(f"file:{ENTITY_DB_PATH}?mode=ro", uri=True)
+        idx_cursor = idx_conn.cursor()
+
+        # Extract capitalized words (2+ chars) as candidate entities
+        words = query.split()
+        candidates = set()
+
+        # Parole singole capitalizzate
+        for w in words:
+            clean = _re.sub(r"[^\w]", "", w)
+            if clean and clean[0].isupper() and len(clean) >= 2:
+                candidates.add(clean)
+
+        # Bigrammi capitalizzati (es. "Acme Corp", "the user")
+        for i in range(len(words) - 1):
+            w1 = _re.sub(r"[^\w]", "", words[i])
+            w2 = _re.sub(r"[^\w]", "", words[i + 1])
+            if w1 and w2 and w1[0].isupper() and w2[0].isupper():
+                candidates.add(f"{w1} {w2}")
+
+        # Trigrammi (es. "Acme Corp Inc")
+        for i in range(len(words) - 2):
+            w1 = _re.sub(r"[^\w]", "", words[i])
+            w2 = _re.sub(r"[^\w]", "", words[i + 1])
+            w3 = _re.sub(r"[^\w]", "", words[i + 2])
+            if w1 and w3 and w1[0].isupper():
+                candidates.add(f"{w1} {w2} {w3}")
+
+        # Search each candidate nell'entity index
+        # sorted() → ordine d'iterazione deterministico (candidates è un set):
+        # entity_hits e a valle new_entity_ids risultano ripetibili a parità di query.
+        for candidate in sorted(candidates):
+            idx_cursor.execute(
+                "SELECT DISTINCT chunk_id FROM entity_index WHERE entity LIKE ? COLLATE NOCASE ORDER BY chunk_id LIMIT 100",
+                (f"%{candidate}%",)
+            )
+            chunk_ids = [r[0] for r in idx_cursor.fetchall()]
+            if chunk_ids:
+                entity_hits.append({"entity": candidate, "chunk_ids": chunk_ids})
+
+        idx_conn.close()
+    if diag:
+        timings["entity_extract_ms"] = (_now() - _t1) * 1000.0
+
+    # --- STEP 3: Retrieve chunks from entity hits (only those not already found) ---
+    _t2 = _now()
+    new_entity_ids = []
+    for hit in entity_hits:
+        for cid in hit["chunk_ids"]:
+            if cid not in seen_ids:
+                new_entity_ids.append(cid)
+
+    if diag:
+        # pre-cap: solo chunk_id noti (non ancora fetchati) → doc_type/score sconosciuti.
+        stages["entity_candidates_pre_cap"] = {
+            "count": len(new_entity_ids),
+            "entities_recognized": [h["entity"] for h in entity_hits],
+            "items": [{"chunk_id": c, "rank": i, "score": None,
+                       "source_type": "entity", "doc_type": None}
+                      for i, c in enumerate(new_entity_ids)],
+        }
+
+    entity_post_snapshot = [] if diag else None
+    if new_entity_ids:
+        # Limita per non esplodere. Deterministico è SOLO *quali* 100 chunk
+        # entrano qui: sorted(candidates) + ORDER BY chunk_id rendono questo
+        # slice ripetibile a parità di query. NON è garantito l'ordine finale
+        # degli entity nei risultati: collection.get(ids=...) non assicura di
+        # preservare l'ordine richiesto, e con score 0.5 fisso + date spesso
+        # uguali il rank entity può ereditare l'ordine di ritorno di Chroma.
+        new_entity_ids = new_entity_ids[:100]
+        FETCH_BATCH = 40
+        for i in range(0, len(new_entity_ids), FETCH_BATCH):
+            batch_ids = new_entity_ids[i:i + FETCH_BATCH]
+            try:
+                batch_result = collection.get(ids=batch_ids, include=["documents", "metadatas"])
+                for cid, doc, meta in zip(batch_result["ids"], batch_result["documents"], batch_result["metadatas"]):
+                    if source_filter and meta.get("source", "") != source_filter:
+                        continue
+                    if cid not in seen_ids:
+                        seen_ids[cid] = {
+                            "doc": doc, "meta": meta, "score": 0.5,
+                            "source_type": "entity", "date": meta.get("date", "")
+                        }
+                        if diag:
+                            entity_post_snapshot.append({
+                                "chunk_id": cid, "rank": len(entity_post_snapshot),
+                                "score": 0.5, "source_type": "entity",
+                                "doc_type": str(meta.get("doc_type", ""))[:64]
+                            })
+            except Exception:
+                pass
+    if diag:
+        timings["entity_fetch_ms"] = (_now() - _t2) * 1000.0
+        # post-cap: fetchati e aggiunti (post slice [:100], post source_filter, PRE-supersede).
+        stages["entity_candidates_post_cap"] = {
+            "count": len(entity_post_snapshot), "items": entity_post_snapshot
+        }
+
+    raw_count = len(seen_ids)
+
+    # --- STEP 3b: Filter superseded chunks ---
+    _t3 = _now()
+    if not include_superseded:
+        seen_ids = {cid: v for cid, v in seen_ids.items() if not is_superseded(v["meta"])}
+    if diag:
+        timings["supersede_ms"] = (_now() - _t3) * 1000.0
+
+    return {"seen_ids": seen_ids, "entity_hits": entity_hits,
+            "raw_count": raw_count, "stages": stages, "timings": timings}
+
+
 @mcp.tool()
 def kb_hybrid_search(query: str, n_results: int = 10, source_filter: str = "", include_superseded: bool = False) -> str:
     """Hybrid search: combines semantic search + entity search in a single query.
@@ -1881,118 +2114,16 @@ def kb_hybrid_search(query: str, n_results: int = 10, source_filter: str = "", i
         source_filter: Filter by source: "document", "chatgpt", "claude", "email" or "" for all
         include_superseded: If True, include chunks superseded by more recent info (default False)
     """
-    import json as _json
-    import sqlite3 as _sqlite3
-    import re as _re
     n_results = min(max(n_results, 1), 30)
-    ENTITY_DB_PATH = os.path.join(DB_DIR, "entity_index.sqlite3")
 
     try:
-        collection = get_collection()
-        seen_ids = {}  # chunk_id -> {"doc", "meta", "score", "source_type"}
+        # --- STEP 1-3b: retrieval semantic + entity + supersede (logica condivisa) ---
+        collected = _hybrid_collect(query, n_results, source_filter, include_superseded)
+        seen_ids = collected["seen_ids"]
+        entity_hits = collected["entity_hits"]
 
-        # --- STEP 1: Semantic search (over-fetch for re-ranking) ---
-        semantic_n = min(n_results * 3, 30)
-        embedding = get_embedding(query)
-        sem_kwargs = dict(query_embeddings=[embedding], n_results=semantic_n)
-        if source_filter in ("document", "chatgpt", "claude", "email"):
-            sem_kwargs["where"] = {"source": source_filter}
-        sem_results = collection.query(**sem_kwargs)
-
-        if sem_results and sem_results["documents"] and sem_results["documents"][0]:
-            for doc, meta, dist, cid in zip(
-                sem_results["documents"][0], sem_results["metadatas"][0],
-                sem_results["distances"][0], sem_results["ids"][0]
-            ):
-                relevance = max(0, 1 - dist)
-                seen_ids[cid] = {
-                    "doc": doc, "meta": meta, "score": relevance,
-                    "source_type": "semantic", "date": meta.get("date", "")
-                }
-
-        # --- STEP 2: Extract candidate entities from the query ---
-        entity_hits = []
-        if os.path.exists(ENTITY_DB_PATH):
-            idx_conn = _sqlite3.connect(f"file:{ENTITY_DB_PATH}?mode=ro", uri=True)
-            idx_cursor = idx_conn.cursor()
-
-            # Extract capitalized words (2+ chars) as candidate entities
-            words = query.split()
-            candidates = set()
-
-            # Parole singole capitalizzate
-            for w in words:
-                clean = _re.sub(r"[^\w]", "", w)
-                if clean and clean[0].isupper() and len(clean) >= 2:
-                    candidates.add(clean)
-
-            # Bigrammi capitalizzati (es. "Acme Corp", "the user")
-            for i in range(len(words) - 1):
-                w1 = _re.sub(r"[^\w]", "", words[i])
-                w2 = _re.sub(r"[^\w]", "", words[i + 1])
-                if w1 and w2 and w1[0].isupper() and w2[0].isupper():
-                    candidates.add(f"{w1} {w2}")
-
-            # Trigrammi (es. "Acme Corp Inc")
-            for i in range(len(words) - 2):
-                w1 = _re.sub(r"[^\w]", "", words[i])
-                w2 = _re.sub(r"[^\w]", "", words[i + 1])
-                w3 = _re.sub(r"[^\w]", "", words[i + 2])
-                if w1 and w3 and w1[0].isupper():
-                    candidates.add(f"{w1} {w2} {w3}")
-
-            # Search each candidate nell'entity index
-            # sorted() → ordine d'iterazione deterministico (candidates è un set):
-            # entity_hits e a valle new_entity_ids risultano ripetibili a parità di query.
-            for candidate in sorted(candidates):
-                idx_cursor.execute(
-                    "SELECT DISTINCT chunk_id FROM entity_index WHERE entity LIKE ? COLLATE NOCASE ORDER BY chunk_id LIMIT 100",
-                    (f"%{candidate}%",)
-                )
-                chunk_ids = [r[0] for r in idx_cursor.fetchall()]
-                if chunk_ids:
-                    entity_hits.append({"entity": candidate, "chunk_ids": chunk_ids})
-
-            idx_conn.close()
-
-        # --- STEP 3: Retrieve chunks from entity hits (only those not already found) ---
-        new_entity_ids = []
-        for hit in entity_hits:
-            for cid in hit["chunk_ids"]:
-                if cid not in seen_ids:
-                    new_entity_ids.append(cid)
-
-        if new_entity_ids:
-            # Limita per non esplodere. Deterministico è SOLO *quali* 100 chunk
-            # entrano qui: sorted(candidates) + ORDER BY chunk_id rendono questo
-            # slice ripetibile a parità di query. NON è garantito l'ordine finale
-            # degli entity nei risultati: collection.get(ids=...) non assicura di
-            # preservare l'ordine richiesto, e con score 0.5 fisso + date spesso
-            # uguali il rank entity può ereditare l'ordine di ritorno di Chroma.
-            new_entity_ids = new_entity_ids[:100]
-            FETCH_BATCH = 40
-            for i in range(0, len(new_entity_ids), FETCH_BATCH):
-                batch_ids = new_entity_ids[i:i + FETCH_BATCH]
-                try:
-                    batch_result = collection.get(ids=batch_ids, include=["documents", "metadatas"])
-                    for cid, doc, meta in zip(batch_result["ids"], batch_result["documents"], batch_result["metadatas"]):
-                        if source_filter and meta.get("source", "") != source_filter:
-                            continue
-                        if cid not in seen_ids:
-                            seen_ids[cid] = {
-                                "doc": doc, "meta": meta, "score": 0.5,
-                                "source_type": "entity", "date": meta.get("date", "")
-                            }
-                except Exception:
-                    pass
-
-        if not seen_ids:
+        if collected["raw_count"] == 0:
             return "No results found in the KB."
-
-        # --- STEP 3b: Filter superseded chunks ---
-        if not include_superseded:
-            seen_ids = {cid: v for cid, v in seen_ids.items() if not is_superseded(v["meta"])}
-
         if not seen_ids:
             return "No results found in the KB (all results have been superseded by more recent info)."
 
@@ -2059,6 +2190,81 @@ def kb_hybrid_search(query: str, n_results: int = 10, source_filter: str = "", i
 
     except Exception as e:
         return f"kb_hybrid_search error: {str(e)}"
+
+
+def _hybrid_diagnostic(query: str, n_results: int = 10, source_filter: str = "",
+                       include_superseded: bool = False) -> dict:
+    """Versione READ-ONLY/strumentata di kb_hybrid_search per harness esterno.
+
+    Riusa _hybrid_collect (con accessor read-only) + _compose_rerank_pool (gli STESSI
+    building block del path produzione) → stesso ordinamento sui candidati/pool. Per il
+    rerank chiama _rerank_local DIRETTAMENTE (ONNX-only, no fallback Jina) → identico
+    all'ordine ONNX della produzione quando il cross-encoder è disponibile. Ritorna SOLO
+    dati strutturati per-stage: nessun testo dei chunk. Per ogni elemento:
+    {chunk_id, rank, score, source_type, doc_type}. Più counts e timing per stage.
+    """
+    import time as _time
+    n_results = min(max(n_results, 1), 30)
+    t_start = _time.perf_counter()
+
+    collected = _hybrid_collect(query, n_results, source_filter, include_superseded, diag=True)
+    seen_ids = collected["seen_ids"]
+    stages = collected["stages"]
+    timings = collected["timings"]
+
+    def _dt(v):  # doc_type reale, troncato a 64 (cintura anti-sentinelle lunghe, FAIL 6)
+        return str(v["meta"].get("doc_type", ""))[:64]
+
+    # --- STEP 3c: sopravvissuti al supersede filter (osserva chi cade tra candidati
+    #     e pool) — ordine d'inserimento di seen_ids (semantic, poi entity). FAIL 7 ---
+    stages["after_supersede"] = {"count": len(seen_ids), "items": [
+        {"chunk_id": k, "rank": i, "score": v["score"], "source_type": v["source_type"],
+         "doc_type": _dt(v)} for i, (k, v) in enumerate(seen_ids.items())]}
+
+    # --- STEP 4: pool composto (input al cross-encoder) — logica pura ---
+    _tp = _time.perf_counter()
+    pool = _compose_rerank_pool(list(seen_ids.items()), n_results)
+    timings["pool_ms"] = (_time.perf_counter() - _tp) * 1000.0
+    stages["rerank_pool"] = {"count": len(pool), "items": [
+        {"chunk_id": k, "rank": i, "score": v["score"], "source_type": v["source_type"],
+         "doc_type": _dt(v)} for i, (k, v) in enumerate(pool)]}
+
+    # --- STEP 5: cross-encoder ONNX. NESSUN fallback Jina nel path diagnostico (FAIL 4):
+    #     Jina fa una POST esterna coi documenti → side-effect + testo che esce. Se ONNX
+    #     non è disponibile/fallisce → backend "unavailable" + ordine pre-rerank, score null. ---
+    _tr = _time.perf_counter()
+    rerank_backend = "none"          # pool<=1: nessun rerank da fare
+    final_order = [(i, None) for i in range(min(len(pool), n_results))]  # default: ordine pool
+    if len(pool) > 1:
+        rerank_backend = "unavailable"
+        documents = [v["doc"][:1000] for _, v in pool]
+        try:
+            ranked = _rerank_local(query, documents)  # [(idx, score), ...] desc | None
+        except Exception as e:
+            print(f"[DIAG] ONNX rerank error: {e}", file=sys.stderr)
+            ranked = None
+        if ranked is not None:
+            rerank_backend = "onnx"
+            final_order = [(idx, float(score)) for idx, score in ranked[:n_results]]
+    final_items = []
+    for rank, (pidx, ce_score) in enumerate(final_order):
+        k, v = pool[pidx]
+        final_items.append({"chunk_id": k, "rank": rank, "score": ce_score,
+                            "source_type": v["source_type"], "doc_type": _dt(v)})
+    timings["rerank_ms"] = (_time.perf_counter() - _tr) * 1000.0
+    stages["final_ranked"] = {"count": len(final_items), "items": final_items}
+    timings["total_ms"] = (_time.perf_counter() - t_start) * 1000.0
+
+    return {
+        "query": query, "n_results": n_results, "source_filter": source_filter,
+        "include_superseded": include_superseded, "rerank_backend": rerank_backend,
+        "counts": {
+            "raw_candidates": collected["raw_count"], "after_supersede": len(seen_ids),
+            "final_semantic": sum(1 for it in final_items if it["source_type"] == "semantic"),
+            "final_entity": sum(1 for it in final_items if it["source_type"] == "entity"),
+        },
+        "stages": stages, "timings": timings,
+    }
 
 
 @mcp.tool()
