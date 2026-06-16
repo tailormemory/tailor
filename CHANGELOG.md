@@ -18,6 +18,32 @@ Template for upcoming changes. Move entries under a new version heading on relea
 ### Docs
 -->
 
+### Added
+
+- **Supporto file Markdown (`.md`/`.markdown`) nell'ingest.** Aggiunte le
+  estensioni a `ingest.supported_extensions`; nuovo path di chunking dedicato
+  (`split_markdown_at_boundaries()`) che preserva la struttura: code fence
+  atomici (mai spezzati internamente, oversize-ma-bilanciati se superano il
+  target), tabelle spezzate solo a confine di riga, prosa a confine di frase.
+  Overlap disattivato per i `.md` (chunk header-anchored, già autoconsistenti) —
+  era una seconda fonte di fence sbilanciati. `split_text_at_boundaries`
+  condiviso con PDF/docx/pptx invariato. `tailor.yaml.example` allineato.
+  File: [`scripts/ingest/ingest_docs.py`](scripts/ingest/ingest_docs.py).
+
+### Fixed
+
+- **Auto-flush queue HNSW: burst allineato al `sync_threshold`.** Il burst di
+  re-upsert (`repair_hnsw_index.py --flush-queue-backlog`) era dimensionato a
+  `max(sync_threshold+margin, drift+margin)` fisso, lasciando un residuo
+  `(drift + burst) mod sync_threshold` non persistito quando il backlog era
+  vicino alla soglia → l'auto-flush falliva (rc=5) gonfiando la queue invece di
+  drenarla (queue 501 -> 601). Ora il burst è calcolato perché `(drift + burst)`
+  sia il più piccolo multiplo di `sync_threshold` >= `drift + margin` (residuo
+  0), con loop di top-up capped e success-criterion che richiede l'allineamento
+  (`drift % sync_threshold == 0`). Validato sul campo: queue 607 -> 0 al primo
+  ciclo auto-flush. File: [`scripts/maintenance/repair_hnsw_index.py`](scripts/maintenance/repair_hnsw_index.py).
+
+
 ---
 
 ## [1.3.0] — 2026-06-12 — ChromaDB #6975 gate hardening: drift-aware, collection-scoped, rc=4 escalations

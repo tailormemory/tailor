@@ -93,10 +93,11 @@ cd ~/tailor
 # soglia custom: ... --flush-queue-backlog --queue-backlog-min 200
 ```
 
-Esegue un burst idempotente di `max(sync_threshold+100, drift+100)` re-upsert → supera la soglia → `_persist()` → `vector_seq` avanza, queue trimmata. L'output riporta `Trigger: drift|queue_backlog` e l'esito.
+Esegue un burst idempotente **allineato**: dimensiona i re-upsert perché `(drift + burst)` sia il più piccolo multiplo di `sync_threshold` ≥ `drift + margin` → l'ultimo `_persist()` atterra sulla testa del WAL, **residuo 0**. (Il vecchio burst fisso `max(sync_threshold+100, drift+100)` lasciava un residuo `(drift+burst) mod sync_threshold` non persistito → falliva con backlog ≈ soglia.) Loop di top-up capped se skip/error lasciano un residuo. → `vector_seq` avanza, queue trimmata. L'output riporta `Trigger: drift|queue_backlog` e l'esito.
 
 **Successo** (exit 0) richiede tutte e tre:
 - `vector_seq_delta ≥ sync_threshold` (il burst ha superato la soglia → persist avvenuto)
+- `post_drift % sync_threshold == 0` (residuo allineato a zero — non basta più aver superato la soglia)
 - `post_drift < DRIFT_WARNING`
 - `post_collection_queue_pending_count < queue_backlog_min` (il backlog azionabile della collection è davvero sceso; `post_queue_total` resta esposto come metrica globale)
 
