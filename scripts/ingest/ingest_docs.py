@@ -1,5 +1,5 @@
 """
-TAILOR — 4: Document Ingest (PDF, Excel, CSV, Word, PowerPoint)
+TAILOR — 4: Document Ingest (PDF, Excel, CSV, Word, PowerPoint, Markdown)
 Scans configured folders (e.g. OneDrive) and ingests documents into the KB.
 
 Features:
@@ -8,6 +8,7 @@ Features:
 - CSV/TSV: extracts text as table
 - Word (.docx): extracts text per paragraph + tables via python-docx
 - PowerPoint (.pptx): extracts text per slide via python-pptx
+- Markdown (.md, .markdown): extracts text per header section (header+fence aware)
 - Chunking with v2 logic (target ~1200 chars)
 - Incremental: tracks already-processed files (SHA256 hash)
 - Source tag: "document" in metadata
@@ -49,7 +50,7 @@ from vlm_extractor import extract_page_via_vlm
 WATCH_FOLDERS = cfg("ingest", "document_paths") or []
 
 # Estensioni supportate
-SUPPORTED_EXTENSIONS = set(cfg("ingest", "supported_extensions") or [".pdf", ".xlsx", ".xls", ".csv", ".tsv", ".docx", ".pptx"])
+SUPPORTED_EXTENSIONS = set(cfg("ingest", "supported_extensions") or [".pdf", ".xlsx", ".xls", ".csv", ".tsv", ".docx", ".pptx", ".md", ".markdown"])
 
 # Subfolders to ignore (exact names, case-insensitive)
 IGNORE_FOLDERS = set(cfg("ingest", "ignore_folders") or ["Food Tracker"])
@@ -866,6 +867,75 @@ def extract_pptx(filepath):
     return sections
 
 
+def _split_markdown_by_headers(text):
+    """Segmenta il markdown in blocchi (heading, testo) a ogni header H2/H3,
+    ignorando i '#' dentro i code fence (```/~~~). Il preambolo prima del primo
+    header resta nel primo blocco con heading="". Header-aware: così il chunker
+    paragraph-first non stacca un'intestazione dal suo corpo.
+    """
+    import re as _re
+    lines = text.splitlines(keepends=True)
+    blocks = []
+    cur_heading = ""
+    cur = []
+    fence_char = None  # '`' o '~' se dentro un code fence, altrimenti None
+
+    for line in lines:
+        s = line.lstrip()
+        if s[:3] in ("```", "~~~"):
+            ch = s[0]
+            fence_char = ch if fence_char is None else (None if ch == fence_char else fence_char)
+            cur.append(line)
+            continue
+        if fence_char is None and _re.match(r"#{2,3} ", line):
+            joined = "".join(cur).strip()
+            if joined:
+                blocks.append((cur_heading, joined))
+            cur_heading = line.strip().lstrip("#").strip()
+            cur = [line]
+        else:
+            cur.append(line)
+
+    joined = "".join(cur).strip()
+    if joined:
+        blocks.append((cur_heading, joined))
+    return blocks
+
+
+def extract_markdown(filepath):
+    """Estrae testo da Markdown (.md/.markdown), una sezione per header H2/H3.
+
+    Header-aware + fence-aware: ogni sezione parte dalla propria intestazione e i
+    '#' dentro i code fence non vengono scambiati per header. Le sezioni oltre il
+    target vengono spezzate da split_markdown_at_boundaries() (path dedicato ai
+    .md): code fence atomici, tabelle spezzate solo a confine di riga, prosa a
+    confine di frase.
+    """
+    sections = []
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except Exception as e:
+        print(f"    ERRORE Markdown {filepath}: {e}")
+        return sections
+
+    if not text.strip():
+        return sections
+
+    blocks = _split_markdown_by_headers(text)
+    total = len(blocks)
+    for i, (heading, body) in enumerate(blocks, 1):
+        sections.append({
+            "text": body,
+            "metadata": {
+                "section": i,
+                "total_sections": total,
+                "heading": heading,
+            },
+        })
+    return sections
+
+
 def extract_text(filepath, doctype=None):
     """Router: estrae testo in base all'estensione.
 
@@ -883,6 +953,8 @@ def extract_text(filepath, doctype=None):
         return extract_docx(filepath)
     elif ext == ".pptx":
         return extract_pptx(filepath)
+    elif ext in (".md", ".markdown"):
+        return extract_markdown(filepath)
     return []
 
 
@@ -972,6 +1044,175 @@ def split_text_at_boundaries(text, max_chars):
     return merged
 
 
+# ---- Markdown-aware chunking (path .md only — NON tocca split_text_at_boundaries) ----
+
+def _is_md_table_block(block):
+    """True se il blocco è una tabella markdown (maggioranza righe con '|')."""
+    lines = [l for l in block.splitlines() if l.strip()]
+    if len(lines) < 2:
+        return False
+    return sum(1 for l in lines if "|" in l) >= len(lines) * 0.6
+
+
+def _segment_markdown(text):
+    """Spezza una sezione markdown in segmenti (kind, testo).
+
+    kind='fence': code block ```/~~~ completo -> ATOMICO, mai spezzato.
+    kind='para' : paragrafo (blank-line delimited) fuori dai fence.
+    Un fence non terminato a fine sezione resta comunque atomico (il source è
+    già sbilanciato: non c'è nulla da bilanciare).
+    """
+    import re as _re
+    lines = text.splitlines(keepends=True)
+    segments = []
+    buf = []
+    fence_char = None
+    fence_buf = []
+
+    def _flush_buf():
+        if buf:
+            for p in _re.split(r'\n\s*\n', "".join(buf)):
+                p = p.strip()
+                if p:
+                    segments.append(("para", p))
+            buf.clear()
+
+    for line in lines:
+        s = line.lstrip()
+        if fence_char is None and s[:3] in ("```", "~~~"):
+            _flush_buf()
+            fence_char = s[0]
+            fence_buf = [line]
+            continue
+        if fence_char is not None:
+            fence_buf.append(line)
+            if s.startswith(fence_char * 3):
+                segments.append(("fence", "".join(fence_buf).strip("\n")))
+                fence_char = None
+                fence_buf = []
+            continue
+        buf.append(line)
+
+    if fence_char is not None:           # fence non chiuso -> atomico comunque
+        segments.append(("fence", "".join(fence_buf).strip("\n")))
+    _flush_buf()
+    return segments
+
+
+def _split_md_table_rows(table, max_chars):
+    """Raggruppa le righe di una tabella fino a max_chars, mai a metà riga.
+    Una riga singola più lunga del max resta intera (oversize ma non spezzata)."""
+    rows = table.splitlines()
+    out, cur, cur_len = [], [], 0
+    for row in rows:
+        rlen = len(row) + 1
+        if cur and cur_len + rlen > max_chars:
+            out.append("\n".join(cur))
+            cur, cur_len = [row], rlen
+        else:
+            cur.append(row)
+            cur_len += rlen
+    if cur:
+        out.append("\n".join(cur))
+    return out
+
+
+def _split_md_plain(text, max_chars):
+    """Spezza prosa lunga a confine di frase/spazio (nessuna struttura da preservare)."""
+    out = []
+    remaining = text
+    while len(remaining) > max_chars:
+        seg = remaining[:max_chars]
+        cut = -1
+        for sep in ('. ', '.\n', '? ', '! ', '; ', '\n'):
+            pos = seg.rfind(sep)
+            if pos > max_chars * 0.3:
+                cut = pos + len(sep)
+                break
+        if cut == -1:
+            pos = seg.rfind(' ')
+            cut = pos if pos > max_chars * 0.3 else max_chars
+        out.append(remaining[:cut].strip())
+        remaining = remaining[cut:].strip()
+    if remaining:
+        out.append(remaining)
+    return out
+
+
+def split_markdown_at_boundaries(text, max_chars):
+    """Splitter markdown-aware per le sole sezioni .md.
+
+    Garanzie sul testo prodotto:
+      - code fence (```/~~~) bilanciati: blocco atomico, se supera max_chars
+        diventa un chunk a sé (oversize) ma mai spezzato internamente;
+      - tabelle spezzate solo a confine di riga, mai a metà riga;
+      - prosa lunga spezzata a confine di frase/spazio.
+    Ogni chunk è bilanciato per costruzione (i fence sono segmenti interi; i
+    chunk para/tabella/prosa non contengono marker di fence), quindi anche il
+    merge per concatenazione resta bilanciato.
+    Stesso contratto di split_text_at_boundaries (lista di stringhe). NON usata
+    per PDF/docx/pptx -> comportamento di quei formati invariato.
+    """
+    MIN_CHUNK = 300
+    if len(text) <= max_chars:
+        return [text]
+
+    segments = _segment_markdown(text)
+    chunks = []
+    cur = []
+    cur_chars = 0
+
+    def _flush():
+        nonlocal cur_chars
+        if cur:
+            chunks.append("\n\n".join(cur))
+            cur.clear()
+            cur_chars = 0
+
+    for kind, seg in segments:
+        if not seg:
+            continue
+        seg_len = len(seg)
+
+        # Segmento che da solo sfora il max
+        if seg_len > max_chars:
+            _flush()
+            if kind == "fence":
+                chunks.append(seg)                        # atomico -> mai spezzato
+            elif _is_md_table_block(seg):
+                chunks.extend(_split_md_table_rows(seg, max_chars))
+            else:
+                chunks.extend(_split_md_plain(seg, max_chars))
+            continue
+
+        would_be = cur_chars + seg_len + (2 if cur else 0)
+        if would_be > max_chars and cur_chars >= MIN_CHUNK:
+            _flush()
+            cur.append(seg)
+            cur_chars = seg_len
+        else:
+            cur.append(seg)
+            cur_chars = would_be
+
+    _flush()
+
+    # Post-hoc merge dei chunk piccoli (concat \n\n -> preserva bilanciamento
+    # fence e confini di riga; mai split interno).
+    merged = []
+    i = 0
+    while i < len(chunks):
+        chunk = chunks[i]
+        while len(chunk) < MIN_CHUNK and i + 1 < len(chunks):
+            i += 1
+            chunk = chunk + '\n\n' + chunks[i]
+        if len(chunk) < MIN_CHUNK and merged:
+            merged[-1] = merged[-1] + '\n\n' + chunk
+        else:
+            merged.append(chunk)
+        i += 1
+    return merged
+
+
 def chunk_document(sections, file_info):
     """Converte le sezioni estratte in chunk per ChromaDB."""
     chunks = []
@@ -983,17 +1224,25 @@ def chunk_document(sections, file_info):
     text_preview = sections[0]["text"] if sections else ""
     doc_type = infer_doc_type(file_info["filename"], text_preview)
 
+    ext_lower = (file_info.get("extension", "") or "").lower()
+    is_md = ext_lower in (".md", ".markdown")
+
     for section in sections:
         text = section["text"]
         sec_meta = section["metadata"]
 
-        # Spezza sezioni lunghe
-        parts = split_text_at_boundaries(text, TARGET_CHUNK_CHARS)
+        # Spezza sezioni lunghe — markdown-aware per i .md (fence/tabelle preservati),
+        # splitter condiviso (invariato) per tutti gli altri formati.
+        if is_md:
+            parts = split_markdown_at_boundaries(text, TARGET_CHUNK_CHARS)
+        else:
+            parts = split_text_at_boundaries(text, TARGET_CHUNK_CHARS)
 
         for part in parts:
-            # Aggiungi overlap
+            # Aggiungi overlap — disattivato per .md: lo slice raw di OVERLAP_CHARS
+            # introdurrebbe fence sbilanciati o frammenti di riga-tabella nel prefisso.
             overlap_text = ""
-            if prev_chunk_text and OVERLAP_CHARS > 0:
+            if prev_chunk_text and OVERLAP_CHARS > 0 and not is_md:
                 overlap_text = prev_chunk_text[-OVERLAP_CHARS:].strip()
                 space_pos = overlap_text.find(" ")
                 if space_pos > 0:

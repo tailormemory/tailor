@@ -64,6 +64,8 @@ ingest:
     - .tsv
     - .docx
     - .pptx
+    - .md
+    - .markdown
   # Conversation sources to parse and ingest into the KB.
   # Each entry needs a matching parser in scripts/ingest/parsers/<name>.py
   # Supported parsers: chatgpt, claude, gemini
