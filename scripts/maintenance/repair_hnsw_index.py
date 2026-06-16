@@ -31,10 +31,13 @@ ids were still in embeddings_queue rather than SQL-only orphans.
 
 A plain restart does NOT drain the backlog: at boot the segment loads its
 persisted pickle at the old max_seq_id and only persists again past
-`hnsw:sync_threshold` or on a *clean* shutdown (`System.stop()`/atexit). A
-`launchctl kickstart -k` (SIGKILL) skips that clean shutdown entirely, so the
-queue survives the restart untouched. Only a threshold-crossing burst (this
-mode) or a graceful shutdown drains it.
+`hnsw:sync_threshold` cumulative writes. ChromaDB 1.5.9 does NOT drain on
+shutdown either: the PersistentClient lives in mcp_server module globals,
+detached from the uvicorn lifespan, so neither a graceful restart
+(`bootout`/`bootstrap`) nor a `launchctl kickstart -k` (SIGKILL) triggers a
+`System.stop()`/atexit persist — the queue survives the restart untouched
+(verified 2026-06-10; see RUNBOOK_drift_alert.md §0). Only a threshold-crossing
+burst (this mode) drains it.
 
 Actionability is therefore gated on EITHER seq-drift >= DRIFT_WARNING OR a
 queue backlog >= FLUSH_QUEUE_BACKLOG_MIN (configurable via
@@ -50,6 +53,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import pickle
 import re
@@ -78,6 +82,11 @@ BACKUP_MAX_AGE_SECONDS = 3600  # 60 minutes
 DRIFT_WARNING = 800
 FLUSH_BURST_MARGIN = 100
 DEFAULT_HNSW_SYNC_THRESHOLD = 1000
+# Cap delle iterazioni di top-up allineamento nel flush (#6975 fix A). Ogni
+# iterazione chiude al più un residuo < sync_threshold, quindi in maintenance
+# esclusiva l'allineamento converge in 1 passata; il cap è una rete di sicurezza
+# se processed < richiesto (skip/error) o se Chroma cambia il timing di persist.
+MAX_TOPUP_ITERS = 5
 # A clean #6975 backlog can be actionable even when seq-drift is below
 # DRIFT_WARNING: a large embeddings_queue that no plain restart drains is itself
 # a reason to flush. Conservative default; override with --queue-backlog-min.
@@ -803,9 +812,10 @@ def format_report_human(report: DriftReport, delta: Delta | None = None) -> str:
         newest = report.queue_newest_iso or "?"
         lines.append(f"  {report.queue_total} pending ops, from {oldest} to {newest}")
         lines.append(f"  Vector segment max_seq_id is behind metadata segment by these ops.")
-        lines.append(f"  Drained only by a GRACEFUL shutdown (System.stop()/atexit persist) or a")
-        lines.append(f"  threshold-crossing burst (--flush-queue-backlog). A `kickstart -k`/SIGKILL")
-        lines.append(f"  restart does NOT drain it: boot reloads the old pickle and the backlog stays.")
+        lines.append(f"  Drained ONLY by a threshold-crossing burst (--flush-queue-backlog).")
+        lines.append(f"  No restart drains it — neither a graceful restart nor a `kickstart -k`/SIGKILL:")
+        lines.append(f"  ChromaDB 1.5.9 does not persist on shutdown, so boot reloads the old pickle")
+        lines.append(f"  and the backlog stays.")
         lines.append(f"  WARNING: queue consumption may itself trigger drift if HNSW persist races")
         lines.append(f"  with shutdown. Re-run audit after any restart/flush to verify.")
         lines.append("")
@@ -1098,8 +1108,11 @@ def flush_queue_backlog(
         watermark) oltre al seq-drift.
       * MCP lo vede solo dopo lazy-reopen (prima query post-SIGUSR2) o restart.
 
-    Dimensionare burst_n >= sync_threshold è una scelta DIFENSIVA conservativa
-    (vedi sopra), non "solo i nuovi write contano".
+    Il chiamante (main, ramo --flush-queue-backlog) dimensiona burst_n ALLINEATO:
+    (drift + burst_n) = più piccolo multiplo di sync_threshold >= drift + margin,
+    così che l'ultimo _persist() atterri sulla testa del WAL → residuo 0 (es. reale
+    2026-06-16: drift=500 → burst_n=500, non un fisso >= sync_threshold). Eventuali
+    skip/error che riducono i record consumati sono chiusi dal loop di top-up.
     """
     processed = 0
     skipped = 0
@@ -1303,13 +1316,28 @@ def main(argv: list[str] | None = None) -> int:
             # vector_max_seq_id e ri-consuma dal WAL SOLO i record del proprio topic
             # con seq_id > watermark. Quei record di backlog riletti GIÀ incrementano
             # _num_log_records_since_last_persist (non solo le re-upsert nuove).
-            # Burstare l'intero sync_threshold è quindi una scelta DIFENSIVA
-            # conservativa per garantire l'attraversamento in TUTTI i casi.
-            burst_n = max(sync_threshold + FLUSH_BURST_MARGIN, pre_seq["drift"] + FLUSH_BURST_MARGIN)
-            if burst_n < sync_threshold:
-                print(f"[flush] burst_n {burst_n} < sync_threshold {sync_threshold} → clamp",
-                      file=sys.stderr)
-                burst_n = sync_threshold
+            #
+            # Fix A — burst ALLINEATO (#6975): _persist() scatta ogni sync_threshold
+            # record consumati e avanza il watermark di esattamente sync_threshold;
+            # il residuo finale è (record_consumati) mod sync_threshold, dove
+            # record_consumati = drift_iniziale + record appesi dal burst. Il vecchio
+            # `max(threshold+margin, drift+margin)` attraversava la soglia ma NON
+            # allineava il totale a un multiplo, lasciando (drift+burst) mod threshold
+            # pendenti (caso 2026-06-16: (500+1100) mod 1000 = 600 → rc=5).
+            #
+            # Si dimensiona burst così che (drift + burst) sia il più piccolo multiplo
+            # di sync_threshold >= drift + FLUSH_BURST_MARGIN → l'ultimo _persist()
+            # atterra sulla testa del WAL, residuo atteso 0. Si usa pre_seq["drift"]
+            # (record WAL sopra il vector watermark), NON collection_queue_pending_count
+            # (netto per id: non conta tutti i record che incrementano il contatore).
+            aligned_total = math.ceil(
+                (pre_seq["drift"] + FLUSH_BURST_MARGIN) / sync_threshold
+            ) * sync_threshold
+            burst_n = aligned_total - pre_seq["drift"]
+            if burst_n < FLUSH_BURST_MARGIN:
+                # Difensivo: per costruzione burst_n >= FLUSH_BURST_MARGIN; clamp solo
+                # contro configurazioni anomale (margin >= sync_threshold).
+                burst_n += sync_threshold
             chunk_ids = _load_existing_embedding_ids(con, pre_seq["metadata_segment"], burst_n)
         finally:
             con.close()
@@ -1392,12 +1420,63 @@ def main(argv: list[str] | None = None) -> int:
             post_seq = _load_seq_state(con)
         finally:
             con.close()
+
+        # Fix A — top-up allineamento (#6975). I record realmente consumati =
+        # result["processed"], che può differire da burst_n se collection.get()
+        # salta id mancanti o un upsert va in errore; in quel caso il drift SQL
+        # residuo (= record consumati mod sync_threshold) non è 0 e la queue resta
+        # non drenata. Si itera (capped) finché il drift è allineato a un multiplo
+        # di sync_threshold → il prossimo _persist() chiude a 0. Gira nello STESSO
+        # client (contatore _num_log_records_since_last_persist vivo) e in
+        # maintenance esclusiva (MCP fermo via SIGUSR1). Riusa la lettura post_seq
+        # appena fatta (nessuna lettura extra quando il burst allineato chiude già
+        # a 0); result e post_seq vengono aggiornati a ogni passata.
+        result["topup_iterations"] = 0
+        for _ in range(MAX_TOPUP_ITERS):
+            residual = post_seq["drift"] % sync_threshold
+            if residual == 0:
+                break
+            top_up = sync_threshold - residual
+            con = _open_sqlite_ro(DB_PATH)
+            try:
+                topup_ids = _load_existing_embedding_ids(
+                    con, pre_seq["metadata_segment"], top_up
+                )
+            finally:
+                con.close()
+            _print(
+                f"  top-up allineamento: drift={post_seq['drift']} residual={residual} "
+                f"→ {len(topup_ids)} re-upsert aggiuntive",
+                args.json,
+            )
+            topup_result = flush_queue_backlog(
+                collection=collection,
+                chunk_ids=topup_ids,
+                progress=_flush_progress,
+            )
+            result["processed"] += topup_result["processed"]
+            result["skipped"] += topup_result["skipped"]
+            result["errors"] += topup_result["errors"]
+            result["candidate_ids"] += topup_result["candidate_ids"]
+            result["topup_iterations"] += 1
+            con = _open_sqlite_ro(DB_PATH)
+            try:
+                post_seq = _load_seq_state(con)
+            finally:
+                con.close()
+
         post_report = audit()
         vector_delta = post_seq["vector_seq"] - pre_seq["vector_seq"]
         success = (
             vector_delta >= sync_threshold
             and post_seq["drift"] < DRIFT_WARNING
             and post_report.collection_queue_pending_count < queue_backlog_min
+            # Post-condizione allineamento (#6975 fix A): il burst deve aver chiuso il
+            # residuo a zero (drift allineato a un multiplo di sync_threshold). Senza
+            # questo, skip/error nel top-up potrebbero lasciare un residuo sotto le
+            # soglie sopra e ritornare rc=0 con la queue NON drenata → success=False
+            # ⇒ rc=5 ⇒ auto_flush manda FAIL.
+            and post_seq["drift"] % sync_threshold == 0
             # Post-condizione: il flush deve aver compattato TUTTI i ghost.
             # Niente assert in prod → success=False ⇒ rc=5 ⇒ auto_flush manda FAIL.
             and post_report.benign_ghost_count == 0

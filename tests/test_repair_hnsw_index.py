@@ -1271,6 +1271,106 @@ def test_flush_cli_postcondition_uses_collection_pending_not_global_queue(synthe
     assert rc == 0          # post collection_pending=0<min, drift=0, no ghost → success
 
 
+def test_flush_cli_postcondition_fails_when_residual_not_aligned(synthetic_db, monkeypatch, capsys):
+    # Fix A / P2 — ramo DEGRADATO: skip/error nel top-up lasciano un residuo
+    # drift NON-zero ma strettamente < sync_threshold E sotto le soglie classiche
+    # (drift<DRIFT_WARNING, collection_pending<queue_backlog_min, nessun ghost).
+    # Senza la clausola di allineamento `post_seq["drift"] % sync_threshold == 0`
+    # il tool tornerebbe rc=0 con la queue NON drenata; con la clausola →
+    # success=False → rc=5.
+    Path(synthetic_db["lock_path"]).write_text("12345")
+    Path(synthetic_db["backups_dir"]).mkdir(exist_ok=True)
+    (Path(synthetic_db["backups_dir"]) / "chroma_now.sqlite3.gz").write_text("fake")
+
+    def _mk_report(collection_pending):
+        return rhi.DriftReport(
+            timestamp="t", timestamp_unix=0, db_path="x",
+            metadata_segment=META_SEG_ID, vector_segment=VEC_SEG_ID,
+            sql_total=1, hnsw_total=1, queue_total=collection_pending,
+            queue_oldest_iso=None, queue_newest_iso=None,
+            collection_queue_pending_count=collection_pending,
+            sql_only_orphans=[], hnsw_only_ghosts=[], unknown_count=0)
+
+    # pre actionable (pending=400 >= min); post pending=100 < min=300 → il criterio
+    # classico passerebbe, ma il residuo drift=600 NON è allineato.
+    reports = iter([_mk_report(400), _mk_report(100)])
+    monkeypatch.setattr(rhi, "audit", lambda *a, **k: next(reports))
+    # sync_threshold fisso a 1000 per determinismo aritmetico (indip. da synthetic_db).
+    monkeypatch.setattr(rhi, "_load_hnsw_sync_threshold", lambda con, **k: 1000)
+
+    # pre: drift=1000; post e TUTTE le passate di top-up: drift=600 PERSISTENTE
+    # (simula skip/error che non chiudono mai il residuo) → il loop esce al cap
+    # senza allineare, e vector_seq è avanzato di sync_threshold (delta criterion OK).
+    seq_calls = {"n": 0}
+
+    def _seq(con, **k):
+        seq_calls["n"] += 1
+        if seq_calls["n"] == 1:
+            return {"collection_id": "c", "metadata_segment": META_SEG_ID,
+                    "vector_segment": VEC_SEG_ID,
+                    "vector_seq": 1000, "metadata_seq": 2000, "drift": 1000}
+        return {"collection_id": "c", "metadata_segment": META_SEG_ID,
+                "vector_segment": VEC_SEG_ID,
+                "vector_seq": 2000, "metadata_seq": 2600, "drift": 600}
+
+    monkeypatch.setattr(rhi, "_load_seq_state", _seq)
+    monkeypatch.setattr(rhi, "_load_existing_embedding_ids",
+                        lambda con, seg, n: ["doc_aaaaaaaaaaaa_chunk_0000"])
+    # top-up non risolve mai: processed=0 (tutto skipped).
+    monkeypatch.setattr(rhi, "flush_queue_backlog",
+                        lambda **k: {"processed": 0, "skipped": 1, "errors": 0, "candidate_ids": 1})
+    _install_flush_mocks(monkeypatch, {})
+
+    rc = rhi.main(["--flush-queue-backlog", "--no-history"])
+    out = capsys.readouterr().out
+    assert rc == 5
+    # success=False osservabile dal ramo non-json (messaggio derivato dal booleano).
+    assert "WARN — flush did not meet success criteria" in out
+    # il top-up ha tentato il cap senza allineare (rete di sicurezza, non loop infinito).
+    assert seq_calls["n"] == 2 + rhi.MAX_TOPUP_ITERS
+
+
+def test_flush_cli_postcondition_succeeds_when_residual_aligned(synthetic_db, monkeypatch, capsys):
+    # Fix A / P2 — lato GEMELLO: drift post-flush = 0 (residuo allineato) → la
+    # clausola `post_seq["drift"] % sync_threshold == 0` passa → success=True → rc=0.
+    # Blinda esplicitamente il lato True della stessa condizione del test sopra.
+    Path(synthetic_db["lock_path"]).write_text("12345")
+    Path(synthetic_db["backups_dir"]).mkdir(exist_ok=True)
+    (Path(synthetic_db["backups_dir"]) / "chroma_now.sqlite3.gz").write_text("fake")
+
+    def _mk_report(collection_pending):
+        return rhi.DriftReport(
+            timestamp="t", timestamp_unix=0, db_path="x",
+            metadata_segment=META_SEG_ID, vector_segment=VEC_SEG_ID,
+            sql_total=1, hnsw_total=1, queue_total=collection_pending,
+            queue_oldest_iso=None, queue_newest_iso=None,
+            collection_queue_pending_count=collection_pending,
+            sql_only_orphans=[], hnsw_only_ghosts=[], unknown_count=0)
+
+    reports = iter([_mk_report(400), _mk_report(0)])
+    monkeypatch.setattr(rhi, "audit", lambda *a, **k: next(reports))
+    monkeypatch.setattr(rhi, "_load_hnsw_sync_threshold", lambda con, **k: 1000)
+    # post drift=0 → il loop di top-up esce subito (residual==0), nessuna lettura extra.
+    seqs = iter([
+        {"collection_id": "c", "metadata_segment": META_SEG_ID, "vector_segment": VEC_SEG_ID,
+         "vector_seq": 1000, "metadata_seq": 2000, "drift": 1000},   # pre
+        {"collection_id": "c", "metadata_segment": META_SEG_ID, "vector_segment": VEC_SEG_ID,
+         "vector_seq": 2000, "metadata_seq": 2000, "drift": 0},      # post allineato
+    ])
+    monkeypatch.setattr(rhi, "_load_seq_state", lambda con, **k: next(seqs))
+    monkeypatch.setattr(rhi, "_load_existing_embedding_ids",
+                        lambda con, seg, n: ["doc_aaaaaaaaaaaa_chunk_0000"])
+    monkeypatch.setattr(rhi, "flush_queue_backlog",
+                        lambda **k: {"processed": 1, "skipped": 0, "errors": 0, "candidate_ids": 1})
+    _install_flush_mocks(monkeypatch, {})
+
+    rc = rhi.main(["--flush-queue-backlog", "--no-history"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    # success=True osservabile dal ramo non-json.
+    assert "OK — HNSW backlog flushed below warning." in out
+
+
 def test_flush_cli_refuses_collection_queue_empty_with_global_backlog(synthetic_db, monkeypatch):
     # drift ≥ soglia ma collection_pending=0 (queue_total globale alto): refuse rc=4
     # con error code 'collection_queue_empty' (non 'queue_empty'). Solo gate, niente mutazione.
