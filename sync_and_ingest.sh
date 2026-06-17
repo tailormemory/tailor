@@ -629,10 +629,19 @@ count = db.execute(\"SELECT COUNT(*) FROM facts WHERE created_at >= '$RUN_START'
 print(count)
 db.close()
 " 2>/dev/null || echo "0")
-# Entities processed: fall back to log JSON (no DB column for this)
-DERIVES_OUTPUT=$(tail -5 "$LOG_FILE")
-DERIVES_JSON=$(echo "$DERIVES_OUTPUT" | tail -1)
-DERIVES_ENTITIES=$(echo "$DERIVES_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('entities_processed',0))" 2>/dev/null || echo "0")
+# Entities processed: read from the derivation checkpoint, not the tail of the
+# log. The final JSON summary line is never printed when the process is killed
+# mid-run (SIGTERM), so tail-parsing reported "0 entities" after every timeout.
+# The checkpoint is written on every periodic flush AND by the SIGTERM handler,
+# so it carries the real count whether the run completed or was killed.
+DERIVES_ENTITIES=$("$PYTHON" -c "
+import json
+try:
+    cp = json.load(open('$TAILOR_DIR/db/checkpoints/derives_checkpoint.json'))
+    print(cp.get('entities_processed', 0))
+except Exception:
+    print(0)
+" 2>/dev/null || echo "0")
 log "Fact derivation completed: $FACTS_DERIVED facts derived from $DERIVES_ENTITIES entities"
 
 # ── 6. EXIT MAINTENANCE MODE ──

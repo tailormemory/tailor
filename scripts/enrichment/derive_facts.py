@@ -18,7 +18,7 @@ Usage:
   python3 19_derive_facts.py --nightly        # Only entities with new facts since last run
 """
 
-import os, sys, json, time, sqlite3, argparse, re, requests
+import os, sys, json, time, sqlite3, argparse, re, signal, tempfile, requests
 from collections import defaultdict
 from datetime import datetime
 
@@ -72,17 +72,29 @@ def get_db():
     db.execute("PRAGMA busy_timeout=30000")
     return db
 
-def load_entity_groups(db, min_facts=MIN_FACTS, entity_filter=None, nightly_since=None):
-    """Load facts grouped by normalized entity. Returns {normalized: {names: set, facts: list}}."""
+def load_entity_groups(db, min_facts=MIN_FACTS, entity_filter=None):
+    """Load ALL facts grouped by normalized entity.
+
+    Returns {normalized: {names: set, facts: list, max_created_at: str}}.
+
+    Always loads the full set (no created_at pre-filter): the new-vs-backlog
+    partition and the durable per-entity watermark skip live in main(), so the
+    loader must see backlog entities (no recent facts) too. `max_created_at` is
+    the newest *source* fact timestamp for the entity (relation_type != 'derived')
+    — the value compared against the per-entity watermark to decide whether the
+    entity is "due". Derived rows are excluded from the cursor on purpose: they
+    are this script's own output, written with created_at=now(), so counting them
+    would make every entity that produced a derive look "newer than its
+    watermark" and re-open itself every night. The cursor must measure "how far
+    I've seen facts TO derive from", not what derivation produced.
+    """
     where = "WHERE (superseded_by = '' OR superseded_by IS NULL) AND entity_tags != '[]' AND entity_tags != ''"
-    if nightly_since:
-        where += f" AND created_at > '{nightly_since}'"
-    
+
     rows = db.execute(f"""
-        SELECT id, fact, category, entity_tags, event_date, created_at
+        SELECT id, fact, category, entity_tags, event_date, created_at, relation_type
         FROM facts {where}
     """).fetchall()
-    
+
     groups = defaultdict(lambda: {"names": set(), "facts": []})
     for r in rows:
         try:
@@ -100,35 +112,10 @@ def load_entity_groups(db, min_facts=MIN_FACTS, entity_filter=None, nightly_sinc
                 "category": r["category"],
                 "event_date": r["event_date"] or "",
                 "created_at": r["created_at"] or "",
+                "relation_type": r["relation_type"] or "",
             })
-    
-    # If nightly mode, also load ALL facts for entities that got new ones
-    if nightly_since:
-        entities_with_new = set(groups.keys())
-        all_rows = db.execute("""
-            SELECT id, fact, category, entity_tags, event_date, created_at
-            FROM facts
-            WHERE (superseded_by = '' OR superseded_by IS NULL) 
-            AND entity_tags != '[]' AND entity_tags != ''
-        """).fetchall()
-        
-        full_groups = defaultdict(lambda: {"names": set(), "facts": []})
-        for r in all_rows:
-            try:
-                tags = json.loads(r["entity_tags"])
-            except Exception:
-                continue
-            for tag in tags:
-                norm = normalize_entity(tag)
-                if norm in entities_with_new:
-                    full_groups[norm]["names"].add(tag)
-                    full_groups[norm]["facts"].append({
-                        "id": r["id"], "fact": r["fact"], "category": r["category"],
-                        "event_date": r["event_date"] or "", "created_at": r["created_at"] or "",
-                    })
-        groups = full_groups
-    
-    # Filter by min facts and deduplicate facts within each group
+
+    # Filter by min facts, deduplicate facts within each group, compute watermark
     filtered = {}
     for norm, data in groups.items():
         # Deduplicate by fact text
@@ -140,8 +127,13 @@ def load_entity_groups(db, min_facts=MIN_FACTS, entity_filter=None, nightly_sinc
                 unique_facts.append(f)
         data["facts"] = unique_facts
         if len(unique_facts) >= min_facts:
+            # Cursor over SOURCE facts only — never the script's own derived rows.
+            data["max_created_at"] = max(
+                (f["created_at"] for f in unique_facts if f["relation_type"] != "derived"),
+                default="",
+            )
             filtered[norm] = data
-    
+
     return filtered
 
 def get_existing_derives(db, entity_norm: str) -> set:
@@ -368,14 +360,50 @@ def derive_for_entity(entity_norm: str, data: dict, existing_derives: set,
 # ── Checkpoint ────────────────────────────────────────────────
 
 def load_checkpoint() -> dict:
+    """Load the derivation checkpoint.
+
+    Schema (current):
+      last_run            boundary "fully derived up to here"; advances ONLY on a
+                          full drain of a completed nightly run (never on SIGTERM).
+      derived_watermarks  {entity_norm: max(created_at) at time of derivation} —
+                          durable per-entity cursor, never wholesale-reset. An
+                          entity is skipped iff its current max(created_at) <= its
+                          stored watermark (so new facts always re-open it; this is
+                          what avoids the 2026-05-25 cumulative silent-skip bug
+                          without needing the old 1h reset).
+      entities_processed  last run's processed count (for reporting).
+      facts_derived       last run's derived count (for reporting).
+    """
     if os.path.exists(CHECKPOINT_FILE):
         with open(CHECKPOINT_FILE) as f:
-            return json.load(f)
-    return {"last_run": "", "entities_processed": 0, "facts_derived": 0, "processed_entities": []}
+            cp = json.load(f)
+        # Migrate legacy schema: drop the cumulative processed_entities list (the
+        # source of the 1h-reset hack) and seed the watermark dict empty. last_run
+        # is preserved as the boundary; entities are re-evaluated by watermark.
+        if "derived_watermarks" not in cp:
+            cp["derived_watermarks"] = {}
+            cp.pop("processed_entities", None)
+        return cp
+    return {"last_run": "", "derived_watermarks": {}, "entities_processed": 0, "facts_derived": 0}
 
 def save_checkpoint(cp: dict):
-    with open(CHECKPOINT_FILE, "w") as f:
-        json.dump(cp, f, indent=2)
+    """Atomic + reentrant-safe write. A unique tmp per call (tempfile.mkstemp)
+    means a SIGTERM landing mid-save — whose handler also calls save_checkpoint —
+    can't clobber the in-flight tmp of the interrupted call; os.replace is atomic,
+    so the checkpoint is never truncated regardless of which save wins."""
+    d = os.path.dirname(CHECKPOINT_FILE)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".derives_ckpt.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(cp, f, indent=2)
+        os.replace(tmp, CHECKPOINT_FILE)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 # ── Main ──────────────────────────────────────────────────────
 
@@ -396,60 +424,92 @@ def main():
     db = get_db()
     cp = load_checkpoint()
 
-    # Reset processed_entities if this is a NEW run (last_run > 1h ago).
-    # processed_entities is meant for resume-from-crash within a single run
-    # (checkpoint is saved every 50 entities). Without this reset it grew
-    # cumulatively across runs to 34,395 entries on 2026-05-25 and started
-    # silently skipping every entity already touched in any previous run —
-    # producing 0 derived facts despite 16 entities with new source facts.
-    last_run_str = cp.get("last_run", "")
-    if last_run_str:
-        try:
-            from datetime import datetime as _dt
-            age_sec = (_dt.now() - _dt.fromisoformat(last_run_str)).total_seconds()
-            if age_sec > 3600:
-                cp["processed_entities"] = []
-        except (ValueError, TypeError):
-            cp["processed_entities"] = []
-    else:
-        cp["processed_entities"] = []
+    # run_start is captured up-front: last_run advances to THIS value (not now())
+    # on a full drain, so entities created during the run stay > last_run and are
+    # treated as "new" (high priority) next night rather than silently dropped.
+    run_start = datetime.now().isoformat()
+    last_run = cp.get("last_run", "")
+    watermarks = cp.get("derived_watermarks", {})  # mutated in place; persisted by _flush
 
-    # Load entity groups
-    nightly_since = cp.get("last_run", "") if args.nightly else None
     entity_filter = args.entity if args.entity else None
-    
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Loading entity groups...", file=sys.stderr)
-    groups = load_entity_groups(db, min_facts=args.min_facts, entity_filter=entity_filter, nightly_since=nightly_since)
-    
-    # Sort by fact count descending
-    sorted_entities = sorted(groups.items(), key=lambda x: -len(x[1]["facts"]))
-    
-    if args.top:
-        sorted_entities = sorted_entities[:args.top]
-    
-    # Skip already-processed in this run (for resume)
-    already_processed = set(cp.get("processed_entities", []))
-    
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Entities to process: {len(sorted_entities)}", file=sys.stderr)
-    
+    groups = load_entity_groups(db, min_facts=args.min_facts, entity_filter=entity_filter)
+
+    # ── Build the work queue ──────────────────────────────────────
+    if args.nightly:
+        # Durable per-entity cursor: an entity is "due" only if it has facts newer
+        # than the last time we derived it. New facts re-open an entity → no silent
+        # skip (the 2026-05-25 cumulative bug), and a killed run resumes here next
+        # night because the watermarks it wrote survive (invariant 1).
+        due = [(norm, data) for norm, data in groups.items()
+               if data["max_created_at"] > watermarks.get(norm, "")]
+        # Priority to new (invariant 3): facts created after the last full drain
+        # (last_run) go first, newest first; the older arrears follow, ordered by
+        # fact count, draining with whatever step time is left.
+        new_tier = sorted([d for d in due if d[1]["max_created_at"] > last_run],
+                          key=lambda d: d[1]["max_created_at"], reverse=True)
+        backlog_tier = sorted([d for d in due if d[1]["max_created_at"] <= last_run],
+                              key=lambda d: -len(d[1]["facts"]))
+        work = new_tier + backlog_tier
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Queue: {len(new_tier)} new + "
+              f"{len(backlog_tier)} backlog ({len(groups) - len(due)} up-to-date, skipped)",
+              file=sys.stderr)
+    else:
+        # Manual runs (full batch / --top / --entity): process everything matching,
+        # by fact count. No watermark skip and no last_run advance — these are
+        # operator-driven, explicit reprocessing.
+        work = sorted(groups.items(), key=lambda d: -len(d[1]["facts"]))
+        if args.top:
+            work = work[:args.top]
+
+    total_work = len(work)
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Entities to process: {total_work}", file=sys.stderr)
+
     total_derived = 0
     total_processed = 0
     errors = 0
-    
-    for i, (norm, data) in enumerate(sorted_entities):
-        if norm in already_processed:
-            continue
-        
+
+    def _flush(advance_last_run=False):
+        """Persist progress. advance_last_run=True ONLY on a full drain of a
+        completed nightly run — never from the SIGTERM handler (invariant 2).
+        No-op outside nightly mode: manual runs (--top/--entity/full) must stay
+        fully isolated from the automatic cycle and never touch the checkpoint
+        (neither derived_watermarks nor last_run)."""
+        if args.dry_run or not args.nightly:
+            return
+        cp["derived_watermarks"] = watermarks
+        cp["entities_processed"] = total_processed
+        cp["facts_derived"] = total_derived
+        if advance_last_run:
+            cp["last_run"] = run_start
+            cp["last_run_completed"] = True
+        else:
+            cp.setdefault("last_run", last_run)
+            cp["last_run_completed"] = False
+        save_checkpoint(cp)
+
+    def _on_sigterm(signum, frame):
+        # The pipeline kills derivation with SIGTERM on step timeout. Persist the
+        # work done so far (watermarks + counts) WITHOUT advancing last_run, then
+        # emit the summary so the caller reports the real entity count, not 0.
+        _flush(advance_last_run=False)
+        print(json.dumps({"entities_processed": total_processed, "facts_derived": total_derived,
+                          "errors": errors, "killed": True}))
+        sys.stdout.flush()
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
+    for norm, data in work:
         n_facts = len(data["facts"])
         names_str = ", ".join(sorted(data["names"])[:3])
-        print(f"[{i+1}/{len(sorted_entities)}] {names_str} ({n_facts} facts)", file=sys.stderr, end="")
-        
+        print(f"[{total_processed + 1}/{total_work}] {names_str} ({n_facts} facts)", file=sys.stderr, end="")
+
         # Check existing derives
         existing = get_existing_derives(db, norm)
-        
+
         # Derive (manager passed for backend rotation)
         derives = derive_for_entity(norm, data, existing, manager)
-        
+
         if derives and not args.dry_run:
             source_ids = []
             for d in derives:
@@ -463,36 +523,38 @@ def main():
                 print(f"    [{d.get('confidence',0):.1f}] {d['fact']}", file=sys.stderr)
         else:
             print(f" → 0", file=sys.stderr)
-        
+
+        # Durable cursor: mark this entity derived up to its newest source fact.
+        # Done whether or not anything was derived — an attempted entity is
+        # "current" until new source facts arrive (max_created_at moves past this
+        # watermark). Nightly only: manual runs stay isolated (no state writes).
+        if args.nightly and not args.dry_run:
+            watermarks[norm] = data["max_created_at"]
         total_processed += 1
-        
-        # Update checkpoint periodically
-        if total_processed % 50 == 0:
-            cp["entities_processed"] = total_processed
-            cp["facts_derived"] = total_derived
-            cp["processed_entities"].append(norm)
-            save_checkpoint(cp)
-        else:
-            cp["processed_entities"].append(norm)
-        
+
+        # Periodic checkpoint floors the progress a hard SIGKILL can lose. 10 (not
+        # 50) keeps that floor small; the SIGTERM handler flushes the rest, so only
+        # a SIGKILL after a stuck request loses up to 9 completed entities.
+        if total_processed % 10 == 0:
+            _flush(advance_last_run=False)
+
         time.sleep(RATE_LIMIT_DELAY)
-    
-    # Final checkpoint
-    cp["last_run"] = datetime.now().isoformat()
-    cp["entities_processed"] = total_processed
-    cp["facts_derived"] = total_derived
-    save_checkpoint(cp)
-    
+
+    # Reached only on normal completion — the SIGTERM handler exits the process,
+    # so getting here means the whole queue drained. Advance last_run ONLY in
+    # nightly mode (invariant 2 + 4: manual runs never move the boundary).
+    _flush(advance_last_run=args.nightly)
+
     # Summary
     print(f"\n{'='*50}", file=sys.stderr)
     print(f"DERIVATION COMPLETE", file=sys.stderr)
     print(f"  Entities processed: {total_processed}", file=sys.stderr)
     print(f"  Facts derived: {total_derived}", file=sys.stderr)
     print(f"  Errors: {errors}", file=sys.stderr)
-    
+
     # Return stats for pipeline integration
     print(json.dumps({"entities_processed": total_processed, "facts_derived": total_derived, "errors": errors}))
-    
+
     db.close()
 
 if __name__ == "__main__":
