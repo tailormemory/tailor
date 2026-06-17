@@ -564,7 +564,7 @@ log "Fact extraction completed: $FACTS_EXTRACTED facts from $FACTS_CHUNKS chunks
 
 # ── 5f. FACT SUPERSESSION (confronto fact-vs-fact sui nuovi fatti) ──
 log "Starting fact supersession"
-# Timeout 30 min
+# Timeout = pipeline.supersession_max_min (config/tailor.yaml, attuale 90 min)
 "$PYTHON" scripts/enrichment/fact_supersession.py --workers 5 >> "$LOG_FILE" 2>&1 &
 SUP_PID=$!
 SUP_ELAPSED=0
@@ -600,7 +600,7 @@ FACTS_COMPARED=${FACTS_COMPARED:-0}
 log "Fact supersession completed: $FACTS_SUPERSEDED superseded out of $FACTS_COMPARED comparisons"
 # ── 5g. FACT DERIVATION ──
 log "Starting fact derivation (nightly)"
-# Timeout 30 min
+# Timeout = pipeline.derivation_max_min (config/tailor.yaml, attuale 180 min)
 "$PYTHON" scripts/enrichment/derive_facts.py --nightly >> "$LOG_FILE" 2>&1 &
 DER_PID=$!
 DER_ELAPSED=0

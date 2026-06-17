@@ -13,6 +13,21 @@ Template for upcoming changes. Move entries under a new version heading on relea
 ### Added
 ### Changed
 ### Fixed
+
+- **Fact derivation: ripresa incrementale con priorità ai nuovi.** La derivation
+  notturna ripartiva da capo a ogni run (`last_run` non avanzava sui run killati
+  da SIGTERM, resume-list azzerata dopo 1h) -> ri-processava sempre le stesse
+  entità di testa e la coda non veniva mai raggiunta (buco permanente). Ora:
+  (a) cursore durevole per-entità (`derived_watermarks`, calcolato solo sui fatti
+  sorgente escludendo `relation_type='derived'` per evitare l'auto-riapertura);
+  (b) `last_run` avanza solo a coda completamente drenata, mai su SIGTERM/run
+  parziale; (c) priorità ai nuovi (fatti `created_at > last_run` per primi, poi
+  smaltimento backlog col tempo residuo); (d) run manuali isolate dallo stato
+  nightly. Handler SIGTERM salva il progresso prima del kill. `derivation_max_min`
+  portato a 180 (sblocco one-shot del backlog accumulato). Corretto anche il
+  report "0 entities" post-timeout (letto dal checkpoint, non dal tail del log).
+  File: [`scripts/enrichment/derive_facts.py`](scripts/enrichment/derive_facts.py),
+  [`sync_and_ingest.sh`](sync_and_ingest.sh).
 ### Removed
 ### Security
 ### Docs
