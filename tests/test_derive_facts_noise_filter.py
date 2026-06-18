@@ -52,6 +52,13 @@ from scripts.enrichment import derive_facts as df  # noqa: E402
     ("Search bar", "ui_fragment"),
     ("Option 1", "ui_fragment"),
     ("Notifiche Push", "ui_fragment"),
+    # (e) identificatori alfanumerici — codici/ID, mai entità (zero-FP per costruzione)
+    ("GB347567856", "vat_id"),          # VAT UK
+    ("IT10817061004", "vat_id"),        # P.IVA IT
+    ("IE28425", "vat_id"),              # codice cliente country-prefix
+    ("CRLMLN75A09H501P", "tax_code"),   # codice fiscale persona IT
+    ("VTBDNL81D07F839Z", "tax_code"),
+    ("a3f8674c-d4a8-4307-99d8-72f435dab291", "uuid"),
 ])
 def test_noise_is_excluded(raw, expected_rule):
     assert df.classify_noise(df.normalize_entity(raw)) == expected_rule
@@ -81,9 +88,30 @@ def test_noise_is_excluded(raw, expected_rule):
     "3M",   # azienda (norm: "3m", non puramente numerica → non `numeric`)
     "A1",   # brand / sigla
     "GE",   # azienda
+    # nomi reali con cifre che i pattern alfanumerici STRETTI non devono prendere:
+    "plus500",   # azienda FTSE 250 — 4 lettere, non 2 → NON vat_id
+    "wd40",      # brand — 2 lettere ma solo 2 cifre (<4) → NON vat_id
+    "o2",        # telecom — 1 cifra → NON vat_id
+    "sha256",    # token tecnico — 3 lettere → NON vat_id
+    "ean13",     # standard — 3 lettere → NON vat_id
 ])
 def test_real_entities_pass(raw):
     assert df.classify_noise(df.normalize_entity(raw)) is None
+
+
+@pytest.mark.parametrize("raw, rule", [
+    ("GB347567856", "vat_id"),
+    ("CRLMLN75A09H501P", "tax_code"),
+    ("a3f8674c-d4a8-4307-99d8-72f435dab291", "uuid"),
+])
+def test_alnum_id_rules_are_strict(raw, rule):
+    """Le 3 regole alfanumeriche prendono i codici/ID ma restano strette:
+    il bound del VAT (>=4 cifre, esattamente 2 lettere) è ciò che tiene fuori
+    ticker/brand reali (o2/wd40/3m) e aziende-con-numero (plus500)."""
+    assert df.classify_noise(df.normalize_entity(raw)) == rule
+    # controprova: i borderline reali NON cadono in nessuna delle 3 nuove regole
+    for real in ("plus500", "wd40", "o2", "3m", "bp"):
+        assert df.classify_noise(df.normalize_entity(real)) not in {"vat_id", "tax_code", "uuid"}
 
 
 def test_short_rule_removed():

@@ -66,9 +66,10 @@ def normalize_entity(name: str) -> str:
 # ── Zero-FP extraction-junk filter (layer 0) ──────────────────
 # Questo è il LAYER 0 della cura-rumore, NON la soluzione completa. Esclude dalla
 # derivation solo il junk OGGETTIVO da estrazione — chiavi che non sono entità in
-# nessuna interpretazione (numeri puri, sentinelle null, frammenti UI/periodi) —
-# a ZERO falsi positivi. Non tocca la KB: le entità restano intatte, la
-# derivation le ignora. Reversibile.
+# nessuna interpretazione (numeri puri, sentinelle null, frammenti UI/periodi,
+# identificatori alfanumerici: VAT/P.IVA, codice fiscale, UUID) — a ZERO falsi
+# positivi. Non tocca la KB: le entità restano intatte, la derivation le ignora.
+# Reversibile.
 #
 # Cosa NON copre, di proposito: il rumore "semantico" — concetti generici
 # mono-parola (`prezzi`, `court`, ~33% del totale). Quello NON è junk oggettivo
@@ -108,6 +109,21 @@ NOISE_UI_FRAGMENTS = {
     "container layout",  # "layout container"
 }
 
+# Identificatori alfanumerici: codici/ID, NON entità in nessuna interpretazione.
+# Junk OGGETTIVO come `numeric`, solo con lettere mischiate. I pattern sono
+# STRETTI PER COSTRUZIONE → zero falsi positivi: non vanno allargati.
+#   - VAT_ID    : 2 lettere (paese) + >=4 cifre. Il bound >=4 cifre è ciò che
+#                 esclude i ticker/brand reali corti (o2, u2, 3m, wd40 hanno <=2
+#                 cifre → passano). Un'azienda tipo `plus500` ha 4 lettere → non
+#                 matcha (richiede esattamente 2 lettere).
+#   - TAX_CODE  : codice fiscale persona IT, 16 char con struttura fissa
+#                 6L 2D L 2D L 3D L — nessuna entità reale ha questa forma.
+#   - UUID      : UUID canonico 8-4-4-4-12 hex.
+# Match sulla chiave NORMALIZZATA (lowercase, hyphen preservato).
+VAT_ID_RE   = re.compile(r"[a-z]{2}\d{4,}")                                  # ^[a-z]{2}\d{4,}$
+TAX_CODE_RE = re.compile(r"[a-z]{6}\d{2}[a-z]\d{2}[a-z]\d{3}[a-z]")          # codice fiscale IT 16ch
+UUID_RE     = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
 def classify_noise(norm: str):
     """Layer 0 della cura-rumore: classifica `norm` come extraction-junk OGGETTIVO.
 
@@ -120,7 +136,13 @@ def classify_noise(norm: str):
         - `noise_token` : sentinelle/null serializzati come tag (null, n/a, …)
         - `ui_fragment` : frammenti UI noti (lista curata)
         - `temporal`    : periodi "MESE ANNO"
-        Tutte categorie a rischio-zero di falso positivo.
+        - `vat_id`      : P.IVA/VAT (2 lettere paese + >=4 cifre)
+        - `tax_code`    : codice fiscale persona IT (16 char, struttura fissa)
+        - `uuid`        : UUID canonico 8-4-4-4-12 hex
+        Tutte categorie a rischio-zero di falso positivo. Le tre alfanumeriche
+        (vat_id/tax_code/uuid) sono codici/ID: junk oggettivo come `numeric`,
+        solo con lettere mischiate; pattern STRETTI per costruzione (vedi note
+        sulle costanti ..._RE) — non allargarli.
 
     (b) COSA NON filtra, e perché:
         - concetti generici mono-parola (`prezzi`, `court`, ~33% del totale):
@@ -147,6 +169,14 @@ def classify_noise(norm: str):
         # esattamente {anno, mese} in qualunque ordine (normalize ordina i token)
         if len(years) == 1 and len(months) == 1:
             return "temporal"
+    # Identificatori alfanumerici (mutuamente esclusivi tra loro e con le regole
+    # sopra): codici/ID, mai entità. Pattern stretti → zero-FP (vedi ..._RE).
+    if VAT_ID_RE.fullmatch(s):
+        return "vat_id"
+    if TAX_CODE_RE.fullmatch(s):
+        return "tax_code"
+    if UUID_RE.fullmatch(s):
+        return "uuid"
     return None
 
 # ── Database Operations ───────────────────────────────────────
