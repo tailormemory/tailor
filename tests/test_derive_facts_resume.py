@@ -93,10 +93,12 @@ def _run_nightly(monkeypatch):
 # ── 1. killed-mid-run resumes from the right point ────────────
 
 def test_killed_run_resumes_without_reprocessing(patched, monkeypatch):
-    # 6 entities, distinct created_at → deterministic newest-first order E6..E1
-    ents = [(f"E{i}", f"2026-06-10T00:0{i}:00", 5) for i in range(1, 7)]
+    # 6 entities, distinct created_at → deterministic newest-first order Ent6..Ent1
+    # Names chosen to not match any pre-derivation noise rule (not purely numeric,
+    # not a known junk token) — this test exercises resume, not the filter.
+    ents = [(f"Ent{i}", f"2026-06-10T00:0{i}:00", 5) for i in range(1, 7)]
     _build_db(patched["db"], ents)
-    ALL = {f"e{i}" for i in range(1, 7)}
+    ALL = {f"ent{i}" for i in range(1, 7)}
 
     # ── Night 1: kill on the 3rd entity ──
     patched["state"]["kill_at"] = 3
@@ -207,7 +209,7 @@ def test_derived_output_does_not_reopen_entity(patched, monkeypatch):
 def test_manual_run_does_not_persist_watermarks(patched, monkeypatch):
     """--top/--entity/full must not touch the nightly state (derived_watermarks
     or last_run)."""
-    _build_db(patched["db"], [(f"E{i}", f"2026-06-10T00:0{i}:00", 5) for i in range(1, 4)])
+    _build_db(patched["db"], [(f"Ent{i}", f"2026-06-10T00:0{i}:00", 5) for i in range(1, 4)])
 
     # Seed an existing nightly checkpoint
     os.makedirs(os.path.dirname(patched["ckpt"]), exist_ok=True)

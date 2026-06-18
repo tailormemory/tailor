@@ -63,6 +63,92 @@ def normalize_entity(name: str) -> str:
         return " ".join(sorted(parts[:2]))
     return n
 
+# ── Zero-FP extraction-junk filter (layer 0) ──────────────────
+# Questo è il LAYER 0 della cura-rumore, NON la soluzione completa. Esclude dalla
+# derivation solo il junk OGGETTIVO da estrazione — chiavi che non sono entità in
+# nessuna interpretazione (numeri puri, sentinelle null, frammenti UI/periodi) —
+# a ZERO falsi positivi. Non tocca la KB: le entità restano intatte, la
+# derivation le ignora. Reversibile.
+#
+# Cosa NON copre, di proposito: il rumore "semantico" — concetti generici
+# mono-parola (`prezzi`, `court`, ~33% del totale). Quello NON è junk oggettivo
+# (la stessa categoria contiene aziende mono-nome reali: `Google`, `CONAI`), va
+# affrontato con scoring NON-distruttivo (ranking/soglie), che è un filone
+# separato e futuro. Qui la regola è: meglio lasciar passare rumore semantico che
+# scartare un'entità vera con un match troppo largo.
+#
+# NB: NON si filtra per lunghezza (<=2 char). Una regola `short` esisteva ma era
+# un falso zero-FP: catturava sigle/ticker/brand reali (`BP`, `EU`, `3M`, `A1`).
+# Rimossa — le chiavi corte restano derivabili.
+#
+# È un layer ESTENDIBILE, non finale: nuove categorie zero-FP si aggiungono qui;
+# il rumore semantico resta fuori per design.
+# Le chiavi qui sotto sono già NORMALIZZATE (output di normalize_entity).
+
+# Token-rumore tecnici: valori sentinella / null serializzati come tag entità.
+NOISE_TOKENS = {"", "null", "none", "nan", "n/a", "undefined", "true", "false"}
+
+# Mesi (IT + EN, estesi + abbreviati) per riconoscere periodi "MESE ANNO".
+NOISE_MONTHS = {
+    "gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio",
+    "agosto", "settembre", "ottobre", "novembre", "dicembre",
+    "january", "february", "march", "april", "may", "june", "july", "august",
+    "september", "october", "november", "december",
+    "gen", "feb", "mar", "apr", "mag", "giu", "lug", "ago", "set", "ott", "dic",
+    "jan", "jun", "jul", "aug", "sep", "sept", "oct", "dec",
+}
+
+# Frammenti UI/dev noti (forma normalizzata). Curata a mano: lista esplicita
+# = zero falsi positivi, estendibile man mano che ne emergono altri dall'audit.
+NOISE_UI_FRAGMENTS = {
+    "bar search",        # "Search bar"
+    "1 option",          # "Option 1"
+    "notifiche push",    # "Notifiche Push"
+    "date form",         # "date form" / "form date"
+    "container layout",  # "layout container"
+}
+
+def classify_noise(norm: str):
+    """Layer 0 della cura-rumore: classifica `norm` come extraction-junk OGGETTIVO.
+
+    Ritorna il nome della regola che esclude `norm` dalla derivation, o None se
+    l'entità passa (viene tenuta). NON è la cura completa del rumore — è il primo
+    layer, a zero falsi positivi, ed è estendibile (vedi header di sezione).
+
+    (a) COSA filtra — solo junk che non è entità in nessuna interpretazione:
+        - `numeric`     : chiavi puramente numeriche (id, fatture, riferimenti)
+        - `noise_token` : sentinelle/null serializzati come tag (null, n/a, …)
+        - `ui_fragment` : frammenti UI noti (lista curata)
+        - `temporal`    : periodi "MESE ANNO"
+        Tutte categorie a rischio-zero di falso positivo.
+
+    (b) COSA NON filtra, e perché:
+        - concetti generici mono-parola (`prezzi`, `court`, ~33% del totale):
+          NON sono junk oggettivo (la stessa forma include aziende mono-nome
+          reali come `Google`, `CONAI`) → scoring NON-distruttivo, filone separato.
+        - chiavi <=2 char: NON sono zero-FP — catturano sigle/ticker/brand reali
+          (`BP`, `EU`, `3M`, `A1`). La regola `short` è stata RIMOSSA per questo:
+          restano derivabili.
+
+    (c) È un LAYER ESTENDIBILE, non finale: nuove regole zero-FP si aggiungono;
+        il rumore semantico resta deliberatamente fuori da questo layer.
+    """
+    s = norm.strip()
+    if s in NOISE_TOKENS:
+        return "noise_token"
+    if re.fullmatch(r"[\d\s]+", s):
+        return "numeric"
+    if s in NOISE_UI_FRAGMENTS:
+        return "ui_fragment"
+    toks = s.split()
+    if len(toks) == 2:
+        years = [t for t in toks if re.fullmatch(r"(?:19|20)\d{2}", t)]
+        months = [t for t in toks if t in NOISE_MONTHS]
+        # esattamente {anno, mese} in qualunque ordine (normalize ordina i token)
+        if len(years) == 1 and len(months) == 1:
+            return "temporal"
+    return None
+
 # ── Database Operations ───────────────────────────────────────
 
 def get_db():
@@ -434,6 +520,37 @@ def main():
     entity_filter = args.entity if args.entity else None
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Loading entity groups...", file=sys.stderr)
     groups = load_entity_groups(db, min_facts=args.min_facts, entity_filter=entity_filter)
+
+    # ── Zero-FP extraction-junk filter (layer 0) ──────────────────
+    # Skip a MONTE della selezione: il junk oggettivo da estrazione non entra in
+    # `groups`. NON è la cura completa del rumore (il mono-parola generico passa
+    # di proposito — vedi classify_noise); è il layer 0, estendibile. Le escluse
+    # quindi non finiscono mai nel work loop e — punto critico — non ricevono
+    # MAI un watermark (i watermark si scrivono solo dentro il loop, riga ~532).
+    # Conseguenza voluta: se un domani la blocklist si restringe, le entità prima
+    # escluse rientrano da sole in derivation. Non bruciamo lo stato delle
+    # filtrate: il filtro è un gate trasparente, NON un "fatto/processato".
+    # Bypass in modalità --entity: run esplicito dell'operatore, l'entità è
+    # richiesta per nome e va processata anche se matcherebbe una regola.
+    if not entity_filter:
+        excluded = defaultdict(list)
+        kept = {}
+        for norm, data in groups.items():
+            rule = classify_noise(norm)
+            if rule:
+                excluded[rule].append(norm)
+            else:
+                kept[norm] = data
+        n_excl = sum(len(v) for v in excluded.values())
+        breakdown = ", ".join(f"{len(v)} {r}" for r, v in sorted(excluded.items())) or "—"
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Noise filter: "
+              f"{len(kept)} derivabili / {len(groups)} totali, "
+              f"{n_excl} escluse ({breakdown})", file=sys.stderr)
+        # Campione esclusi per audit (max 5 per regola) — un filtro cieco è
+        # inaccettabile: Emiliano deve poter verificare che non scarti roba buona.
+        for rule in sorted(excluded):
+            print(f"    excluded[{rule}] sample: {sorted(excluded[rule])[:5]}", file=sys.stderr)
+        groups = kept
 
     # ── Build the work queue ──────────────────────────────────────
     if args.nightly:
