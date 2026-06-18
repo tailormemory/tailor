@@ -11,6 +11,18 @@ Versioning: [Semantic Versioning](https://semver.org/).
 Template for upcoming changes. Move entries under a new version heading on release.
 
 ### Added
+
+- **Filtro pre-derivation "zero-FP extraction-junk" (layer 0).** Gate in ingresso
+  alla fact derivation che esclude le entità chiaramente non-reali da estrazione:
+  chiavi puramente numeriche, token-junk (`null`/vuote), frammenti UI noti,
+  periodi temporali (`mese anno`). Solo categorie a zero falsi positivi -- esclude
+  ~4.500 entità (13%) su ~35k. NON filtra i concetti generici mono-parola (es.
+  "prezzi", "court"): stessa forma di aziende mono-nome reali (Google, CONAI),
+  richiedono entity-quality scoring non-distruttivo (filone separato). Le entità
+  filtrate restano in KB e NON ricevono watermark -> rientrano in derivation se la
+  blocklist si restringe (reversibile). Bypass in `--entity`. Log di osservabilità
+  con conteggi/categorie/campione. File:
+  [`scripts/enrichment/derive_facts.py`](scripts/enrichment/derive_facts.py).
 ### Changed
 ### Fixed
 
