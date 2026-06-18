@@ -12,6 +12,16 @@ Template for upcoming changes. Move entries under a new version heading on relea
 
 ### Added
 
+- **Layer-0 esteso con regole zero-FP per identificatori alfanumerici.** Aggiunte
+  3 regole a `classify_noise` che escludono dalla derivation codici/ID che oggi
+  passavano: P.IVA/VAT (`^[a-z]{2}\d{4,}$`), codice fiscale persona IT (16 char),
+  UUID canonico. Zero-FP per costruzione: nessuna entità reale ha quelle strutture
+  (verificato che `plus500`, `wd40`, `o2`, `3m`, `bp`, `sha256` passano). Esclude
+  +77 entità (54 vat_id, 16 uuid, 7 tax_code). NON inclusi i prefissi-fattura
+  (allowlist da curare) né i pattern alfanumerici larghi (catturano entità vere
+  tipo plus500/covid-19). Non tocca il rumore semantico mono-parola.
+  File: [`scripts/enrichment/derive_facts.py`](scripts/enrichment/derive_facts.py).
+
 - **Filtro pre-derivation "zero-FP extraction-junk" (layer 0).** Gate in ingresso
   alla fact derivation che esclude le entità chiaramente non-reali da estrazione:
   chiavi puramente numeriche, token-junk (`null`/vuote), frammenti UI noti,
