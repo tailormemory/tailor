@@ -6,15 +6,38 @@ Polls `embeddings_queue` depth on a 30-min schedule (LaunchDaemon
 `com.tailor.queue-depth-monitor`). Read-only SQLite, no chromadb client
 instantiated — zero risk of racing the live MCP process.
 
-Alert ladder:
-- WARNING  : queue_total >= 600   (above observed regime ceiling ~510)
-- CRITICAL : queue_total >= 850   (15% margin under chromadb sync_threshold 1000)
-- STUCK    : oldest_iso unchanged AND queue_total non-decreasing for >=12h
-             (consumer freeze signature — observed 12/05–23/05 freeze @ 597)
+Due segnali DISTINTI, allineati alla remediation reale (sdoppiamento 21/06,
+prima un singolo STUCK su queue_total+età-oldest generava falsi positivi non
+azionabili — il gate auto-flush decide su collection_queue_pending_count dal
+12/06, commit 6be02c4, e il monitor era rimasto indietro):
+
+- STUCK azionabile  (PAGE, CTA repair_hnsw_index.py)
+    collection_queue_pending_count >= flush-watermark (la STESSA soglia del gate,
+    auto_flush_queue.queue_min()) in modo continuo da >=STUCK_WINDOW_HOURS (48h).
+    Legge la STESSA metrica del gate dalla cache che il gate persiste a ogni run
+    (auto_flush_queue.write_audit_cache: ts + collection_pending + queue_total), NON
+    più COUNT(*) sul WAL globale e SENZA rieffettuare l'audit ogni 30 min (cache
+    fresca entro la cadenza del gate; staleness > CACHE_MAX_AGE_HOURS → non
+    valutabile, degrado safe). Se l'auto-flush skippa legittimamente
+    (collection_pending < min) STUCK NON parte → niente CTA no-op. È l'unico
+    segnale page-worthy con il bottone repair.
+
+- WAL global aging  (osservabilità, severità WARNING/CRITICAL, NESSUN CTA repair)
+    queue_total globale >= WARNING_THRESHOLD (severità CRITICAL >= CRITICAL_THRESHOLD)
+    E non-decrescente nella finestra WAL_AGING_WINDOW_HOURS, E nessuna collection
+    sopra watermark. Triggerato su profondità+crescita, NON sull'età statica
+    dell'oldest. Messaggio "WAL globale non drena, nessuna collection sopra
+    watermark — indaga sync_threshold/burst", senza repair_hnsw_index.py: tiene
+    osservabile il rischio chromadb-backlog (#6975, 200+ chunk = zona rischio)
+    senza spacciarlo per stuck azionabile.
+
+I due segnali sono mutuamente esclusivi per costruzione (STUCK ⟹ collection sopra
+watermark; WAL aging richiede NESSUNA collection sopra watermark): al più uno
+scatta per run. Snooze 6h INDIPENDENTE per segnale (chiavi "stuck" /
+"wal_aging:<level>"): un WAL-aging rumoroso non silenzia una STUCK page e vv.
 
 Snapshots written append-only to `logs/queue_depth/snapshots.jsonl`,
-pruned to last 8 days. Alert state in `alert_state.json`; 6h snooze
-between consecutive alerts.
+pruned to last 8 days. Alert state per chiave in `alert_state.json`.
 
 Drift monitor (Path A azione 3): per ogni collection confronta
 max_seq_id VECTOR vs METADATA. Rileva drift e VECTOR-stuck PRIMA che la
@@ -39,7 +62,12 @@ from datetime import datetime, timedelta
 import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # per import auto_flush_queue
 from env_loader import load_env  # noqa: E402
+# Stessa fonte del gate auto-flush: la soglia (queue_min) e la cache dell'audit
+# per-collection che il gate persiste a ogni run (collection_queue_pending_count).
+# Il monitor NON rieffettua l'audit: legge la cache (vedi read_collection_pending).
+from auto_flush_queue import queue_min as flush_watermark, AUDIT_CACHE_PATH as GATE_AUDIT_CACHE_PATH  # noqa: E402
 
 load_env()
 
@@ -51,12 +79,21 @@ LOG_PATH = os.path.join(SNAP_DIR, "monitor.log")
 STATE_PATH = os.path.join(SNAP_DIR, "alert_state.json")
 MAINTENANCE_LOCK = os.path.join(BASE_DIR, "maintenance.lock")
 
+# Soglie del SEGNALE WAL-aging (osservabilità globale): profondità del WAL totale.
+# Dopo lo sdoppiamento NON governano più STUCK (che dipende da collection-pending +
+# tempo, non da queue_total). Severità WARNING/CRITICAL del solo WAL-aging.
 WARNING_THRESHOLD = 1200
 CRITICAL_THRESHOLD = 1800
 SYNC_THRESHOLD = 1000  # chromadb default
-STUCK_WINDOW_HOURS = 48
+STUCK_WINDOW_HOURS = 48     # persistenza collection-pending >= watermark per la STUCK page
+WAL_AGING_WINDOW_HOURS = 6  # finestra "non-decrescente" del WAL-aging (≈ cadenza auto-flush)
 SNOOZE_HOURS = 6
 KEEP_DAYS = 8
+# Staleness max della cache audit del gate prima di considerare collection_pending
+# "non disponibile". Il gate gira 08/14/20 → gap massimo 12h (notturno 20→08); 13h
+# assorbe quel gap + slack per un cron in ritardo. Oltre soglia = gate probabilmente
+# fermo → STUCK non valutabile (degrado safe). Irrilevante vs finestra STUCK 48h.
+CACHE_MAX_AGE_HOURS = 13
 
 DRIFT_SNAP_PATH = os.path.join(SNAP_DIR, "drift_snapshots.jsonl")
 DRIFT_STATE_PATH = os.path.join(SNAP_DIR, "drift_alert_state.json")
@@ -103,38 +140,140 @@ def classify_level(queue_total: int) -> str:
     return "NORMAL"
 
 
-def is_stuck(current: dict, history: list[dict], window_hours: int) -> bool:
-    """Stuck = oldest unchanged AND queue_total non-decreasing for >=window_hours.
+def read_collection_pending(args: argparse.Namespace) -> int | None:
+    """collection_queue_pending_count dalla CACHE dell'audit del gate auto-flush.
 
-    Requires at least one historical snapshot whose own ts is <= now-window.
-    A queue with no oldest (None) or count=0 is never stuck.
+    Il gate (auto_flush_queue) persiste l'esito del proprio audit a ogni run
+    (08/14/20, vedi auto_flush_queue.write_audit_cache); il monitor — che gira ogni
+    30 min — NON rieffettua l'audit (eviterebbe un subprocess inutile 48×/giorno):
+    legge questa cache. La finestra STUCK è 48h, una staleness di poche ore è
+    irrilevante. Stessa soglia/metrica del gate → STUCK resta allineato al gate.
+
+    Ritorna None (→ STUCK non valutabile, status quo safe, niente CTA no-op) se la
+    cache è: assente, illeggibile/malformata, priva di ts valido, stale oltre
+    CACHE_MAX_AGE_HOURS (gate probabilmente fermo), o senza collection-pending valido.
+
+    Override test: --collection-pending N forza il valore (salta la cache);
+    --skip-audit ritorna None senza leggere la cache; --audit-cache-path override.
     """
-    if not current.get("oldest") or current.get("queue_total", 0) == 0:
-        return False
-    if not history:
-        return False
+    if getattr(args, "collection_pending", None) is not None:
+        return args.collection_pending
+    if getattr(args, "skip_audit", False):
+        return None
+    path = getattr(args, "audit_cache_path", None) or GATE_AUDIT_CACHE_PATH
     try:
-        now_t = datetime.strptime(current["ts"], TS_FMT)
+        with open(path) as f:
+            cache = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        log("WARN", f"cache audit gate assente/illeggibile ({path}) → STUCK non valutabile")
+        return None
+    if not isinstance(cache, dict):
+        log("WARN", "cache audit gate malformata (non-dict) → STUCK non valutabile")
+        return None
+    try:
+        age = datetime.now().timestamp() - float(cache.get("ts_unix"))
+    except (TypeError, ValueError):
+        log("WARN", "cache audit gate senza ts_unix valido → STUCK non valutabile")
+        return None
+    if age > CACHE_MAX_AGE_HOURS * 3600:
+        log("WARN", f"cache audit gate stale ({age / 3600:.1f}h > {CACHE_MAX_AGE_HOURS}h) "
+                    "→ gate fermo? STUCK non valutabile")
+        return None
+    raw = cache.get("collection_queue_pending_count")
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        log("WARN", f"cache collection_queue_pending_count assente/non-int ({raw!r}) "
+                    "→ STUCK non valutabile")
+        return None
+    return v if v >= 0 else None
+
+
+def _ref_before_cutoff(history: list[dict], now_ts: str, window_hours: int) -> dict | None:
+    """Snapshot più recente con ts <= now-window_hours, altrimenti None.
+
+    L'ancora per le condizioni temporali "da >=window" (persistenza / non-decrescita):
+    senza uno snapshot abbastanza vecchio non si può asserire la durata → None.
+    """
+    try:
+        now_t = datetime.strptime(now_ts, TS_FMT)
     except (ValueError, KeyError):
-        return False
+        return None
     cutoff = now_t - timedelta(hours=window_hours)
-    older_or_equal = []
+    cands = []
     for s in history:
         try:
             t = datetime.strptime(s["ts"], TS_FMT)
         except (ValueError, KeyError):
             continue
         if t <= cutoff:
-            older_or_equal.append((t, s))
-    if not older_or_equal:
+            cands.append((t, s))
+    if not cands:
+        return None
+    cands.sort(key=lambda x: x[0])
+    return cands[-1][1]
+
+
+def is_actionable_stuck(collection_pending: int | None, watermark: int,
+                        history: list[dict], now_ts: str, window_hours: int) -> bool:
+    """STUCK azionabile = la collection è sopra il flush-watermark e NON drena da >=window.
+
+    Allineato 1:1 al gate auto-flush: la metrica decisionale è
+    collection_queue_pending_count (`collection_pending` negli snapshot), NON
+    queue_total globale. Scatta SOLO se:
+      1. collection_pending corrente >= watermark, E
+      2. esiste uno snapshot-ancora con collection_pending presente e ts <= now-window
+         il cui collection_pending era già >= watermark (backlog azionabile già da >=48h), E
+      3. nessuno snapshot DENTRO la finestra [now-window, now] è sceso sotto watermark
+         (mai drenato → l'auto-flush non ha rimediato per >=48h).
+
+    Se collection_pending è assente (tool/audit legacy o audit fallito) → None →
+    STUCK NON scatta (status quo safe, niente CTA no-op). Gli snapshot privi di
+    collection_pending vengono ignorati nel calcolo (storia pre-sdoppiamento):
+    STUCK attende 48h di storia nuova prima di poter scattare — niente FP.
+    """
+    if collection_pending is None or collection_pending < watermark:
         return False
-    older_or_equal.sort(key=lambda x: x[0])
-    _, ref = older_or_equal[-1]  # most recent snapshot still <= cutoff
-    if ref.get("oldest") != current["oldest"]:
+    try:
+        now_t = datetime.strptime(now_ts, TS_FMT)
+    except (ValueError, KeyError):
         return False
-    if current["queue_total"] < ref.get("queue_total", 0):
+    cutoff = now_t - timedelta(hours=window_hours)
+    anchor: tuple[datetime, int] | None = None   # più recente con t <= cutoff
+    in_window_ok = True                           # nessun calo sotto watermark in finestra
+    for s in history:
+        cp = s.get("collection_pending")
+        if cp is None:
+            continue
+        try:
+            t = datetime.strptime(s["ts"], TS_FMT)
+        except (ValueError, KeyError):
+            continue
+        if t <= cutoff:
+            if anchor is None or t > anchor[0]:
+                anchor = (t, cp)
+        else:  # dentro la finestra
+            if cp < watermark:
+                in_window_ok = False
+    if anchor is None or anchor[1] < watermark:
         return False
-    return True
+    return in_window_ok
+
+
+def is_wal_aging(queue_total: int, history: list[dict], now_ts: str,
+                 window_hours: int) -> bool:
+    """WAL global aging = WAL totale alto E non-decrescente nella finestra.
+
+    Profondità + crescita, NON età-oldest statica: un WAL alto ma in calo
+    (l'indexer sta drenando) NON allerta. Richiede uno snapshot-ancora a >=window:
+    senza storia sufficiente non si asserisce "non drena" → False.
+    """
+    if queue_total < WARNING_THRESHOLD:
+        return False
+    ref = _ref_before_cutoff(history, now_ts, window_hours)
+    if ref is None:
+        return False
+    return queue_total >= int(ref.get("queue_total", 0) or 0)
 
 
 def load_history() -> list[dict]:
@@ -201,17 +340,6 @@ def write_alert_state(state: dict) -> None:
     os.replace(tmp, STATE_PATH)
 
 
-def within_snooze(last: dict, hours: int) -> bool:
-    last_ts = last.get("last_alert_ts")
-    if not last_ts:
-        return False
-    try:
-        t = datetime.strptime(last_ts, TS_FMT)
-    except ValueError:
-        return False
-    return (datetime.now() - t) < timedelta(hours=hours)
-
-
 def _oldest_age_hours(oldest: str | None, now_ts: str) -> float | None:
     if not oldest:
         return None
@@ -223,30 +351,40 @@ def _oldest_age_hours(oldest: str | None, now_ts: str) -> float | None:
     return (n - o).total_seconds() / 3600
 
 
-def format_alert(snap: dict, level: str, stuck: bool) -> str:
-    if level != "NORMAL" and stuck:
-        flag = f"{level} + STUCK"
-    elif level != "NORMAL":
-        flag = level
-    elif stuck:
-        flag = "STUCK"
-    else:
-        flag = "INFO"
-    lines = [f"🚨 *TAILOR queue alert — {flag}*"]
-    lines.append(f"Queue depth: `{snap['queue_total']}`")
-    if level == "CRITICAL":
-        lines.append(f"Critical threshold: {CRITICAL_THRESHOLD} (sync_threshold {SYNC_THRESHOLD})")
-    elif level == "WARNING":
-        lines.append(f"Warning threshold: {WARNING_THRESHOLD}")
+def format_stuck_alert(snap: dict, watermark: int, window_hours: int) -> str:
+    """STUCK azionabile — PAGE con CTA repair. Backlog per-collection sopra
+    watermark che non drena da >=window: l'auto-flush non ha rimediato."""
+    lines = [f"🚨 *TAILOR queue alert — STUCK azionabile*"]
+    lines.append(f"Collection pending: `{snap.get('collection_pending')}` (watermark {watermark})")
+    lines.append(f"Queue depth (globale): `{snap['queue_total']}`")
     age = _oldest_age_hours(snap.get("oldest"), snap["ts"])
     if snap.get("oldest"):
         if age is not None:
             lines.append(f"Oldest pending: `{snap['oldest']}` ({age:.1f}h fa)")
         else:
             lines.append(f"Oldest pending: `{snap['oldest']}`")
-    if stuck:
-        lines.append(f"Stuck: oldest non avanza da ≥{STUCK_WINDOW_HOURS}h e depth non scende")
-        lines.append("Run: `python scripts/maintenance/repair_hnsw_index.py`")
+    lines.append(f"Stuck: collection_pending >= watermark e non drena da ≥{window_hours}h "
+                 "(auto-flush non ha rimediato).")
+    lines.append("Run: `python scripts/maintenance/repair_hnsw_index.py`")
+    return "\n".join(lines)
+
+
+def format_wal_aging_alert(snap: dict, level: str, window_hours: int) -> str:
+    """WAL global aging — osservabilità, NESSUN CTA repair. WAL totale alto e
+    non-decrescente, ma nessuna collection sopra watermark (non auto-remediabile
+    via flush per-collection)."""
+    emoji = "🚨" if level == "CRITICAL" else "⚠️"
+    lines = [f"{emoji} *TAILOR WAL aging — {level}*"]
+    lines.append(f"Queue depth (globale): `{snap['queue_total']}`")
+    if level == "CRITICAL":
+        lines.append(f"Critical threshold: {CRITICAL_THRESHOLD} (sync_threshold {SYNC_THRESHOLD})")
+    else:
+        lines.append(f"Warning threshold: {WARNING_THRESHOLD}")
+    cp = snap.get("collection_pending")
+    lines.append(f"Collection pending: `{cp}` (sotto watermark / n/d)")
+    lines.append(f"WAL globale non drena (non-decrescente da ≥{window_hours}h) e nessuna "
+                 "collection sopra watermark — indaga `sync_threshold` / burst di ingest.")
+    lines.append("Nessuna azione repair: non è un backlog #6975 azionabile per collection.")
     return "\n".join(lines)
 
 
@@ -473,44 +611,80 @@ def format_drift_alert(snap: dict, label: str, oldest_age: float | None,
     return "\n".join(lines)
 
 
+def _emit_queue_signal(args: argparse.Namespace, state: dict, key: str,
+                       kind: str, msg: str, summary: str) -> tuple[bool, bool]:
+    """Invia (o dry-run) un segnale queue con snooze per-chiave.
+
+    Ritorna (attempted, send_ok): attempted=False se snoozato/dry-run.
+    Aggiorna `state[key]` in place su invio riuscito.
+    """
+    snoozed = within_snooze_key(state, key, SNOOZE_HOURS) and not args.ignore_snooze
+    if snoozed:
+        log("SNOOZED", f"{kind} {summary}")
+        print(f"SNOOZED {kind} {summary}")
+        return False, False
+    if args.dry_run:
+        log("DRY_RUN", f"{kind} {summary}")
+        print(f"DRY-RUN would alert ({kind}) {summary}:\n{msg}")
+        return False, False
+    ok = send_telegram(msg)
+    if ok:
+        state[key] = {"last_alert_ts": datetime.now().strftime(TS_FMT), "kind": kind}
+    log("ALERT", f"{kind} {summary} sent={ok}")
+    print(f"ALERT {kind} {summary} sent={ok}")
+    return True, ok
+
+
 def handle_queue(args: argparse.Namespace) -> tuple[int, dict | None]:
     snap = read_queue_snapshot()
     if snap is None:
         return 1, None
     history = load_history()
+    watermark = args.flush_watermark if args.flush_watermark is not None else flush_watermark()
+    collection_pending = read_collection_pending(args)
+
     level = classify_level(snap["queue_total"])
-    stuck = is_stuck(snap, history, STUCK_WINDOW_HOURS)
+    # SEGNALE 1 — STUCK azionabile: collection-pending >= watermark sostenuto >=48h.
+    stuck = is_actionable_stuck(collection_pending, watermark, history,
+                                snap["ts"], STUCK_WINDOW_HOURS)
+    # SEGNALE 2 — WAL aging: queue_total alto+crescente E nessuna collection sopra
+    # watermark (mutuamente esclusivo con STUCK per costruzione).
+    no_actionable = collection_pending is None or collection_pending < watermark
+    aging = no_actionable and is_wal_aging(snap["queue_total"], history,
+                                           snap["ts"], WAL_AGING_WINDOW_HOURS)
+
+    snap["collection_pending"] = collection_pending
+    snap["watermark"] = watermark
     snap["level"] = level
     snap["stuck"] = stuck
+    snap["wal_aging"] = aging
     append_snapshot(snap)
     prune_history(KEEP_DAYS)
-    last_alert = read_alert_state()
-    should_alert = (level != "NORMAL") or stuck
-    snoozed = within_snooze(last_alert, SNOOZE_HOURS) and not args.ignore_snooze
-    if should_alert and not snoozed:
-        if args.dry_run:
-            preview = format_alert(snap, level, stuck)
-            log("DRY_RUN", f"level={level} stuck={stuck} queue={snap['queue_total']}")
-            print(f"DRY-RUN would alert ({level}, stuck={stuck}):\n{preview}")
-            return 0, snap
-        ok = send_telegram(format_alert(snap, level, stuck))
-        if ok:
-            write_alert_state({
-                "last_alert_ts": snap["ts"],
-                "last_level": level,
-                "last_stuck": stuck,
-                "last_queue_total": snap["queue_total"],
-            })
-        log("ALERT", f"level={level} stuck={stuck} queue={snap['queue_total']} sent={ok}")
-        print(f"ALERT level={level} stuck={stuck} queue={snap['queue_total']} sent={ok}")
-        return (0 if ok else 1), snap
-    if should_alert and snoozed:
-        log("SNOOZED", f"level={level} stuck={stuck} queue={snap['queue_total']}")
-        print(f"SNOOZED level={level} stuck={stuck} queue={snap['queue_total']}")
+
+    summary = (f"queue={snap['queue_total']} collection_pending={collection_pending} "
+               f"watermark={watermark} level={level} stuck={stuck} aging={aging}")
+    state = read_alert_state()
+    rc = 0
+
+    if stuck:
+        msg = format_stuck_alert(snap, watermark, STUCK_WINDOW_HOURS)
+        attempted, ok = _emit_queue_signal(args, state, "stuck", "STUCK", msg, summary)
+        if attempted and not ok:
+            rc = 1
+    elif aging:
+        msg = format_wal_aging_alert(snap, level, WAL_AGING_WINDOW_HOURS)
+        attempted, ok = _emit_queue_signal(args, state, f"wal_aging:{level}",
+                                           "WAL_AGING", msg, summary)
+        if attempted and not ok:
+            rc = 1
+    else:
+        log("OK", summary)
+        print(f"OK {summary}")
         return 0, snap
-    log("OK", f"queue={snap['queue_total']} level=NORMAL stuck=False")
-    print(f"OK queue={snap['queue_total']} level=NORMAL")
-    return 0, snap
+
+    if not args.dry_run:
+        write_alert_state(state)
+    return rc, snap
 
 
 def handle_drift(args: argparse.Namespace, queue_snap: dict | None) -> int:
@@ -608,15 +782,23 @@ def main() -> int:
     parser.add_argument("--drift-state-path", help="Override drift_alert_state.json path (tests).")
     parser.add_argument("--skip-queue", action="store_true", help="Skip queue evaluation (tests).")
     parser.add_argument("--skip-drift", action="store_true", help="Skip drift evaluation.")
+    parser.add_argument("--collection-pending", type=int, default=None,
+                        help="Forza collection_queue_pending_count, salta la cache (tests).")
+    parser.add_argument("--skip-audit", action="store_true",
+                        help="Non leggere la cache audit del gate (collection_pending=None) (tests).")
+    parser.add_argument("--audit-cache-path",
+                        help="Override del path cache audit del gate (default: auto_flush_queue.AUDIT_CACHE_PATH) (tests).")
+    parser.add_argument("--flush-watermark", type=int, default=None,
+                        help="Override del flush-watermark (default: auto_flush_queue.queue_min()) (tests).")
     args = parser.parse_args()
     _override_paths(args)
 
     if args.force_alert:
         msg = (
             "⚠️ TEST FORCED ALERT — ignore content\n\n"
-            "🚨 *TAILOR queue alert — TEST*\n"
-            "Queue depth: `9999` (forced)\n"
-            f"Critical threshold: {CRITICAL_THRESHOLD} (sync_threshold {SYNC_THRESHOLD})\n"
+            "🚨 *TAILOR queue alert — STUCK azionabile (TEST)*\n"
+            "Collection pending: `9999` (watermark forced)\n"
+            "Queue depth (globale): `9999` (forced)\n"
             "Oldest pending: `forced`\n"
             f"Stuck: forced (>={STUCK_WINDOW_HOURS}h simulato)\n"
             "Run: `python scripts/maintenance/repair_hnsw_index.py`"

@@ -759,5 +759,38 @@ def test_run_procedure_rc5_still_generic_fail(monkeypatch, tmp_path):
     assert not any("ESCALATION" in m for m in calls["telegram"])
 
 
+# ─────────────────────────── write_audit_cache ───────────────────────────
+# La cache è consumata da queue_depth_monitor per il segnale STUCK senza re-audit.
+
+def test_write_audit_cache_persists_fields(tmp_path):
+    path = tmp_path / "gate_audit_cache.json"
+    audit = {"collection_queue_pending_count": 420, "queue_total": 1300, "extra": "ignored"}
+    assert afq.write_audit_cache(audit, path=str(path)) is True
+    data = json.loads(path.read_text())
+    assert data["collection_queue_pending_count"] == 420
+    assert data["queue_total"] == 1300
+    assert isinstance(data["ts_unix"], int)
+    assert data["ts_unix"] <= int(time.time())
+    assert "ts" in data
+    assert "extra" not in data  # solo i campi che servono al monitor
+
+
+def test_write_audit_cache_missing_keys_become_null(tmp_path):
+    path = tmp_path / "c.json"
+    assert afq.write_audit_cache({}, path=str(path)) is True
+    data = json.loads(path.read_text())
+    assert data["collection_queue_pending_count"] is None
+    assert data["queue_total"] is None
+
+
+def test_write_audit_cache_atomic_overwrite(tmp_path):
+    path = tmp_path / "c.json"
+    afq.write_audit_cache({"collection_queue_pending_count": 1, "queue_total": 1}, path=str(path))
+    afq.write_audit_cache({"collection_queue_pending_count": 2, "queue_total": 2}, path=str(path))
+    data = json.loads(path.read_text())
+    assert data["collection_queue_pending_count"] == 2
+    assert not (tmp_path / "c.json.tmp").exists()  # tmp rimosso da os.replace
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

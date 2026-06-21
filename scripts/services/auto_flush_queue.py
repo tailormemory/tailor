@@ -67,6 +67,11 @@ LOG_PATH = os.path.join(BASE_DIR, "logs", "auto_flush.log")
 MAINTENANCE_LOCK = os.path.join(BASE_DIR, "maintenance.lock")
 RUN_LOCK = "/tmp/tailor_auto_flush.flock"
 
+# Cache dell'esito audit del gate, consumata da queue_depth_monitor per il segnale
+# STUCK senza rieffettuare l'audit a ogni run (vedi write_audit_cache). Persistita a
+# ogni run del gate (08/14/20), quindi sempre fresca entro la cadenza del gate.
+AUDIT_CACHE_PATH = os.path.join(BASE_DIR, "logs", "gate_audit_cache.json")
+
 # Restart MCP — deve combaciare ESATTAMENTE col grant in /etc/sudoers.d/jarvis-mcp:
 #   jarvis ALL=(root) NOPASSWD: /bin/launchctl unload <plist>, /bin/launchctl load <plist>
 LAUNCHCTL = "/bin/launchctl"
@@ -190,6 +195,35 @@ def run_audit() -> dict | None:
         log("ERROR", f"audit: nessun JSON in stdout (rc={proc.returncode}) stderr={proc.stderr[:200]}")
         return None
     return objs[0]
+
+
+def write_audit_cache(audit: dict, path: str | None = None) -> bool:
+    """Persiste l'esito dell'audit del gate per queue_depth_monitor.
+
+    Il monitor (ogni 30 min) NON rieffettua l'audit: legge questa cache. Il gate
+    gira 08/14/20 e produce SEMPRE un audit (anche su skip/escalate/dry-run), quindi
+    la cache è fresca entro la cadenza del gate. Salva solo i campi che servono al
+    monitor (ts + collection_queue_pending_count + queue_total globale). Scrittura
+    atomica (tmp+replace). Best-effort: un fallimento qui NON deve abortire il gate.
+    """
+    if path is None:
+        path = AUDIT_CACHE_PATH
+    try:
+        payload = {
+            "ts": datetime.now().strftime(TS_FMT),
+            "ts_unix": int(time.time()),
+            "collection_queue_pending_count": audit.get("collection_queue_pending_count"),
+            "queue_total": audit.get("queue_total"),
+        }
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp, path)
+        return True
+    except Exception as e:
+        log("WARN", f"write_audit_cache fallito: {type(e).__name__}: {e}")
+        return False
 
 
 def run_backup() -> bool:
@@ -817,6 +851,9 @@ def main() -> int:
     if audit is None:
         log("ERROR", "audit fallito — abort (nessuna azione)")
         return 1
+
+    # Persiste l'esito audit per queue_depth_monitor (segnale STUCK senza re-audit).
+    write_audit_cache(audit)
 
     qmin = queue_min()
     action, reason = evaluate_gate(audit, qmin)

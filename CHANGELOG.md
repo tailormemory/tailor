@@ -34,6 +34,36 @@ Template for upcoming changes. Move entries under a new version heading on relea
   con conteggi/categorie/campione. File:
   [`scripts/enrichment/derive_facts.py`](scripts/enrichment/derive_facts.py).
 ### Changed
+
+- **Queue alert sdoppiato in due segnali distinti** (`queue_depth_monitor.py`).
+  Il monitor decideva STUCK su `queue_total` globale + età-oldest, mentre il gate
+  auto-flush decide su `collection_queue_pending_count` (dal 12/06, commit
+  `6be02c4`): disallineamento che generava STUCK falsi positivi con CTA
+  `repair_hnsw_index.py` no-op. Ora due fenomeni separati:
+  - **STUCK azionabile** (PAGE, mantiene CTA repair): scatta solo se
+    `collection_queue_pending_count >= flush-watermark` (la STESSA soglia del
+    gate, `auto_flush_queue.queue_min()`) in modo continuo da ≥48h. Il monitor
+    legge la STESSA metrica del gate dalla cache che il gate persiste a ogni run
+    (`auto_flush_queue.write_audit_cache` → `logs/gate_audit_cache.json`: ts +
+    collection_pending + queue_total), non più `COUNT(*)` sul WAL globale e SENZA
+    rieffettuare l'audit ogni 30 min. Staleness accettata `CACHE_MAX_AGE_HOURS=13`
+    (copre il gap notturno 20→08 del gate); oltre soglia / cache assente / malformata
+    → STUCK non valutabile (degrado safe, niente CTA no-op). Se l'auto-flush skippa
+    legittimamente (collection sotto soglia), STUCK NON parte.
+  - **WAL global aging** (osservabilità, severità WARNING/CRITICAL, NESSUN CTA
+    repair): `queue_total >= WARNING_THRESHOLD` E non-decrescente nella finestra
+    (`WAL_AGING_WINDOW_HOURS=6`), E nessuna collection sopra watermark. Triggerato
+    su profondità+crescita, non sull'età statica dell'oldest. Messaggio "indaga
+    sync_threshold/burst" senza bottone repair: tiene osservabile il rischio
+    chromadb-backlog (#6975) senza spacciarlo per stuck azionabile.
+
+  Le soglie 1200/1800 governano ora il solo WAL-aging (severità); STUCK è
+  disaccoppiato (collection-pending + tempo). Snooze 6h indipendente per segnale
+  (chiavi `stuck` / `wal_aging:<level>`). Il monitor è un job a sé
+  (`com.tailor.queue-depth-monitor`): nessun restart MCP. Test:
+  [`tests/test_queue_alert_split.py`](tests/test_queue_alert_split.py).
+  File: [`scripts/services/queue_depth_monitor.py`](scripts/services/queue_depth_monitor.py).
+
 ### Fixed
 
 - **Fact derivation: ripresa incrementale con priorità ai nuovi.** La derivation
