@@ -792,5 +792,49 @@ def test_write_audit_cache_atomic_overwrite(tmp_path):
     assert not (tmp_path / "c.json.tmp").exists()  # tmp rimosso da os.replace
 
 
+def test_write_audit_cache_preflush_fields(tmp_path):
+    """Senza flush (chiamata pre-flush di main): vector_seq/drift dall'audit,
+    flush_ran=False, flush_resolved=None, collection_name propagato."""
+    path = tmp_path / "c.json"
+    audit = {"collection_queue_pending_count": 5, "queue_total": 900,
+             "collection_name": "tailor_kb_v2", "vector_seq": 333672, "drift": 836}
+    afq.write_audit_cache(audit, path=str(path))
+    d = json.loads(path.read_text())
+    assert d["collection_name"] == "tailor_kb_v2"
+    assert d["vector_seq"] == 333672 and d["drift"] == 836
+    assert d["flush_ran"] is False
+    assert d["flush_resolved"] is None
+
+
+def test_write_audit_cache_postflush_resolved(tmp_path):
+    """Con flush risolto (success=True): stato POST, flush_ran=True, flush_resolved=True."""
+    path = tmp_path / "c.json"
+    audit = {"collection_name": "tailor_kb_v2", "vector_seq": 333672, "drift": 1100,
+             "collection_queue_pending_count": 400, "queue_total": 900}
+    flush = {"post": {"vector_seq": 334772, "drift": 0}, "success": True,
+             "post_collection_queue_pending_count": 0, "post_queue_total": 0}
+    afq.write_audit_cache(audit, flush=flush, path=str(path))
+    d = json.loads(path.read_text())
+    assert d["flush_ran"] is True
+    assert d["flush_resolved"] is True
+    assert d["vector_seq"] == 334772 and d["drift"] == 0  # POST-flush
+    assert d["collection_queue_pending_count"] == 0
+
+
+def test_write_audit_cache_postflush_unresolved_6975(tmp_path):
+    """Flush girato ma NON risolto (success=False, drift non sceso): flush_ran=True,
+    flush_resolved=False — la firma #6975 che il monitor usa per confermare STUCK_VECTOR."""
+    path = tmp_path / "c.json"
+    audit = {"collection_name": "tailor_kb_v2", "vector_seq": 333672, "drift": 1100,
+             "collection_queue_pending_count": 400, "queue_total": 900}
+    flush = {"post": {"vector_seq": 333672, "drift": 1100}, "success": False,
+             "post_collection_queue_pending_count": 400, "post_queue_total": 900}
+    afq.write_audit_cache(audit, flush=flush, path=str(path))
+    d = json.loads(path.read_text())
+    assert d["flush_ran"] is True
+    assert d["flush_resolved"] is False
+    assert d["vector_seq"] == 333672 and d["drift"] == 1100  # non avanzato
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

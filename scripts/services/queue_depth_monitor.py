@@ -45,7 +45,14 @@ queue cresca oltre WARNING. Snapshot append-only in `drift_snapshots.jsonl`,
 alert state per (collection, level) in `drift_alert_state.json`.
 - WARNING      : drift > 800   (lazy compaction normale fino a sync_threshold=1000)
 - CRITICAL     : drift > 1500  (oltre sync_threshold → problema reale)
-- STUCK_VECTOR : vector_seq invariato e meta_seq avanzato tra 2 letture
+- STUCK_VECTOR : A+C (allineato al gate, sdoppiamento 22/06). Base = vector_seq
+                 invariato e meta_seq avanzato tra 2 letture. A = drift >=
+                 SYNC_THRESHOLD (sotto soglia è lazy compaction, non stuck — era il FP).
+                 C = l'ultimo flush del gate NON ha risolto (flush_resolved=False dalla
+                 cache audit) e il vector non è avanzato → consumer davvero bloccato
+                 (#6975), CTA repair. Se C non valutabile (cache assente/stale) →
+                 STUCK_VECTOR_UNCONFIRMED: osservabilità, nessuna CTA. Se il flush ha
+                 risolto → soppresso (transitorio pre-flush benigno).
 
 Skips silently when `maintenance.lock` is present.
 """
@@ -140,6 +147,37 @@ def classify_level(queue_total: int) -> str:
     return "NORMAL"
 
 
+def _read_gate_cache(args: argparse.Namespace) -> dict | None:
+    """Cache audit del gate (auto_flush_queue.write_audit_cache → gate_audit_cache.json),
+    validata per freschezza. Ritorna il dict o None se assente/illeggibile/malformata/
+    priva di ts valido/stale oltre CACHE_MAX_AGE_HOURS. Sorgente unica di staleness per
+    entrambi i segnali che la consumano (queue STUCK e drift STUCK_VECTOR-C).
+
+    --skip-audit forza None (test); --audit-cache-path override (test).
+    """
+    if getattr(args, "skip_audit", False):
+        return None
+    path = getattr(args, "audit_cache_path", None) or GATE_AUDIT_CACHE_PATH
+    try:
+        with open(path) as f:
+            cache = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        log("WARN", f"cache audit gate assente/illeggibile ({path})")
+        return None
+    if not isinstance(cache, dict):
+        log("WARN", "cache audit gate malformata (non-dict)")
+        return None
+    try:
+        age = datetime.now().timestamp() - float(cache.get("ts_unix"))
+    except (TypeError, ValueError):
+        log("WARN", "cache audit gate senza ts_unix valido")
+        return None
+    if age > CACHE_MAX_AGE_HOURS * 3600:
+        log("WARN", f"cache audit gate stale ({age / 3600:.1f}h > {CACHE_MAX_AGE_HOURS}h) → gate fermo?")
+        return None
+    return cache
+
+
 def read_collection_pending(args: argparse.Namespace) -> int | None:
     """collection_queue_pending_count dalla CACHE dell'audit del gate auto-flush.
 
@@ -150,34 +188,15 @@ def read_collection_pending(args: argparse.Namespace) -> int | None:
     irrilevante. Stessa soglia/metrica del gate → STUCK resta allineato al gate.
 
     Ritorna None (→ STUCK non valutabile, status quo safe, niente CTA no-op) se la
-    cache è: assente, illeggibile/malformata, priva di ts valido, stale oltre
-    CACHE_MAX_AGE_HOURS (gate probabilmente fermo), o senza collection-pending valido.
+    cache è assente/stale (vedi _read_gate_cache) o senza collection-pending valido.
 
     Override test: --collection-pending N forza il valore (salta la cache);
     --skip-audit ritorna None senza leggere la cache; --audit-cache-path override.
     """
     if getattr(args, "collection_pending", None) is not None:
         return args.collection_pending
-    if getattr(args, "skip_audit", False):
-        return None
-    path = getattr(args, "audit_cache_path", None) or GATE_AUDIT_CACHE_PATH
-    try:
-        with open(path) as f:
-            cache = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        log("WARN", f"cache audit gate assente/illeggibile ({path}) → STUCK non valutabile")
-        return None
-    if not isinstance(cache, dict):
-        log("WARN", "cache audit gate malformata (non-dict) → STUCK non valutabile")
-        return None
-    try:
-        age = datetime.now().timestamp() - float(cache.get("ts_unix"))
-    except (TypeError, ValueError):
-        log("WARN", "cache audit gate senza ts_unix valido → STUCK non valutabile")
-        return None
-    if age > CACHE_MAX_AGE_HOURS * 3600:
-        log("WARN", f"cache audit gate stale ({age / 3600:.1f}h > {CACHE_MAX_AGE_HOURS}h) "
-                    "→ gate fermo? STUCK non valutabile")
+    cache = _read_gate_cache(args)
+    if cache is None:
         return None
     raw = cache.get("collection_queue_pending_count")
     try:
@@ -187,6 +206,40 @@ def read_collection_pending(args: argparse.Namespace) -> int | None:
                     "→ STUCK non valutabile")
         return None
     return v if v >= 0 else None
+
+
+def stuck_vector_verdict(cache: dict | None, collection_name: str,
+                         current_vector_seq) -> bool | None:
+    """Condizione C di STUCK_VECTOR: l'ultimo flush del gate ha RISOLTO o no?
+
+    Distingue il vero #6975 (flush girato ma drift non sceso / vector non avanzato)
+    dal transitorio benigno pre-flush. Ritorna:
+      * True  → CONFERMATO stuck: il gate ha flushato questa collection, il flush NON
+                ha risolto (flush_resolved=False) E il vector live non è avanzato oltre
+                quello cachato (current <= cached). Consumer davvero bloccato → CTA.
+      * False → BENIGNO: il gate ha flushato e ha RISOLTO (resolved=True) oppure il
+                vector è avanzato oltre la cache (consumer ripartito) → sopprimi.
+      * None  → NON valutabile su C: cache assente/stale, di altra collection, o
+                nessun flush registrato (flush_ran=False). Il chiamante ricade su A.
+    """
+    if not cache:
+        return None
+    if cache.get("collection_name") != collection_name:
+        return None
+    if not cache.get("flush_ran"):
+        return None
+    resolved = cache.get("flush_resolved")
+    cached_vec = cache.get("vector_seq")
+    advanced = False
+    try:
+        advanced = current_vector_seq > int(cached_vec)
+    except (TypeError, ValueError):
+        advanced = False  # cache senza vector confrontabile → non posso dire "avanzato"
+    if resolved is True or advanced:
+        return False
+    if resolved is False:
+        return True
+    return None  # flush_ran ma resolved sconosciuto → non valutabile
 
 
 def _ref_before_cutoff(history: list[dict], now_ts: str, window_hours: int) -> dict | None:
@@ -587,8 +640,11 @@ def within_snooze_key(state: dict, key: str, hours: int) -> bool:
 
 def format_drift_alert(snap: dict, label: str, oldest_age: float | None,
                        oldest: str | None) -> str:
-    emoji = {"WARNING": "⚠️", "CRITICAL": "🚨", "STUCK_VECTOR": "🧊"}.get(label, "⚠️")
-    lines = [f"{emoji} *TAILOR drift alert — {label}*"]
+    emoji = {"WARNING": "⚠️", "CRITICAL": "🚨",
+             "STUCK_VECTOR": "🧊", "STUCK_VECTOR_UNCONFIRMED": "👀"}.get(label, "⚠️")
+    title = "STUCK_VECTOR" if label == "STUCK_VECTOR_UNCONFIRMED" else label
+    suffix = " (non confermato)" if label == "STUCK_VECTOR_UNCONFIRMED" else ""
+    lines = [f"{emoji} *TAILOR drift alert — {title}{suffix}*"]
     lines.append(f"Collection: `{snap['collection_name']}`")
     lines.append(f"Drift (META-VECTOR): `{snap['drift']}`")
     lines.append(f"vector_seq: `{snap['vector_seq']}`  meta_seq: `{snap['meta_seq']}`")
@@ -596,18 +652,30 @@ def format_drift_alert(snap: dict, label: str, oldest_age: float | None,
     md = snap.get("meta_seq_delta_since_last")
     if vd is not None:
         lines.append(f"Δ dal check precedente — vector: `{vd}`  meta: `{md}`")
+    # CTA repair SOLO quando il flush del gate ha già dimostrato di non risolvere
+    # (STUCK_VECTOR confermato, condizione C). Negli altri casi è osservabilità.
+    cta = False
     if label == "STUCK_VECTOR":
-        lines.append("VECTOR fermo mentre META avanza → consumer HNSW bloccato.")
+        lines.append("VECTOR fermo mentre META avanza E l'ultimo flush del gate NON "
+                     "ha risolto (drift ≥ sync_threshold) → consumer HNSW bloccato (#6975).")
+        cta = True
+    elif label == "STUCK_VECTOR_UNCONFIRMED":
+        lines.append(f"VECTOR fermo con drift ≥ sync_threshold ({SYNC_THRESHOLD}), ma esito "
+                     "flush del gate non disponibile (cache assente/stale): osservabilità, "
+                     "NON confermato bloccato. Attendere il prossimo run del gate.")
     elif label == "WARNING":
         lines.append(f"Soglia WARNING: drift > {DRIFT_WARNING}")
+        cta = True
     elif label == "CRITICAL":
         lines.append(f"Soglia CRITICAL: drift > {DRIFT_CRITICAL} (sync_threshold {SYNC_THRESHOLD})")
+        cta = True
     if oldest:
         if oldest_age is not None:
             lines.append(f"Queue oldest pending: `{oldest}` ({oldest_age:.1f}h fa)")
         else:
             lines.append(f"Queue oldest pending: `{oldest}`")
-    lines.append("Run: `python scripts/maintenance/repair_hnsw_index.py`")
+    if cta:
+        lines.append("Run: `python scripts/maintenance/repair_hnsw_index.py`")
     return "\n".join(lines)
 
 
@@ -697,6 +765,7 @@ def handle_drift(args: argparse.Namespace, queue_snap: dict | None) -> int:
     oldest = queue_snap.get("oldest") if queue_snap else None
     now_ts = datetime.now().strftime(TS_FMT)
     oldest_age = _oldest_age_hours(oldest, now_ts) if oldest else None
+    gate_cache = _read_gate_cache(args)  # condizione C di STUCK_VECTOR (esito flush del gate)
     rc = 0
     for r in readings:
         cname = r["collection_name"]
@@ -706,12 +775,23 @@ def handle_drift(args: argparse.Namespace, queue_snap: dict | None) -> int:
             mdelta = r["meta_seq"] - last["meta_seq"]
         else:
             vdelta = mdelta = None
-        stuck_vector = (vdelta == 0 and mdelta is not None and mdelta > 0 and r["drift"] > DRIFT_WARNING)
+        # Base: vector fermo + meta avanzato tra 2 letture del monitor.
+        base_stall = (vdelta == 0 and mdelta is not None and mdelta > 0)
+        # A (pavimento): vector fermo è sospetto solo da SYNC_THRESHOLD in su; sotto
+        # [DRIFT_WARNING, SYNC_THRESHOLD) è lazy compaction normale (era il FP).
+        a_floor = r["drift"] >= SYNC_THRESHOLD
+        # C (allineamento al gate): l'ultimo flush ha risolto? True=conferma #6975,
+        # False=benigno (sopprimi), None=non valutabile (ricade su A).
+        c_verdict = stuck_vector_verdict(gate_cache, cname, r["vector_seq"]) if base_stall and a_floor else None
+        stuck_vector = base_stall and a_floor and c_verdict is not False
+        stuck_confirmed = stuck_vector and c_verdict is True
         level = classify_drift(r["drift"])
         if level == "CRITICAL":
             status = "CRITICAL"
-        elif stuck_vector:
+        elif stuck_confirmed:
             status = "STUCK_VECTOR"
+        elif stuck_vector:
+            status = "STUCK_VECTOR_UNCONFIRMED"
         elif level == "WARNING":
             status = "WARNING"
         else:
@@ -726,13 +806,16 @@ def handle_drift(args: argparse.Namespace, queue_snap: dict | None) -> int:
             "meta_seq_delta_since_last": mdelta,
             "status": status,
             "stuck_vector": stuck_vector,
+            "stuck_vector_confirmed": stuck_confirmed,
         }
         append_jsonl(DRIFT_SNAP_PATH, snap)
         triggers = []
         if level in ("WARNING", "CRITICAL"):
             triggers.append(level)
-        if stuck_vector:
+        if stuck_confirmed:
             triggers.append("STUCK_VECTOR")
+        elif stuck_vector:
+            triggers.append("STUCK_VECTOR_UNCONFIRMED")
         for label in triggers:
             key = f"{cname}:{label}"
             snoozed = within_snooze_key(state, key, SNOOZE_HOURS) and not args.ignore_snooze

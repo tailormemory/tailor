@@ -12,11 +12,24 @@ import json
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 MONITOR = REPO / "scripts" / "services" / "queue_depth_monitor.py"
 PY = sys.executable
+
+
+def _write_gate_cache(path, collection_name="tailor_kb_v2", vector_seq=0, drift=0,
+                      flush_ran=True, flush_resolved=False, age_hours=2.0):
+    """Cache audit del gate come la scrive auto_flush_queue.write_audit_cache."""
+    path.write_text(json.dumps({
+        "ts_unix": int(time.time() - age_hours * 3600),
+        "collection_name": collection_name,
+        "vector_seq": vector_seq, "drift": drift,
+        "flush_ran": flush_ran, "flush_resolved": flush_resolved,
+        "collection_queue_pending_count": 0, "queue_total": 0,
+    }))
 
 
 def _make_db(path, collections):
@@ -87,22 +100,92 @@ def test_drift_normal(tmp_path):
     assert "would alert" not in r.stdout
 
 
-def test_stuck_vector(tmp_path):
-    db = tmp_path / "c.sqlite3"
-    # vector fermo a 1000, meta avanzato 1100 -> 1900 (drift 900 > WARNING 800)
-    _make_db(db, [{"name": "tailor_kb_v2", "vec_seq": 1000, "meta_seq": 1900}])
-    drift_snap = tmp_path / "d.jsonl"
+def _prior_snap(drift_snap, vector_seq, meta_seq):
+    """Snapshot drift precedente (per calcolare vdelta/mdelta nel monitor)."""
     drift_snap.write_text(json.dumps({
         "ts": "2026-05-28 20:00:00", "collection_name": "tailor_kb_v2",
-        "vector_seq": 1000, "meta_seq": 1100, "drift": 100,
+        "vector_seq": vector_seq, "meta_seq": meta_seq, "drift": meta_seq - vector_seq,
         "vector_seq_delta_since_last": None, "meta_seq_delta_since_last": None,
         "status": "WARNING", "stuck_vector": False,
     }) + "\n")
-    r = _run(db, drift_snap, tmp_path / "s.json")
+
+
+def test_stuck_vector_benign_below_sync_threshold(tmp_path):
+    """FP di stamattina: drift 836 (< SYNC_THRESHOLD 1000), vector fermo su 1 finestra.
+    Sotto soglia è lazy compaction → A NON scatta → niente STUCK_VECTOR (solo WARNING)."""
+    db = tmp_path / "c.sqlite3"
+    _make_db(db, [{"name": "tailor_kb_v2", "vec_seq": 333672, "meta_seq": 334508}])  # drift 836
+    drift_snap = tmp_path / "d.jsonl"
+    _prior_snap(drift_snap, vector_seq=333672, meta_seq=334399)  # vdelta 0, mdelta 109
+    cache = tmp_path / "gate_cache.json"
+    _write_gate_cache(cache, vector_seq=333672, flush_resolved=True)  # realistico: flush poi riuscito
+    r = _run(db, drift_snap, tmp_path / "s.json", extra=["--audit-cache-path", str(cache)])
+    assert r.returncode == 0, r.stderr
+    assert "STUCK_VECTOR" not in r.stdout
+    assert "would alert tailor_kb_v2:WARNING" in r.stdout
+
+
+def test_stuck_vector_confirmed_real_6975(tmp_path):
+    """#6975 reale: drift 1100 (>= SYNC_THRESHOLD), vector fermo, e la cache dice che
+    l'ultimo flush del gate NON ha risolto (flush_resolved=False) col vector non
+    avanzato → STUCK_VECTOR confermato + CTA repair."""
+    db = tmp_path / "c.sqlite3"
+    _make_db(db, [{"name": "tailor_kb_v2", "vec_seq": 333672, "meta_seq": 334772}])  # drift 1100
+    drift_snap = tmp_path / "d.jsonl"
+    _prior_snap(drift_snap, vector_seq=333672, meta_seq=333872)  # vdelta 0, mdelta 900
+    cache = tmp_path / "gate_cache.json"
+    _write_gate_cache(cache, vector_seq=333672, drift=1100,
+                      flush_ran=True, flush_resolved=False)
+    r = _run(db, drift_snap, tmp_path / "s.json", extra=["--audit-cache-path", str(cache)])
     assert r.returncode == 0, r.stderr
     assert "would alert tailor_kb_v2:STUCK_VECTOR" in r.stdout
-    # drift 900 → anche WARNING (trigger separato)
-    assert "would alert tailor_kb_v2:WARNING" in r.stdout
+    assert "STUCK_VECTOR_UNCONFIRMED" not in r.stdout
+    assert "repair_hnsw_index.py" in r.stdout  # CTA presente solo qui
+
+
+def test_stuck_vector_suppressed_when_flush_resolved(tmp_path):
+    """drift 1100 + vector fermo, ma la cache dice flush RISOLTO (flush_resolved=True):
+    transitorio benigno pre-flush → soppresso (nessun STUCK_VECTOR né UNCONFIRMED)."""
+    db = tmp_path / "c.sqlite3"
+    _make_db(db, [{"name": "tailor_kb_v2", "vec_seq": 333672, "meta_seq": 334772}])
+    drift_snap = tmp_path / "d.jsonl"
+    _prior_snap(drift_snap, vector_seq=333672, meta_seq=333872)
+    cache = tmp_path / "gate_cache.json"
+    _write_gate_cache(cache, vector_seq=333672, flush_ran=True, flush_resolved=True)
+    r = _run(db, drift_snap, tmp_path / "s.json", extra=["--audit-cache-path", str(cache)])
+    assert r.returncode == 0, r.stderr
+    assert "STUCK_VECTOR" not in r.stdout  # né confermato né unconfirmed
+
+
+def test_stuck_vector_suppressed_when_vector_advanced(tmp_path):
+    """flush non risolto MA il vector live è avanzato oltre la cache (consumer ripartito)
+    → C=False → soppresso."""
+    db = tmp_path / "c.sqlite3"
+    _make_db(db, [{"name": "tailor_kb_v2", "vec_seq": 333672, "meta_seq": 334772}])
+    drift_snap = tmp_path / "d.jsonl"
+    _prior_snap(drift_snap, vector_seq=333672, meta_seq=333872)
+    cache = tmp_path / "gate_cache.json"
+    _write_gate_cache(cache, vector_seq=333000, flush_ran=True, flush_resolved=False)  # < current
+    r = _run(db, drift_snap, tmp_path / "s.json", extra=["--audit-cache-path", str(cache)])
+    assert r.returncode == 0, r.stderr
+    assert "STUCK_VECTOR" not in r.stdout
+
+
+def test_stuck_vector_unconfirmed_cache_absent(tmp_path):
+    """drift 1100 + vector fermo ma cache assente → C non valutabile → ricade su A:
+    STUCK_VECTOR_UNCONFIRMED (osservabilità), SENZA CTA repair."""
+    db = tmp_path / "c.sqlite3"
+    _make_db(db, [{"name": "tailor_kb_v2", "vec_seq": 333672, "meta_seq": 334772}])
+    drift_snap = tmp_path / "d.jsonl"
+    _prior_snap(drift_snap, vector_seq=333672, meta_seq=333872)
+    absent = tmp_path / "nope.json"
+    r = _run(db, drift_snap, tmp_path / "s.json", extra=["--audit-cache-path", str(absent)])
+    assert r.returncode == 0, r.stderr
+    assert "would alert tailor_kb_v2:STUCK_VECTOR_UNCONFIRMED" in r.stdout
+    # CTA repair NON presente nel messaggio STUCK_VECTOR_UNCONFIRMED (ma WARNING/CRITICAL
+    # nello stesso run potrebbero averla): qui drift 1100 < CRITICAL 1500 → solo WARNING,
+    # che però la include. Verifichiamo il blocco unconfirmed esplicitamente.
+    assert "non confermato" in r.stdout
 
 
 def test_no_stuck_when_vector_advances(tmp_path):

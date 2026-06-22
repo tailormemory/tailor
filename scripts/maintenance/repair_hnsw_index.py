@@ -130,6 +130,7 @@ class DriftReport:
     queue_oldest_iso: str | None
     queue_newest_iso: str | None
     collection_queue_pending_count: int = 0
+    collection_name: str = COLLECTION_NAME  # collection auditata (per consumer della cache audit)
     collection_topic: str | None = None
     collection_topic_ambiguous: bool = False
     sql_only_orphans: list[OrphanChunk] = field(default_factory=list)

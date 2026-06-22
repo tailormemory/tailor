@@ -197,23 +197,52 @@ def run_audit() -> dict | None:
     return objs[0]
 
 
-def write_audit_cache(audit: dict, path: str | None = None) -> bool:
-    """Persiste l'esito dell'audit del gate per queue_depth_monitor.
+def write_audit_cache(audit: dict, flush: dict | None = None, path: str | None = None) -> bool:
+    """Persiste l'esito del gate per queue_depth_monitor (segnali STUCK queue e STUCK_VECTOR).
 
     Il monitor (ogni 30 min) NON rieffettua l'audit: legge questa cache. Il gate
     gira 08/14/20 e produce SEMPRE un audit (anche su skip/escalate/dry-run), quindi
-    la cache è fresca entro la cadenza del gate. Salva solo i campi che servono al
-    monitor (ts + collection_queue_pending_count + queue_total globale). Scrittura
-    atomica (tmp+replace). Best-effort: un fallimento qui NON deve abortire il gate.
+    la cache è fresca entro la cadenza del gate.
+
+    Due chiamate per run del gate:
+      * pre-flush (main, flush=None): stato dall'audit (collection_pending, queue_total,
+        vector_seq, drift), flush_ran=False — sufficiente per il segnale queue STUCK.
+      * post-flush (run_procedure, flush=flush_json): sovrascrive con lo stato POST
+        mutazione + esito, così il monitor sa se un flush è girato e se ha RISOLTO.
+        `flush_resolved` = il contratto `success` del tool (che richiede già drift
+        post < DRIFT_WARNING): è la firma che separa #6975 reale (flush girato ma
+        drift NON sceso → resolved=False) da transitorio benigno (resolved=True).
+
+    Scrittura atomica (tmp+replace). Best-effort: un fallimento qui NON aborta il gate.
     """
     if path is None:
         path = AUDIT_CACHE_PATH
     try:
+        post = (flush or {}).get("post") or {}
+        flush_ran = isinstance(flush, dict) and isinstance(flush.get("post"), dict)
+        if flush_ran:
+            vector_seq = post.get("vector_seq", audit.get("vector_seq"))
+            drift = post.get("drift", audit.get("drift"))
+            cqp = flush.get("post_collection_queue_pending_count",
+                            audit.get("collection_queue_pending_count"))
+            qt = flush.get("post_queue_total", audit.get("queue_total"))
+            flush_resolved = bool(flush.get("success"))
+        else:
+            vector_seq = audit.get("vector_seq")
+            drift = audit.get("drift")
+            cqp = audit.get("collection_queue_pending_count")
+            qt = audit.get("queue_total")
+            flush_resolved = None
         payload = {
             "ts": datetime.now().strftime(TS_FMT),
             "ts_unix": int(time.time()),
-            "collection_queue_pending_count": audit.get("collection_queue_pending_count"),
-            "queue_total": audit.get("queue_total"),
+            "collection_name": audit.get("collection_name"),
+            "collection_queue_pending_count": cqp,
+            "queue_total": qt,
+            "vector_seq": vector_seq,
+            "drift": drift,
+            "flush_ran": flush_ran,
+            "flush_resolved": flush_resolved,
         }
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".tmp"
@@ -668,6 +697,13 @@ def run_procedure(audit: dict, dry_run: bool) -> int:
     # evita _collection=None residuo → NoneType.upsert).
     restart_state = restart_mcp(mcp_pid) if signaled else "not_attempted"
     restarted = restart_state == "healthy"
+
+    # Aggiorna la cache con lo stato POST-flush per queue_depth_monitor (STUCK_VECTOR
+    # condizione C: "flush girato + drift non sceso"). Solo se un flush ha prodotto un
+    # blocco `post` (flush_json con post): altrimenti la cache pre-flush di main resta
+    # valida. Best-effort.
+    if isinstance(flush_json, dict) and isinstance(flush_json.get("post"), dict):
+        write_audit_cache(audit, flush=flush_json)
 
     # ── Esito ────────────────────────────────────────────────────────────────
     if not maint_confirmed:
