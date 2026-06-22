@@ -64,6 +64,28 @@ Template for upcoming changes. Move entries under a new version heading on relea
   [`tests/test_queue_alert_split.py`](tests/test_queue_alert_split.py).
   File: [`scripts/services/queue_depth_monitor.py`](scripts/services/queue_depth_monitor.py).
 
+- **STUCK_VECTOR del drift monitor allineato al gate (A+C)** — stesso tipo di FP del
+  queue STUCK, su un ramo diverso. Il trigger scattava su `vector_seq` fermo + `meta_seq`
+  avanzato tra 2 letture con `drift > DRIFT_WARNING` (800), cioè dentro la zona [800,1000)
+  che è lazy compaction benigna (incidente 22/06: alert "consumer bloccato" alle 06:17,
+  flush del gate alle 08:00 drift `836→0` senza problemi). Ora:
+  - **A — pavimento a `SYNC_THRESHOLD`** (1000): sotto soglia `vector_seq` fermo è lazy
+    compaction per definizione, non stuck. Elimina alla radice il FP della zona benigna.
+  - **C — subordinato all'esito del flush del gate**: STUCK_VECTOR è *confermato* (CTA
+    repair) solo se la cache audit dice che l'ultimo flush NON ha risolto
+    (`flush_resolved=False`, dal contratto `success` del tool) e il `vector_seq` live non
+    è avanzato oltre quello cachato → consumer davvero bloccato (#6975). Se il flush ha
+    risolto → soppresso (transitorio pre-flush). Se C non valutabile (cache assente/stale)
+    → `STUCK_VECTOR_UNCONFIRMED`: osservabilità, **nessuna CTA** e niente wording "consumer
+    bloccato". La cache del gate (`write_audit_cache`) è estesa con `collection_name`,
+    `vector_seq`, `drift`, `flush_ran`, `flush_resolved` (aggiornata post-flush); l'audit
+    JSON del tool espone ora `collection_name`. Snooze 6h indipendente per label. Test:
+    [`tests/test_drift_monitor.py`](tests/test_drift_monitor.py),
+    [`tests/test_auto_flush_queue.py`](tests/test_auto_flush_queue.py). File:
+    [`scripts/services/queue_depth_monitor.py`](scripts/services/queue_depth_monitor.py),
+    [`scripts/services/auto_flush_queue.py`](scripts/services/auto_flush_queue.py),
+    [`scripts/maintenance/repair_hnsw_index.py`](scripts/maintenance/repair_hnsw_index.py).
+
 ### Fixed
 
 - **Fact derivation: ripresa incrementale con priorità ai nuovi.** La derivation
