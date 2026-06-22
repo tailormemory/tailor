@@ -35,6 +35,15 @@ Template for upcoming changes. Move entries under a new version heading on relea
   [`scripts/enrichment/derive_facts.py`](scripts/enrichment/derive_facts.py).
 ### Changed
 
+- **WARNING drift: rimossa la CTA `repair_hnsw_index.py`.** Il WARNING (drift > 800)
+  resta come segnale informativo della zona di lazy compaction [800,1000), ma non
+  suggerisce più l'azione manuale di repair: era un consiglio no-op su uno stato che
+  l'auto-flush risolve da solo. Il caso "drift davvero non scende" è già coperto da
+  STUCK_VECTOR confermato (CTA condizionata) e da CRITICAL (drift > 1500, fuori dalla
+  zona benigna, mantiene la CTA). Completa l'allineamento al gate dei tre rami di alert
+  (queue STUCK, STUCK_VECTOR, WARNING drift).
+  File: [`scripts/services/queue_depth_monitor.py`](scripts/services/queue_depth_monitor.py).
+
 - **Queue alert sdoppiato in due segnali distinti** (`queue_depth_monitor.py`).
   Il monitor decideva STUCK su `queue_total` globale + età-oldest, mentre il gate
   auto-flush decide su `collection_queue_pending_count` (dal 12/06, commit
