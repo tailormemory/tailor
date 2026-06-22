@@ -79,6 +79,9 @@ def test_drift_warning(tmp_path):
     assert "would alert tailor_kb_v2:WARNING" in r.stdout
     assert "`900`" in r.stdout
     assert "CRITICAL" not in r.stdout
+    # WARNING è puramente informativo: niente CTA repair (azione manuale no-op nella
+    # zona lazy-compaction; il caso reale è coperto da STUCK_VECTOR confermato).
+    assert "repair_hnsw_index.py" not in r.stdout
 
 
 def test_drift_critical(tmp_path):
@@ -89,6 +92,8 @@ def test_drift_critical(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "would alert tailor_kb_v2:CRITICAL" in r.stdout
     assert "`1600`" in r.stdout
+    # CRITICAL (drift > 1500, ben oltre sync_threshold) NON è zona benigna → CTA invariata.
+    assert "repair_hnsw_index.py" in r.stdout
 
 
 def test_drift_normal(tmp_path):
@@ -182,10 +187,10 @@ def test_stuck_vector_unconfirmed_cache_absent(tmp_path):
     r = _run(db, drift_snap, tmp_path / "s.json", extra=["--audit-cache-path", str(absent)])
     assert r.returncode == 0, r.stderr
     assert "would alert tailor_kb_v2:STUCK_VECTOR_UNCONFIRMED" in r.stdout
-    # CTA repair NON presente nel messaggio STUCK_VECTOR_UNCONFIRMED (ma WARNING/CRITICAL
-    # nello stesso run potrebbero averla): qui drift 1100 < CRITICAL 1500 → solo WARNING,
-    # che però la include. Verifichiamo il blocco unconfirmed esplicitamente.
     assert "non confermato" in r.stdout
+    # drift 1100 → WARNING (ora senza CTA) + UNCONFIRMED (senza CTA): nessuna CTA repair
+    # nell'intero run (< CRITICAL 1500). Conferma che il WARNING non reintroduce la CTA.
+    assert "repair_hnsw_index.py" not in r.stdout
 
 
 def test_no_stuck_when_vector_advances(tmp_path):

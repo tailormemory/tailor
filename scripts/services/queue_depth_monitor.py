@@ -664,8 +664,11 @@ def format_drift_alert(snap: dict, label: str, oldest_age: float | None,
                      "flush del gate non disponibile (cache assente/stale): osservabilità, "
                      "NON confermato bloccato. Attendere il prossimo run del gate.")
     elif label == "WARNING":
-        lines.append(f"Soglia WARNING: drift > {DRIFT_WARNING}")
-        cta = True
+        # Informativo: zona lazy-compaction [DRIFT_WARNING, SYNC_THRESHOLD), l'auto-flush
+        # risolve da sé → niente CTA repair (sarebbe un'azione manuale no-op). Il caso
+        # "drift davvero non scende" è coperto da STUCK_VECTOR confermato (CTA propria).
+        lines.append(f"Soglia WARNING: drift > {DRIFT_WARNING} "
+                     f"(lazy compaction sotto sync_threshold {SYNC_THRESHOLD}, informativo)")
     elif label == "CRITICAL":
         lines.append(f"Soglia CRITICAL: drift > {DRIFT_CRITICAL} (sync_threshold {SYNC_THRESHOLD})")
         cta = True
