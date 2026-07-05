@@ -213,6 +213,22 @@ def _resolve_backoff(
     return float(backoff)
 
 
+def _resolve_collection(collection: Any) -> Any:
+    """Support both a live Collection and a zero-arg getter.
+
+    (C) The 3 interactive mcp_server callsites (retry>0) pass the bound
+    `get_collection` function so the retry loop can RE-RESOLVE the handle on
+    each attempt: if the first resolution landed inside a maintenance window
+    (`get_collection()` → None because SIGUSR1 released ChromaDB), a later
+    attempt after SIGUSR2 re-fetches a live handle and the write persists,
+    instead of looping forever on a frozen None.
+
+    The 4 batch callsites (retry=0) keep passing a live Collection instance,
+    which is NOT callable → returned as-is (bit-identical to prior behaviour).
+    """
+    return collection() if callable(collection) else collection
+
+
 def verified_upsert(
     collection: Any,
     ids: Sequence[str],
@@ -227,6 +243,7 @@ def verified_upsert(
     retry_delay: float = VERIFIER_RETRY_DELAY,
     retry: int = 0,
     retry_backoff: float | tuple[float, ...] = 0.0,
+    report: dict | None = None,
 ) -> bool:
     """Upsert into ChromaDB and verify the first batch id is reachable
     via a post-upsert sample-get sentinel (chromadb 1.5.8 frozen-collection
@@ -249,9 +266,11 @@ def verified_upsert(
         Up to `1 + N` attempts. Each attempt re-runs BOTH `collection.upsert()`
         AND the sample-get (the chromadb 1.5.8 frozen-collection state is
         not cured by re-reading; only a fresh upsert may break out of it).
-        Exceptions from upsert OR get are caught and logged as a failed
-        attempt — with retry>0, verified_upsert NEVER raises (differs
-        from retry=0). Returns True on the first successful attempt;
+        Exceptions from the getter (reopen/lazy-init), upsert OR get are
+        caught and logged as a failed attempt (reason="error") — with
+        retry>0, verified_upsert NEVER raises (differs from retry=0). A
+        getter that RETURNS None is a distinct case (reason="maintenance"),
+        not an error. Returns True on the first successful attempt;
         if attempt > 0, logs "recovered on attempt N". Returns False
         if all attempts exhaust, with a FINAL_FAILURE stderr line that
         includes `last_error`.
@@ -279,11 +298,22 @@ def verified_upsert(
         `repair_hnsw_index.py` (nightly).
 
     Args:
+        collection: a live Collection OR a zero-arg getter returning
+            `Collection | None` (see `_resolve_collection`). With retry>0 the
+            getter is re-resolved on EVERY attempt so a None captured during a
+            maintenance window recovers on a later attempt (fix C).
         retry: number of EXTRA attempts after the initial one (0 = single-shot).
         retry_backoff: sleep between consecutive attempts. A float applies
             uniformly; a tuple `(s0, s1, ...)` specifies per-position delays
             with clamp to the last value when there are more retries than
             tuple entries.
+        report: optional dict, populated ONLY on the retry>0 path. On exit it
+            carries `reason` ∈ {"ok", "maintenance", "silent_drop", "error"}
+            and `last_error`. `"maintenance"` means every attempt found the
+            collection unavailable (SIGUSR1 released it) → the caller must
+            surface an HONEST "MCP in maintenance" error, NOT the misleading
+            "chromadb silent-drop" (fix B). `"silent_drop"` is the genuine
+            chromadb 1.5.8 frozen-collection case (upsert OK, sample-get miss).
 
     `run_id` is the caller-supplied identifier shared across all batches in
     one ingest run; use `make_run_id(source)` at the top of the script.
@@ -293,36 +323,66 @@ def verified_upsert(
     if retry > 0:
         # ===== retry>0 path (A1 opt-in): loop with full upsert+sample-get =====
         last_error: str | None = None
+        last_reason: str = "error"   # ok | maintenance | silent_drop | error
         total_attempts = retry + 1
         for attempt in range(total_attempts):
             attempt_label = f"attempt {attempt + 1}/{total_attempts}"
             try:
-                collection.upsert(
-                    ids=id_list,
-                    embeddings=list(embeddings),
-                    documents=list(documents),
-                    metadatas=list(metadatas),
-                )
-                if not id_list:
-                    return True
-                sample_id = id_list[0]
-                result = collection.get(ids=[sample_id])
-                if result.get("ids") and sample_id in result["ids"]:
-                    if attempt > 0:
-                        print(
-                            f"[ingest_helpers] verified_upsert recovered on "
-                            f"{attempt_label} (run_id={run_id}, source={source}).",
-                            file=sys.stderr,
-                        )
-                    return True
-                last_error = f"silent_drop sample_id={sample_id!r}"
-                print(
-                    f"[ingest_helpers] SILENT DROP observed on {attempt_label}: "
-                    f"upsert returned OK but get(ids=[{sample_id!r}]) is empty "
-                    f"(run_id={run_id}, source={source}, batch_size={len(id_list)}).",
-                    file=sys.stderr,
-                )
+                # (C) re-resolve the handle on EVERY attempt. A None captured
+                # during a maintenance window (SIGUSR1 → get_collection() returns
+                # None) is no longer frozen for the whole loop: once SIGUSR2 fires
+                # during the backoff, the next attempt re-fetches a live
+                # collection. The resolve is INSIDE the try so a getter that
+                # RAISES during reopen/lazy-init is caught as reason="error" and
+                # retried, NOT propagated (retry>0 contract: never raises). A
+                # getter that RETURNS None is a different case → maintenance below.
+                col = _resolve_collection(collection)
+                if col is None:
+                    # (B) maintenance, NOT a chromadb silent-drop. Do not call
+                    # None.upsert() — that raised the misleading AttributeError
+                    # that got re-labelled "chromadb silent-drop" every flush cycle.
+                    last_reason = "maintenance"
+                    last_error = "collection unavailable (maintenance mode)"
+                    print(
+                        f"[ingest_helpers] {attempt_label}: collection unavailable "
+                        f"(maintenance) — will re-resolve on next attempt "
+                        f"(run_id={run_id}, source={source}).",
+                        file=sys.stderr,
+                    )
+                else:
+                    col.upsert(
+                        ids=id_list,
+                        embeddings=list(embeddings),
+                        documents=list(documents),
+                        metadatas=list(metadatas),
+                    )
+                    if not id_list:
+                        if report is not None:
+                            report["reason"] = "ok"
+                        return True
+                    sample_id = id_list[0]
+                    result = col.get(ids=[sample_id])
+                    if result.get("ids") and sample_id in result["ids"]:
+                        if attempt > 0:
+                            print(
+                                f"[ingest_helpers] verified_upsert recovered on "
+                                f"{attempt_label} (run_id={run_id}, source={source}).",
+                                file=sys.stderr,
+                            )
+                        if report is not None:
+                            report["reason"] = "ok"
+                        return True
+                    last_reason = "silent_drop"
+                    last_error = f"silent_drop sample_id={sample_id!r}"
+                    print(
+                        f"[ingest_helpers] SILENT DROP observed on {attempt_label}: "
+                        f"upsert returned OK but get(ids=[{sample_id!r}]) is empty "
+                        f"(run_id={run_id}, source={source}, batch_size={len(id_list)}).",
+                        file=sys.stderr,
+                    )
             except Exception as e:
+                # Covers getter-raise (reopen/lazy-init), upsert-raise, get-raise.
+                last_reason = "error"
                 last_error = f"{type(e).__name__}: {e}"
                 print(
                     f"[ingest_helpers] {attempt_label} raised "
@@ -333,15 +393,21 @@ def verified_upsert(
                 sleep_for = _resolve_backoff(retry_backoff, attempt)
                 if sleep_for > 0:
                     time.sleep(sleep_for)
+        if report is not None:
+            report["reason"] = last_reason
+            report["last_error"] = last_error
         print(
             f"[ingest_helpers] verified_upsert FAILED after {total_attempts} "
-            f"attempts (run_id={run_id}, source={source}, "
+            f"attempts (run_id={run_id}, source={source}, reason={last_reason}, "
             f"last_error={last_error}).",
             file=sys.stderr,
         )
         return False
 
     # ===== retry=0 path: v1.2.6.3 single-shot, body preserved verbatim =====
+    # (C) getter support: batch callsites pass a live Collection (not callable
+    # → returned as-is, bit-identical); resolved once here if ever given a getter.
+    collection = _resolve_collection(collection)
     collection.upsert(
         ids=id_list,
         embeddings=list(embeddings),

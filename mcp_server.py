@@ -1129,14 +1129,27 @@ class BearerAuthMiddleware:
                     }
                     # Batch-1: verified_upsert verifies only id_list[0]; if this
                     # becomes batch-N, per-id coverage must be revisited.
+                    # (C) getter → re-resolve per attempt across a maintenance
+                    # window (auto-flush SIGUSR1/SIGUSR2). is_update above stays
+                    # best-effort (its get() is already swallowed on None).
+                    _report: dict = {}
                     ok = verified_upsert(
-                        collection,
+                        get_collection,
                         ids=[chunk_id], embeddings=[embedding],
                         documents=[text[:10000]], metadatas=[metadata],
                         run_id=make_run_id("ingest_live"), source="ingest_live",
-                        retry=2, retry_backoff=0.3,
+                        retry=2, retry_backoff=0.3, report=_report,
                     )
                     if not ok:
+                        # (B) maintenance != chromadb silent-drop: honest 503 so
+                        # telemetry isn't polluted with false frozen-collection.
+                        if _report.get("reason") == "maintenance":
+                            return _json_response(
+                                {"error": "MCP in maintenance (auto-flush queue "
+                                          "in corso), retry in a few seconds",
+                                 "persisted": False, "maintenance": True},
+                                503,
+                            )
                         return _json_response(
                             {"error": "KB write verification failed after 3 "
                                       "attempts (chromadb silent-drop)",
@@ -2933,7 +2946,6 @@ def kb_add(content: str, title: str, category: str = "general", source: str = "c
         chunk_id = f"{prefix}_{now.strftime('%Y%m%d_%H%M%S')}_{abs(hash(content)) % 10000:04d}"
         conv_id = f"{prefix}_session_{now.strftime('%Y%m%d')}"
         embedding = get_embedding(content)
-        collection = get_collection()
         meta = {
             "conv_id": conv_id, "title": title, "date": date_str,
             "create_time": timestamp, "default_model": source,
@@ -2947,14 +2959,23 @@ def kb_add(content: str, title: str, category: str = "general", source: str = "c
         meta["entities_count"] = len(entities)
         # Batch-1: verified_upsert verifies only id_list[0]; if this
         # becomes batch-N, per-id coverage must be revisited.
+        # (C) pass get_collection (the getter) so the retry loop re-resolves
+        # the handle each attempt: a None captured during an auto-flush
+        # maintenance window recovers once SIGUSR2 fires mid-backoff.
+        _report: dict = {}
         ok = verified_upsert(
-            collection,
+            get_collection,
             ids=[chunk_id], embeddings=[embedding],
             documents=[content[:4000]], metadatas=[meta],
             run_id=make_run_id("kb_add"), source="kb_add",
-            retry=2, retry_backoff=(0.5, 1.0),
+            retry=2, retry_backoff=(0.5, 1.0), report=_report,
         )
         if not ok:
+            # (B) honest attribution: maintenance != chromadb silent-drop.
+            if _report.get("reason") == "maintenance":
+                return ("Error saving: MCP in maintenance (auto-flush della "
+                        "queue in corso). Content NOT persisted \u2014 retry "
+                        "in a few seconds.")
             return ("Error saving: KB write verification failed after 3 "
                     "attempts (chromadb silent-drop). Content NOT "
                     "persisted \u2014 retry or check logs.")
@@ -3006,7 +3027,6 @@ def kb_update_session(summary: str, key_facts: str, decisions: str = "", action_
         chunk_id = f"{prefix}_session_{now.strftime('%Y%m%d_%H%M%S')}"
         conv_id = f"{prefix}_session_{now.strftime('%Y%m%d')}"
         embedding = get_embedding(full_doc)
-        collection = get_collection()
         meta = {
             "conv_id": conv_id, "title": f"Sessione {source_label} {date_str}",
             "date": date_str, "create_time": timestamp, "default_model": source,
@@ -3025,14 +3045,21 @@ def kb_update_session(summary: str, key_facts: str, decisions: str = "", action_
         # same second collide and the 2nd silently overwrites the 1st
         # (was: add() raised). Root cause is the id granularity, not
         # upsert(). Finer-grained chunk_id would fix it.
+        # (C) getter → retry loop re-resolves across a maintenance window.
+        _report: dict = {}
         ok = verified_upsert(
-            collection,
+            get_collection,
             ids=[chunk_id], embeddings=[embedding],
             documents=[full_doc[:4000]], metadatas=[meta],
             run_id=make_run_id("kb_update_session"), source="kb_update_session",
-            retry=2, retry_backoff=(0.5, 1.0),
+            retry=2, retry_backoff=(0.5, 1.0), report=_report,
         )
         if not ok:
+            # (B) maintenance != chromadb silent-drop.
+            if _report.get("reason") == "maintenance":
+                return ("Error saving session: MCP in maintenance (auto-flush "
+                        "della queue in corso). Session NOT persisted — retry "
+                        "in a few seconds.")
             return ("Error saving session: KB write verification failed "
                     "after 3 attempts (chromadb silent-drop). "
                     "Session NOT persisted.")

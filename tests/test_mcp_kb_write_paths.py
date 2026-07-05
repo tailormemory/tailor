@@ -237,5 +237,60 @@ def test_ingest_live_callsite_wraps_verified_upsert():
     # Failure response shape (contract with the browser extension)
     assert re.search(r'[\'"]persisted[\'"]\s*:\s*False\b', block), \
         'failure response missing "persisted": False'
+    # (C) getter passed so the retry loop re-resolves across maintenance.
+    assert re.search(r'verified_upsert\(\s*\n\s*get_collection\b', block), \
+        "ingest-live must pass get_collection (the getter), not a resolved handle"
+    # (B) honest maintenance branch (503, not the false 'silent-drop' 500).
+    assert re.search(r'reason[\'"]\s*\)\s*==\s*[\'"]maintenance[\'"]', block), \
+        "ingest-live missing the maintenance-vs-silent-drop branch"
+    assert re.search(r'\b503\b', block), \
+        "ingest-live maintenance branch must return 503, not 500"
     assert "silent-drop" in block
     assert "verification failed" in block
+
+
+# ============================================================
+# (C)+(B) — maintenance recovery + honest attribution at the callsites
+# ============================================================
+# Il getter passato a verified_upsert è mcp_server.get_collection, che la
+# fixture patcha. Simulando get_collection()->None si riproduce la finestra
+# di maintenance (SIGUSR1 ha rilasciato ChromaDB) senza toccare i segnali.
+
+
+def test_kb_add_maintenance_returns_honest_error(fake_kb, monkeypatch):
+    """get_collection() None per l'intero budget → errore ONESTO
+    'MCP in maintenance', NON il falso 'chromadb silent-drop'. Nessun
+    entity-index (niente twin-hole)."""
+    monkeypatch.setattr(mcp_server, "get_collection", lambda: None)
+    result = mcp_server.kb_add(content="x", title="y")
+    assert result.startswith("Error saving: MCP in maintenance")
+    assert "silent-drop" not in result
+    assert "NOT persisted" in result
+    assert fake_kb["entity_index_calls"] == []
+
+
+def test_kb_add_recovers_after_maintenance(fake_kb, monkeypatch):
+    """(C) end-to-end sul callsite: None al 1° attempt, live al 2° →
+    kb_add persiste ('Saved to KB:') senza aspettare una query."""
+    coll = fake_kb["coll"]
+    state = {"n": 0}
+
+    def flipping():
+        state["n"] += 1
+        return None if state["n"] < 2 else coll
+
+    monkeypatch.setattr(mcp_server, "get_collection", flipping)
+    result = mcp_server.kb_add(content="x", title="y")
+    assert result.startswith("Saved to KB:")
+    assert state["n"] == 2
+    assert len(fake_kb["entity_index_calls"]) == 1
+    assert len(coll.upsert_calls) == 1
+
+
+def test_kb_update_session_maintenance_returns_honest_error(fake_kb, monkeypatch):
+    """kb_update_session: maintenance → errore onesto, non silent-drop."""
+    monkeypatch.setattr(mcp_server, "get_collection", lambda: None)
+    result = mcp_server.kb_update_session(summary="s", key_facts="k")
+    assert result.startswith("Error saving session: MCP in maintenance")
+    assert "silent-drop" not in result
+    assert fake_kb["entity_index_calls"] == []

@@ -344,3 +344,181 @@ def test_no_sleep_after_last_attempt(monkeypatch):
         retry=1, retry_backoff=5.0,
     )
     assert sleeps == [5.0]
+
+
+# ============================================================
+# (C)+(B) — getter re-resolution across maintenance + honest reason
+# ============================================================
+# Fix per il silent-drop post-maintenance (auto-flush SIGUSR1/SIGUSR2).
+# (C) collection ora accetta un getter, ri-risolto a OGNI attempt: un None
+#     catturato durante la finestra di maintenance recupera all'attempt
+#     successivo (dopo SIGUSR2 mid-backoff).
+# (B) report["reason"] distingue "maintenance" (collection None per l'intero
+#     budget) da "silent_drop" (chromadb frozen-collection reale).
+
+
+def _flipping_getter(coll, live_from_attempt):
+    """Getter che ritorna None (maintenance) finché la chiamata N-esima
+    (1-based) < live_from_attempt, poi `coll`. Traccia il conteggio in
+    getter.calls per le assert di ri-risoluzione."""
+    state = {"n": 0}
+
+    def getter():
+        state["n"] += 1
+        return None if state["n"] < live_from_attempt else coll
+
+    getter.calls = state
+    return getter
+
+
+def test_getter_reresolves_and_recovers_after_maintenance(monkeypatch):
+    """(C): attempt 1 → None (maintenance), attempt 2 re-risolve → live →
+    persiste. La locale NON è più congelata a None per tutto il loop."""
+    monkeypatch.setattr(ih.time, "sleep", lambda d: None)
+    coll = FakeCollection()
+    getter = _flipping_getter(coll, live_from_attempt=2)
+    p = _payload(["a_chunk_0"])
+    report: dict = {}
+    ok = ih.verified_upsert(
+        getter, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
+        run_id="t_maint_recover", source="test", retry=2, report=report,
+    )
+    assert ok is True
+    assert report["reason"] == "ok"
+    assert getter.calls["n"] == 2          # re-risolto: None poi live
+    assert len(coll.upsert_calls) == 1     # solo l'attempt live ha scritto
+    assert "a_chunk_0" in coll.sql
+
+
+def test_maintenance_whole_budget_reports_maintenance_not_silent_drop(monkeypatch):
+    """(B): collection None per tutti e 3 gli attempt → False con
+    reason='maintenance' (NON 'silent_drop'), NESSUN upsert tentato,
+    NESSUN None.upsert() → nessun AttributeError mis-attribuito."""
+    monkeypatch.setattr(ih.time, "sleep", lambda d: None)
+    getter = _flipping_getter(FakeCollection(), live_from_attempt=99)  # mai live
+    p = _payload(["a_chunk_0"])
+    report: dict = {}
+    ok = ih.verified_upsert(
+        getter, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
+        run_id="t_maint_exhausted", source="test", retry=2, report=report,
+    )
+    assert ok is False
+    assert report["reason"] == "maintenance"
+    assert "maintenance" in report["last_error"]
+    assert getter.calls["n"] == 3          # ri-risolto a ogni attempt (retry=2 → 3)
+
+
+def test_real_silent_drop_still_reports_silent_drop(monkeypatch):
+    """(B): collection VALIDA ma sample-get sempre vuoto → il vero
+    frozen-collection resta etichettato 'silent_drop', non 'maintenance'."""
+    monkeypatch.setattr(ih.time, "sleep", lambda d: None)
+    coll = FakeCollection()
+    coll.program_get({"ids": []}, {"ids": []}, {"ids": []})
+    p = _payload(["a_chunk_0"])
+    report: dict = {}
+    ok = ih.verified_upsert(
+        coll, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
+        run_id="t_real_drop", source="test", retry=2, report=report,
+    )
+    assert ok is False
+    assert report["reason"] == "silent_drop"
+    assert len(coll.upsert_calls) == 3
+
+
+def test_maintenance_then_persistent_drop_reports_silent_drop(monkeypatch):
+    """La classificazione riflette l'ULTIMO attempt: maintenance sul primo,
+    poi collection live che droppa → reason='silent_drop' (l'ultimo attempt
+    ha raggiunto una collection reale)."""
+    monkeypatch.setattr(ih.time, "sleep", lambda d: None)
+    coll = FakeCollection()
+    coll.program_get({"ids": []}, {"ids": []})  # attempt 2 e 3 droppano
+    getter = _flipping_getter(coll, live_from_attempt=2)
+    p = _payload(["a_chunk_0"])
+    report: dict = {}
+    ok = ih.verified_upsert(
+        getter, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
+        run_id="t_maint_then_drop", source="test", retry=2, report=report,
+    )
+    assert ok is False
+    assert report["reason"] == "silent_drop"
+    assert getter.calls["n"] == 3
+    assert len(coll.upsert_calls) == 2      # attempt 1 = maintenance (no upsert)
+
+
+def test_retry_zero_accepts_getter():
+    """(C) retry=0: il getter è risolto una volta (parità batch-callsite:
+    l'istanza Collection non-callable resta invariata, il getter callable
+    viene chiamato)."""
+    coll = FakeCollection()
+    p = _payload(["a_chunk_0"])
+    ok = ih.verified_upsert(
+        lambda: coll, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
+        run_id="t_getter_retry0", source="test",
+    )
+    assert ok is True
+    assert len(coll.upsert_calls) == 1
+    assert "a_chunk_0" in coll.sql
+
+
+def test_report_reason_ok_on_first_attempt_success(monkeypatch):
+    """report['reason'] == 'ok' quando il primo attempt persiste (istanza
+    Collection diretta, non getter — retro-compat)."""
+    monkeypatch.setattr(ih.time, "sleep", lambda d: None)
+    coll = FakeCollection()
+    p = _payload(["a_chunk_0"])
+    report: dict = {}
+    ok = ih.verified_upsert(
+        coll, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
+        run_id="t_report_ok", source="test", retry=2, report=report,
+    )
+    assert ok is True
+    assert report["reason"] == "ok"
+
+
+def test_getter_raises_is_caught_as_error_never_propagates(monkeypatch):
+    """(Codex blocker) un getter che SOLLEVA durante reopen/lazy-init deve
+    essere catturato dal retry loop come reason='error', ritentato, e chiudere
+    con False + report popolato — MAI propagato (contratto retry>0: never
+    raises). Distinto dal getter che RITORNA None (→ maintenance)."""
+    monkeypatch.setattr(ih.time, "sleep", lambda d: None)
+    calls = {"n": 0}
+
+    def raising_getter():
+        calls["n"] += 1
+        raise RuntimeError("reopen boom")
+
+    p = _payload(["a_chunk_0"])
+    report: dict = {}
+    ok = ih.verified_upsert(
+        raising_getter, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
+        run_id="t_getter_raise", source="test", retry=2, report=report,
+    )
+    assert ok is False
+    assert report["reason"] == "error"          # non 'maintenance', non {}
+    assert "RuntimeError" in report["last_error"]
+    assert calls["n"] == 3                       # ri-risolto a ogni attempt
+
+
+def test_getter_raise_then_live_recovers(monkeypatch):
+    """Getter che solleva sull'attempt 1 (transiente) e ritorna live sul 2 →
+    il retry recupera e persiste (reason='ok')."""
+    monkeypatch.setattr(ih.time, "sleep", lambda d: None)
+    coll = FakeCollection()
+    state = {"n": 0}
+
+    def getter():
+        state["n"] += 1
+        if state["n"] < 2:
+            raise RuntimeError("transient reopen failure")
+        return coll
+
+    p = _payload(["a_chunk_0"])
+    report: dict = {}
+    ok = ih.verified_upsert(
+        getter, p["ids"], p["embeddings"], p["documents"], p["metadatas"],
+        run_id="t_getter_raise_recover", source="test", retry=2, report=report,
+    )
+    assert ok is True
+    assert report["reason"] == "ok"
+    assert state["n"] == 2
+    assert "a_chunk_0" in coll.sql
