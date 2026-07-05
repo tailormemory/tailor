@@ -97,6 +97,21 @@ Template for upcoming changes. Move entries under a new version heading on relea
 
 ### Fixed
 
+- **Fix silent-drop delle scritture post-maintenance.** Durante la finestra di
+  maintenance dell'auto-flush (SIGUSR1→SIGUSR2, ChromaDB rilasciato), le scritture
+  (`kb_add`, `kb_update_session`, `/api/ingest-live`) risolvevano l'handle collection
+  UNA volta e lo passavano congelato al retry loop: se cadeva nella finestra, restava
+  `None` per tutti i tentativi -> `None.upsert()` inghiottito e mis-etichettato come
+  falso "chromadb silent-drop", contenuto perso in silenzio. Fix (C): `verified_upsert`
+  ora ri-risolve la collection a OGNI retry (accetta un getter oltre a un handle),
+  così un `None` catturato in maintenance viene ri-fetchato al tentativo successivo e
+  persiste. Fix (B): distingue `None per maintenance` (errore onesto "in maintenance,
+  ritenta" / HTTP 503) dal vero silent-drop chromadb, eliminando i falsi positivi
+  "frozen-collection" dalla telemetria a ogni ciclo flush. Un getter che solleva è
+  classificato `error` (contratto "retry>0 never raises" preservato). Batch-caller
+  (retry=0) invariati. File: [`mcp_server.py`](mcp_server.py),
+  [`scripts/lib/ingest_helpers.py`](scripts/lib/ingest_helpers.py).
+
 - **Fact derivation: ripresa incrementale con priorità ai nuovi.** La derivation
   notturna ripartiva da capo a ogni run (`last_run` non avanzava sui run killati
   da SIGTERM, resume-list azzerata dopo 1h) -> ri-processava sempre le stesse
