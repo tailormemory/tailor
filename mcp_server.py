@@ -1925,6 +1925,39 @@ def _compose_rerank_pool(items: list, n_results: int) -> list:
     return deduped
 
 
+def _cosine_relevance(q_vec, c_vec) -> float:
+    """Cosine similarity clampata a [0,1], stessa scala di max(0, 1-dist) del ramo semantic.
+
+    La collection tailor_kb_v2 e' creata con hnsw:space=cosine, quindi il ramo semantic
+    produce relevance = max(0, 1 - cosine_distance) = max(0, cosine_similarity). Restituire
+    qui la stessa quantita' rende i due rami comparabili senza calibrazione ne' normalizzazione
+    di scala.
+
+    Normalizzazione ESPLICITA (dot / (norm*norm)): nomic-embed-text NON garantisce vettori
+    L2-normalizzati; Chroma normalizza internamente per lo spazio cosine, noi no → il dot
+    product nudo sarebbe sbagliato. Clamp a max(0.0, cos).
+
+    Fallback → 0.0 (mai 0.5: 0.5 non e' neutro, e' medio-alto e scavalcherebbe candidati con
+    cosine reale bassa). Se il vettore e' assente o di dimensione inattesa lo score degrada a
+    0.0 e NON solleva: un embedding mancante non deve far fallire una search.
+    Nota: c_vec arriva da Chroma come numpy.ndarray → niente test di verita' booleano nudo
+    (solleverebbe "ambiguous truth value"); si controlla None e size esplicitamente.
+    """
+    import numpy as np
+    if q_vec is None or c_vec is None:
+        return 0.0
+    q = np.asarray(q_vec, dtype=float).ravel()
+    c = np.asarray(c_vec, dtype=float).ravel()
+    if q.size == 0 or c.size == 0 or q.size != c.size:
+        return 0.0
+    nq = float(np.linalg.norm(q))
+    nc = float(np.linalg.norm(c))
+    if nq == 0.0 or nc == 0.0:
+        return 0.0
+    cos = float(np.dot(q, c) / (nq * nc))
+    return max(0.0, cos)
+
+
 def _hybrid_collect(query: str, n_results: int, source_filter: str,
                     include_superseded: bool, *, diag: bool = False) -> dict:
     """STEP 1-3b della pipeline hybrid: retrieval semantic + entity + supersede filter.
@@ -2063,28 +2096,58 @@ def _hybrid_collect(query: str, n_results: int, source_filter: str,
     if new_entity_ids:
         # Limita per non esplodere. Deterministico è SOLO *quali* 100 chunk
         # entrano qui: sorted(candidates) + ORDER BY chunk_id rendono questo
-        # slice ripetibile a parità di query. NON è garantito l'ordine finale
-        # degli entity nei risultati: collection.get(ids=...) non assicura di
-        # preservare l'ordine richiesto, e con score 0.5 fisso + date spesso
-        # uguali il rank entity può ereditare l'ordine di ritorno di Chroma.
+        # slice ripetibile a parità di query. NB: questo cap [:100] agisce PRIMA
+        # di qualsiasi ranking (Livello B, fuori scope) — il cosine sotto ordina
+        # correttamente ciò che è stato fetchato ma non recupera un gold già
+        # tagliato dal cap. L'ordine finale degli entity ora deriva dallo score
+        # cosine reale (non più dal 0.5 fisso): a valle _compose_rerank_pool
+        # ordina per (-score, date), quindi il rank entity riflette la rilevanza.
         new_entity_ids = new_entity_ids[:100]
         FETCH_BATCH = 40
         for i in range(0, len(new_entity_ids), FETCH_BATCH):
             batch_ids = new_entity_ids[i:i + FETCH_BATCH]
             try:
-                batch_result = collection.get(ids=batch_ids, include=["documents", "metadatas"])
-                for cid, doc, meta in zip(batch_result["ids"], batch_result["documents"], batch_result["metadatas"]):
+                import numpy as np
+                batch_result = collection.get(ids=batch_ids, include=["documents", "metadatas", "embeddings"])
+                # ZIP SU batch_result["ids"], MAI su batch_ids. collection.get() NON preserva
+                # l'ordine di batch_ids (Chroma ritorna in ordine di id) e DROPPA gli id
+                # inesistenti accorciando TUTTI gli array in modo coerente (verificato su
+                # chromadb 1.5.9: nessun None interposto, cardinalita' ids==docs==metas==emb).
+                # Zippare i 4 array della STESSA risposta e' quindi sicuro e allineato per
+                # posizione. Zippare su batch_ids romperebbe in silenzio l'allineamento
+                # score↔chunk (embedding di un altro id assegnato al cid sbagliato): e' il
+                # punto in cui una futura modifica introdurrebbe un bug invisibile.
+                b_ids = batch_result["ids"]
+                b_docs = batch_result["documents"]
+                b_metas = batch_result["metadatas"]
+                b_embs = batch_result["embeddings"]
+                # embeddings e' un numpy.ndarray 2D (N,768): niente "if not b_embs".
+                # Se assente/vuoto → tutti gli score degradano a fallback 0.0 via _cosine_relevance.
+                n_emb = 0 if b_embs is None else len(b_embs)
+                for _j, (cid, doc, meta) in enumerate(zip(b_ids, b_docs, b_metas)):
                     if source_filter and meta.get("source", "") != source_filter:
                         continue
                     if cid not in seen_ids:
+                        vec = b_embs[_j] if _j < n_emb else None
+                        score = _cosine_relevance(embedding, vec)
+                        # score_source rispecchia la condizione di fallback dell'helper:
+                        # "cosine" solo se il vettore esiste ed ha la dimensione attesa.
+                        # np.asarray(vec).size (non getattr "size"): _cosine_relevance fa
+                        # np.asarray internamente e accetta anche list → su una list
+                        # getattr(vec,"size",0)=0 darebbe "fallback" mentre il cosine e'
+                        # stato calcolato davvero. Le due condizioni devono coincidere per
+                        # costruzione, non perche' Chroma 1.5.9 ritorna ndarray.
+                        vec_size = int(np.asarray(vec).size) if vec is not None else 0
+                        score_source = "cosine" if vec_size == len(embedding) else "fallback"
                         seen_ids[cid] = {
-                            "doc": doc, "meta": meta, "score": 0.5,
+                            "doc": doc, "meta": meta, "score": score,
                             "source_type": "entity", "date": meta.get("date", "")
                         }
                         if diag:
                             entity_post_snapshot.append({
                                 "chunk_id": cid, "rank": len(entity_post_snapshot),
-                                "score": 0.5, "source_type": "entity",
+                                "score": score, "score_source": score_source,
+                                "source_type": "entity",
                                 "doc_type": str(meta.get("doc_type", ""))[:64]
                             })
             except Exception:
