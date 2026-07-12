@@ -139,3 +139,83 @@ def test_query_senza_entity_pool_bit_identico(_no_entity_env):
     assert out["seen_ids"] == expected
     # nessun candidato entity materializzato
     assert all(v["source_type"] == "semantic" for v in out["seen_ids"].values())
+
+
+# ── 3. Livello B1: dedup order-preserving di new_entity_ids prima del cap ──────
+
+class _FetchStubCollection:
+    """query() → semantic vuoto (isola il ramo entity); get() registra gli id richiesti
+    e ritorna array allineati con embedding fittizio."""
+
+    def __init__(self):
+        self.requested_ids = []  # concatenazione ordinata di tutti i batch_ids visti
+
+    def query(self, **kwargs):
+        return {"documents": [[]], "metadatas": [[]], "distances": [[]], "ids": [[]]}
+
+    def get(self, ids=None, include=None, **kwargs):
+        self.requested_ids.extend(ids)
+        n = len(ids)
+        return {
+            "ids": list(ids),
+            "documents": [f"doc-{c}" for c in ids],
+            "metadatas": [{"date": ""} for _ in ids],
+            "embeddings": [[0.5, 0.5, 0.5] for _ in range(n)],
+        }
+
+
+def _build_entity_index(path):
+    """entity_index con 3 entita' che condividono chunk_id → duplicati garantiti.
+
+    sorted(candidates) itera: Alburnea, Ninfa, Usufrutto (i bi/tri-grammi non matchano
+    nessuna entity). Con ORDER BY chunk_id:
+      Alburnea  → [c1, c3]
+      Ninfa     → [c1, c2]   (c1 duplica Alburnea)
+      Usufrutto → [c2, c4]   (c2 duplica Ninfa)
+    """
+    import sqlite3
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE entity_index (entity TEXT, chunk_id TEXT)")
+    rows = [
+        ("Alburnea", "c1"), ("Alburnea", "c3"),
+        ("Ninfa", "c1"), ("Ninfa", "c2"),
+        ("Usufrutto", "c2"), ("Usufrutto", "c4"),
+    ]
+    conn.executemany("INSERT INTO entity_index VALUES (?, ?)", rows)
+    conn.commit()
+    conn.close()
+
+
+def test_dedup_order_preserving_prima_del_cap(monkeypatch, tmp_path):
+    _build_entity_index(str(tmp_path / "entity_index.sqlite3"))
+    stub = _FetchStubCollection()
+    monkeypatch.setattr(mcp_server, "DB_DIR", str(tmp_path))
+    monkeypatch.setattr(mcp_server, "get_embedding", lambda q: [0.5, 0.5, 0.5])
+    monkeypatch.setattr(mcp_server, "get_collection", lambda: stub)
+    monkeypatch.setattr(mcp_server, "_get_collection_readonly", lambda: stub)
+
+    out = mcp_server._hybrid_collect(
+        "Ninfa Alburnea Usufrutto", n_results=5, source_filter="",
+        include_superseded=True, diag=True,
+    )
+
+    pre = out["stages"]["entity_candidates_pre_cap"]
+    # 6 righe pre-dedup (2 per entita'), 4 unici, 2 duplicati (c1, c2)
+    assert pre["rows_appended"] == 6
+    assert pre["unique_count"] == 4
+    assert pre["duplicates_dropped"] == 2
+    assert pre["count"] == 4
+    assert pre["unique_lost_to_cap"] == 0  # 4 < 100
+
+    # ordine di PRIMA APPARIZIONE preservato: Alburnea(c1,c3) → Ninfa(c1 dup, c2) → Usufrutto(c2 dup, c4)
+    order = [it["chunk_id"] for it in pre["items"]]
+    assert order == ["c1", "c3", "c2", "c4"]
+    assert len(order) == len(set(order))  # nessun duplicato residuo
+
+    # il cap/get ha visto SOLO unici, nell'ordine di prima apparizione, ciascuno una volta
+    assert stub.requested_ids == ["c1", "c3", "c2", "c4"]
+    assert len(stub.requested_ids) == len(set(stub.requested_ids))
+
+    # side effect finale: 4 chunk entity materializzati in seen_ids
+    assert set(out["seen_ids"].keys()) == {"c1", "c3", "c2", "c4"}
+    assert all(v["source_type"] == "entity" for v in out["seen_ids"].values())

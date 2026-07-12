@@ -129,6 +129,16 @@ from scripts.lib.config_runtime import apply_pending_rollback
 apply_pending_rollback(os.path.join(BASE_DIR, "config", "tailor.yaml"))
 
 DB_DIR = os.path.join(BASE_DIR, "db")
+
+# Cap sui candidati entity fetchati in _hybrid_collect() STEP 3. Agisce PRIMA di
+# qualsiasi ranking: limita quanti chunk_id (deduplicati, order-preserving) vengono
+# materializzati via collection.get() prima che il cosine li ordini. Il fetch costa
+# ~10ms/100 chunk, quindi 100 potrebbe essere conservativo — valore SOTTO REVISIONE
+# (Livello B2). Usato sia dallo slice reale sia dalla metrica diag unique_lost_to_cap:
+# tenerli sulla stessa costante rende la coincidenza strutturale, non accidentale
+# (altrimenti B2 alzerebbe il cap ma la metrica continuerebbe a misurare contro 100).
+ENTITY_FETCH_CAP = 100
+
 # Embedding: loaded from lib.embedding (config-driven)
 from embedding import get_embedding, get_embeddings, info as embedding_info
 # Collection name from config
@@ -2076,16 +2086,40 @@ def _hybrid_collect(query: str, n_results: int, source_filter: str,
 
     # --- STEP 3: Retrieve chunks from entity hits (only those not already found) ---
     _t2 = _now()
+    # Dedup ORDER-PRESERVING (Livello B1): lo stesso cid compare in piu' entity_hit
+    # (una query con 3 entita' produceva 277 righe / 109 uniche → 61% duplicati). Il test
+    # `cid not in seen_ids` NON li intercetta: seen_ids qui contiene solo i candidati
+    # semantici e non viene aggiornato durante questo loop.
+    # NB perche' i due numeri non si contraddicono: i duplicati NON sono distribuiti
+    # uniformemente, si CONCENTRANO oltre il cap. Le entita' sono iterate in ordine
+    # alfabetico (sorted(candidates)); le prime emettono chunk nuovi, le successive
+    # ripetono in gran parte chunk gia' emessi. Nei primi ENTITY_FETCH_CAP slot cadono
+    # solo ~2 doppioni (→ ~98 unici su 100), mentre i restanti ~166 duplicati stanno
+    # TUTTI dopo il cap. Quindi senza dedup il cap taglia una lista gonfiata alla coda
+    # ma quasi-pulita in testa. Dedup: seen-set + lista, NON set() nudo — l'ordine di
+    # prima apparizione deve restare deterministico.
     new_entity_ids = []
+    _entity_seen = set()
+    _rows_appended = 0  # righe che il vecchio codice avrebbe appeso (pre-dedup)
     for hit in entity_hits:
         for cid in hit["chunk_ids"]:
-            if cid not in seen_ids:
-                new_entity_ids.append(cid)
+            if cid in seen_ids:
+                continue
+            _rows_appended += 1
+            if cid in _entity_seen:
+                continue  # duplicato: prima apparizione gia' registrata
+            _entity_seen.add(cid)
+            new_entity_ids.append(cid)
 
     if diag:
         # pre-cap: solo chunk_id noti (non ancora fetchati) → doc_type/score sconosciuti.
+        _unique_count = len(new_entity_ids)
         stages["entity_candidates_pre_cap"] = {
-            "count": len(new_entity_ids),
+            "count": _unique_count,
+            "rows_appended": _rows_appended,          # totale righe pre-dedup (vecchio count)
+            "unique_count": _unique_count,            # unici dopo dedup
+            "duplicates_dropped": _rows_appended - _unique_count,
+            "unique_lost_to_cap": max(0, _unique_count - ENTITY_FETCH_CAP),  # unici scartati dal cap
             "entities_recognized": [h["entity"] for h in entity_hits],
             "items": [{"chunk_id": c, "rank": i, "score": None,
                        "source_type": "entity", "doc_type": None}
@@ -2094,15 +2128,15 @@ def _hybrid_collect(query: str, n_results: int, source_filter: str,
 
     entity_post_snapshot = [] if diag else None
     if new_entity_ids:
-        # Limita per non esplodere. Deterministico è SOLO *quali* 100 chunk
-        # entrano qui: sorted(candidates) + ORDER BY chunk_id rendono questo
-        # slice ripetibile a parità di query. NB: questo cap [:100] agisce PRIMA
-        # di qualsiasi ranking (Livello B, fuori scope) — il cosine sotto ordina
-        # correttamente ciò che è stato fetchato ma non recupera un gold già
+        # Limita per non esplodere. Deterministico è SOLO *quali* chunk entrano
+        # qui: sorted(candidates) + ORDER BY chunk_id rendono questo slice
+        # ripetibile a parità di query. NB: questo cap (ENTITY_FETCH_CAP) agisce
+        # PRIMA di qualsiasi ranking (Livello B, fuori scope) — il cosine sotto
+        # ordina correttamente ciò che è stato fetchato ma non recupera un gold già
         # tagliato dal cap. L'ordine finale degli entity ora deriva dallo score
         # cosine reale (non più dal 0.5 fisso): a valle _compose_rerank_pool
         # ordina per (-score, date), quindi il rank entity riflette la rilevanza.
-        new_entity_ids = new_entity_ids[:100]
+        new_entity_ids = new_entity_ids[:ENTITY_FETCH_CAP]
         FETCH_BATCH = 40
         for i in range(0, len(new_entity_ids), FETCH_BATCH):
             batch_ids = new_entity_ids[i:i + FETCH_BATCH]
@@ -2154,7 +2188,7 @@ def _hybrid_collect(query: str, n_results: int, source_filter: str,
                 pass
     if diag:
         timings["entity_fetch_ms"] = (_now() - _t2) * 1000.0
-        # post-cap: fetchati e aggiunti (post slice [:100], post source_filter, PRE-supersede).
+        # post-cap: fetchati e aggiunti (post slice [:ENTITY_FETCH_CAP], post source_filter, PRE-supersede).
         stages["entity_candidates_post_cap"] = {
             "count": len(entity_post_snapshot), "items": entity_post_snapshot
         }
