@@ -1108,10 +1108,7 @@ class BearerAuthMiddleware:
                     pass
                 # Embed and upsert
                 try:
-                    embedding = get_embeddings(text[:4000])
-                    # Flatten if nested list (some providers return [[...]])
-                    if embedding and isinstance(embedding[0], list):
-                        embedding = embedding[0]
+                    embedding = get_embeddings([text[:4000]])[0]
                     # Parse timestamp once, derive both create_time and date_str
                     # from the parsed datetime to keep them consistent. If parsing
                     # fails, both fall back to safe empty/zero values (no garbage
