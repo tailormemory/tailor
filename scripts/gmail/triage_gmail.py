@@ -679,18 +679,35 @@ def run_sync(resume=False):
     total = len(emails)
     log(f"[sync] Email nel file export: {total:,}")
 
-    # C3: custom_id duplicati nell'export = invariante rotta. L'export e'
-    # append-only e ri-scarica gli id usciti dalla finestra 10k del checkpoint,
-    # quindi i duplicati sono possibili per costruzione. Con last-wins in
-    # progress e nel merge un verdetto sovrascrive l'altro in silenzio: fail
-    # esplicito PRIMA di qualsiasi lavoro, niente dedup automatico nascosto.
-    id_counts = collections.Counter(e.get("id", "") for e in emails)
+    # C3: due invarianti dell'export DIVERSE, gate separati con messaggi
+    # distinti (missing-id != duplicate-id). Entrambi PRIMA di qualsiasi lavoro
+    # e prima della rimozione del progress file. Niente dedup automatico.
+
+    # Gate 1 — MISSING/EMPTY ID: senza id non c'e' chiave di join per il merge
+    # ne' per il progress. Non collassare questi sulla chiave "" (mentirebbe
+    # dicendo "duplicato"): sono un problema a se'.
+    missing = [i for i, e in enumerate(emails) if not e.get("id")]
+    if missing:
+        log(f"[sync] FALLITO: {len(missing):,} email senza id in {INPUT_FILE} "
+            f"— impossibile triagiare email senza id (nessuna chiave di join).")
+        for idx in missing[:20]:
+            log(f"[sync]   NO-ID riga {idx}")
+        if len(missing) > 20:
+            log(f"[sync]   ... e altre {len(missing) - 20:,} righe")
+        return 1
+
+    # Gate 2 — DUPLICATE ID: su soli id NON vuoti. L'export e' append-only e
+    # ri-scarica gli id usciti dalla finestra 10k del checkpoint, quindi i
+    # duplicati sono possibili per costruzione. Con last-wins in progress e nel
+    # merge un verdetto sovrascrive l'altro in silenzio: fail esplicito.
+    id_counts = collections.Counter(e.get("id") for e in emails)
     dup_ids = {i: n for i, n in id_counts.items() if n > 1}
     if dup_ids:
         log(f"[sync] FALLITO: {len(dup_ids):,} custom_id duplicati in {INPUT_FILE} "
-            f"(export append-only). Deduplica o rigenera l'export prima del run.")
+            f"(export append-only): lo stesso id appare piu' volte. "
+            f"Deduplica o rigenera l'export prima del run.")
         for cid, n in list(dup_ids.items())[:20]:
-            log(f"[sync]   DUP {cid or '<vuoto>'}: {n} righe")
+            log(f"[sync]   DUP {cid}: {n} righe")
         if len(dup_ids) > 20:
             log(f"[sync]   ... e altri {len(dup_ids) - 20:,} id")
         return 1

@@ -170,3 +170,29 @@ def test_run_sync_fails_on_duplicate_export_ids(tmp_path, monkeypatch):
 
     assert rc == 1, f"expected exit 1 on duplicate export ids, got {rc!r}"
     assert called == [], "provider must NOT run when the export has duplicate ids"
+
+
+def test_run_sync_reports_missing_id_not_duplicate(tmp_path, monkeypatch, capsys):
+    """C3 split: two emails with id="" must be reported as MISSING-ID, not
+    collapsed onto the "" key and mislabeled as duplicates. Fails on the old
+    code (Counter(get("id","")) -> {"": 2} -> 'duplicati')."""
+    emails = [
+        {"id": "", "from": "a@x.it", "subject": "s1", "snippet": "hello"},
+        {"id": "", "from": "b@x.it", "subject": "s2", "snippet": "world"},
+        {"id": "e3", "from": "c@x.it", "subject": "s3", "snippet": "ok"},
+    ]
+    called = []
+
+    def fake_call(email):
+        called.append(email.get("id"))
+        return email.get("id"), {"useful": True}
+
+    _wire(tmp_path, monkeypatch, emails, fake_call)
+
+    rc = tg.run_sync(resume=False)
+
+    assert rc == 1, f"expected exit 1 on missing id, got {rc!r}"
+    assert called == [], "provider must NOT run when the export has emails without id"
+    out = capsys.readouterr().out
+    assert "senza id" in out, "must report the MISSING-ID cause"
+    assert "duplicati" not in out, "must NOT mislabel missing ids as duplicates"
