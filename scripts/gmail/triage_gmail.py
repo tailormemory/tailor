@@ -21,6 +21,7 @@ import sys
 import json
 import time
 import glob
+import collections
 import random
 import threading
 import concurrent.futures
@@ -630,18 +631,33 @@ def _load_sync_progress():
     if not os.path.exists(SYNC_PROGRESS_FILE):
         return {}
     progress = {}
+    corrupt = []  # (lineno, motivo) — C2: mai saltare in silenzio
     with open(SYNC_PROGRESS_FILE, "r", encoding="utf-8") as f:
-        for line in f:
+        for lineno, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
                 continue
             try:
                 rec = json.loads(line)
-                cid = rec.get("custom_id")
-                if cid:
-                    progress[cid] = {k: v for k, v in rec.items() if k != "custom_id"}
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as e:
+                corrupt.append((lineno, f"JSON non valido: {e}"))
                 continue
+            cid = rec.get("custom_id")
+            if not cid:
+                corrupt.append((lineno, "record senza custom_id"))
+                continue
+            progress[cid] = {k: v for k, v in rec.items() if k != "custom_id"}
+    if corrupt:
+        # C2: il journal di recupero NON deve nascondere la propria corruzione.
+        # Segnala path + numero di riga e solleva — precondizione rotta, il run
+        # non prosegue su uno stato di resume inaffidabile.
+        shown = "; ".join(f"riga {ln}: {msg}" for ln, msg in corrupt[:20])
+        extra = f" (+{len(corrupt) - 20} altre)" if len(corrupt) > 20 else ""
+        raise ValueError(
+            f"progress file corrotto: {SYNC_PROGRESS_FILE} — "
+            f"{len(corrupt)} riga/e non valide: {shown}{extra}. "
+            f"Ripara o rimuovi il file prima di riprovare il resume."
+        )
     return progress
 
 
@@ -662,6 +678,22 @@ def run_sync(resume=False):
     emails = load_emails()
     total = len(emails)
     log(f"[sync] Email nel file export: {total:,}")
+
+    # C3: custom_id duplicati nell'export = invariante rotta. L'export e'
+    # append-only e ri-scarica gli id usciti dalla finestra 10k del checkpoint,
+    # quindi i duplicati sono possibili per costruzione. Con last-wins in
+    # progress e nel merge un verdetto sovrascrive l'altro in silenzio: fail
+    # esplicito PRIMA di qualsiasi lavoro, niente dedup automatico nascosto.
+    id_counts = collections.Counter(e.get("id", "") for e in emails)
+    dup_ids = {i: n for i, n in id_counts.items() if n > 1}
+    if dup_ids:
+        log(f"[sync] FALLITO: {len(dup_ids):,} custom_id duplicati in {INPUT_FILE} "
+            f"(export append-only). Deduplica o rigenera l'export prima del run.")
+        for cid, n in list(dup_ids.items())[:20]:
+            log(f"[sync]   DUP {cid or '<vuoto>'}: {n} righe")
+        if len(dup_ids) > 20:
+            log(f"[sync]   ... e altri {len(dup_ids) - 20:,} id")
+        return 1
 
     if not resume and os.path.exists(SYNC_PROGRESS_FILE):
         os.remove(SYNC_PROGRESS_FILE)

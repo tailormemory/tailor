@@ -18,6 +18,8 @@ import json
 import os
 import sys
 
+import pytest
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "scripts", "lib"))
@@ -126,3 +128,45 @@ def test_fresh_run_full_success_exits_zero(tmp_path, monkeypatch):
     rows = [json.loads(l) for l in (tmp_path / "triage_out.jsonl").read_text().splitlines() if l.strip()]
     assert len(rows) == len(_EMAILS)
     assert all(r.get("useful") is not None and "triage_error" not in r for r in rows)
+
+
+def test_load_sync_progress_raises_on_corrupt_line(tmp_path, monkeypatch):
+    """C2: a malformed JSONL line in the progress journal must be DETECTED and
+    reported with file path + line number, never silently skipped. Fails on the
+    old code (silently continues and returns a dict)."""
+    p = tmp_path / "sync_progress.jsonl"
+    p.write_text(
+        json.dumps({"custom_id": "e1", "useful": True}) + "\n"
+        + "{ this is not valid json\n"                      # line 2: corrupt
+        + json.dumps({"custom_id": "e2", "useful": False}) + "\n"
+    )
+    monkeypatch.setattr(tg, "SYNC_PROGRESS_FILE", str(p))
+
+    with pytest.raises(ValueError) as ei:
+        tg._load_sync_progress()
+
+    msg = str(ei.value)
+    assert str(p) in msg, "error must report the progress file path"
+    assert "riga 2" in msg, "error must report the corrupt line number"
+
+
+def test_run_sync_fails_on_duplicate_export_ids(tmp_path, monkeypatch):
+    """C3: duplicate custom_id in the export must fail explicitly BEFORE any
+    work. Fails on the old code (no dedup guard -> provider called, exit 0)."""
+    emails = [
+        {"id": "e1", "from": "a@x.it", "subject": "s1", "snippet": "hello"},
+        {"id": "e1", "from": "a2@x.it", "subject": "s1-bis", "snippet": "other"},
+        {"id": "e2", "from": "b@x.it", "subject": "s2", "snippet": "world"},
+    ]
+    called = []
+
+    def fake_call(email):
+        called.append(email["id"])
+        return email["id"], {"useful": True}
+
+    _wire(tmp_path, monkeypatch, emails, fake_call)
+
+    rc = tg.run_sync(resume=False)
+
+    assert rc == 1, f"expected exit 1 on duplicate export ids, got {rc!r}"
+    assert called == [], "provider must NOT run when the export has duplicate ids"
