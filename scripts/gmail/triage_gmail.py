@@ -668,10 +668,20 @@ def run_sync(resume=False):
         log(f"[sync] Progress file precedente rimosso (fresh run)")
 
     progress = _load_sync_progress() if resume else {}
+    # DIFETTO 1 fix: un record con `error` (o useful=None) NON conta come
+    # "gia' processato" ai fini del resume — va ritentato. Solo i successi
+    # (useful in {true,false}, nessun errore) vengono saltati. Gli errori
+    # restano scritti nel progress file (tracciati) ma non bloccano il retry.
+    done_ok = {
+        cid for cid, rec in progress.items()
+        if rec.get("error") is None and rec.get("useful") is not None
+    }
     if progress:
-        log(f"[sync] Resume: {len(progress):,} email gia' processate, skip")
+        retryable = len(progress) - len(done_ok)
+        log(f"[sync] Resume: {len(done_ok):,} email gia' completate (skip), "
+            f"{retryable:,} da ritentare (errore precedente)")
 
-    todo = [e for e in emails if e.get("id", "") not in progress]
+    todo = [e for e in emails if e.get("id", "") not in done_ok]
     log(f"[sync] Da processare: {len(todo):,} (workers={SYNC_MAX_WORKERS})")
 
     if todo:
@@ -722,6 +732,29 @@ def run_sync(resume=False):
     log(f"  Errori: {error_count:,}")
     log(f"  Totale: {len(emails):,}")
     log(f"  File: {OUTPUT_FILE}")
+
+    # DIFETTO 2 fix: fail-loud. Se restano email non triagiate (errore residuo
+    # o nessun risultato), esci NON-ZERO con riepilogo esplicito. Questa
+    # pipeline non deve piu' dichiarare successo senza aver fatto il lavoro.
+    residual = [
+        (email.get("id", ""),
+         progress.get(email.get("id", ""), {}).get("error") or "nessun risultato")
+        for email in emails
+        if progress.get(email.get("id", ""), {}).get("error") is not None
+        or progress.get(email.get("id", ""), {}).get("useful") is None
+    ]
+
+    if residual:
+        log(f"[sync] FALLITO: {len(residual):,} email NON triagiate (errore residuo).")
+        for cid, err in residual[:50]:
+            log(f"[sync]   FAIL {cid}: {err}")
+        if len(residual) > 50:
+            log(f"[sync]   ... e altre {len(residual) - 50:,} (dettaglio in {OUTPUT_FILE})")
+        log(f"[sync] Ritenta con: triage_gmail.py run-sync --resume")
+        return 1
+
+    log(f"[sync] OK: tutte le {len(emails):,} email triagiate, zero errori residui.")
+    return 0
 
 
 # ============================================================
@@ -825,7 +858,7 @@ if __name__ == "__main__":
         run(resume=resume)
     elif cmd == "run-sync":
         resume = "--resume" in sys.argv
-        run_sync(resume=resume)
+        sys.exit(run_sync(resume=resume))
     elif cmd == "prepare":
         prepare()
     elif cmd == "submit-next":
