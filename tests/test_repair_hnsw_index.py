@@ -353,7 +353,7 @@ def test_apply_repairs_orphans_via_upsert(synthetic_db):
     coll = FakeCollection()
     result = rhi.repair(report, embed_fn=_deterministic_embed, collection=coll, batch_size=2)
     assert result["repaired"] == 4
-    assert result["skipped_oversize"] == 0
+    assert result["skipped_empty"] == 0
     upserted_ids = [i for call in coll.upsert_calls for i in call["ids"]]
     assert sorted(upserted_ids) == sorted(synthetic_db["expected_orphan_ids"])
 
@@ -657,7 +657,7 @@ def test_apply_skips_auto_persist_when_repair_set_is_empty(synthetic_db, monkeyp
 
     # Make repair return an empty ids list
     def _fake_repair(report, *, embed_fn, collection, batch_size=10, progress=None):
-        return {"repaired": 0, "batches": 0, "skipped_oversize": 4, "repaired_ids": []}
+        return {"repaired": 0, "batches": 0, "skipped_empty": 4, "repaired_ids": []}
     monkeypatch.setattr(rhi, "repair", _fake_repair)
 
     rc = rhi.main(["--apply", "--no-history"])
@@ -708,8 +708,11 @@ def test_apply_records_mtime_did_not_advance(synthetic_db, monkeypatch):
     assert payload["auto_persist"]["triggered"] is True
 
 
-def test_doc_chunk_embedding_text_includes_prefix(synthetic_db):
-    """White-box: re-embed text for doc chunks must reconstruct the ingest_docs prefix."""
+def test_doc_chunk_embedding_text_is_nudo_per_contract(synthetic_db):
+    """Contratto unico: il testo re-embeddato e' il documento NUDO (troncato),
+    SENZA prefisso folder/doc_type/title. Regressione che impedisce di
+    reintrodurre il prefisso, che romperebbe la simmetria query/corpus (la query
+    e' embeddata nuda). Sostituisce il vecchio test che codificava il prefisso."""
     report = rhi.audit(db_path=synthetic_db["db_path"], db_dir=synthetic_db["db_dir"])
     coll = FakeCollection()
 
@@ -723,13 +726,44 @@ def test_doc_chunk_embedding_text_includes_prefix(synthetic_db):
     # Find the text used for a doc chunk and a summary chunk
     doc_text = next(t for t in captured_texts if "orphan body 0" in t)
     summary_text = next(t for t in captured_texts if "summary text alpha" in t)
-    # Doc chunk gets prefix
-    assert "Cartella: Wealth" in doc_text
-    assert "Tipo: spreadsheet" in doc_text
-    assert "File: orphan.pdf" in doc_text
-    # Summary chunk does NOT get an extra prefix (uses chroma:document as-is)
+    # Doc chunk: NIENTE prefisso ricostruito — testo nudo == chroma:document
+    assert doc_text == "orphan body 0"
+    assert "Cartella:" not in doc_text
+    assert "Tipo:" not in doc_text
+    assert "File:" not in doc_text
+    # Summary chunk: nudo, invariato
     assert summary_text == "summary text alpha"
     assert "Cartella:" not in summary_text
+
+
+def test_apply_canonicalizes_oversize_chunk():
+    """--apply CANONICALIZZA, non ripristina: un orphan con documento >
+    MAX_EMBED_CHARS viene ricostruito TRONCATO (vettore != storico) e contato a
+    parte in `migrated_truncated`. Guardia della policy dichiarata in docstring."""
+    long_doc = "x" * (rhi.MAX_EMBED_CHARS + 1234)
+    orphan = rhi.OrphanChunk(
+        embedding_id="doc_zzzzzzzzzzzz_chunk_0000", int_id=1,
+        metadata={"source": "document", "conv_id": "doc_zzzzzzzzzzzz",
+                  "title": "big.pdf", "chroma:document": long_doc},
+        classification="known_document",
+    )
+    report = rhi.DriftReport(
+        timestamp="t", timestamp_unix=0, db_path="x",
+        metadata_segment=META_SEG_ID, vector_segment=VEC_SEG_ID,
+        sql_total=1, hnsw_total=0, queue_total=0,
+        queue_oldest_iso=None, queue_newest_iso=None,
+        collection_queue_pending_count=0,
+        sql_only_orphans=[orphan], hnsw_only_ghosts=[], unknown_count=0,
+    )
+    coll = FakeCollection()
+    result = rhi.repair(report, embed_fn=_deterministic_embed, collection=coll, batch_size=10)
+    assert result["repaired"] == 1
+    assert result["migrated_truncated"] == 1
+    assert result["skipped_empty"] == 0
+    # documento salvato == testo troncato al contratto (canonicalizzato)
+    doc_saved = coll.upsert_calls[0]["documents"][0]
+    assert len(doc_saved) == rhi.MAX_EMBED_CHARS
+    assert doc_saved == long_doc[: rhi.MAX_EMBED_CHARS]
 
 
 # ============================================================
@@ -937,7 +971,7 @@ def test_apply_proceeds_with_modern_ghosts_present(synthetic_db_with_modern_ghos
         batch_size=10,
     )
     assert result["repaired"] == 4
-    assert result["skipped_oversize"] == 0
+    assert result["skipped_empty"] == 0
     upserted_ids = sorted(i for call in coll.upsert_calls for i in call["ids"])
     assert upserted_ids == sorted(
         synthetic_db_with_modern_ghosts["expected_orphan_ids"]
@@ -985,21 +1019,30 @@ def _enter_maint_and_backup(tmp_path):
 
 
 class FakeFlushCollection:
-    """Stand-in per il flush path: .get(ids, include) + .upsert(ids, documents, metadatas)."""
+    """Stand-in per il flush path: .get(ids, include) + .upsert(ids, embeddings, documents, metadatas)."""
 
     def __init__(self, docs):
         self._docs = docs          # {id: (document, metadata)}
         self.upserts = []
 
     def get(self, ids, include=None):
+        include = include or []
         oi, od, om = [], [], []
         for i in ids:
             if i in self._docs:
                 oi.append(i); od.append(self._docs[i][0]); om.append(self._docs[i][1])
-        return {"ids": oi, "documents": od, "metadatas": om}
+        out = {"ids": oi, "documents": od, "metadatas": om}
+        if "embeddings" in include:
+            # Vettore deterministico dal documento: il flush deve RILEGGERLO e
+            # passarlo esplicito (mai far ri-embeddare a Chroma).
+            out["embeddings"] = _deterministic_embed(od)
+        return out
 
-    def upsert(self, ids, documents, metadatas):
-        self.upserts.append({"ids": list(ids), "documents": list(documents), "metadatas": list(metadatas)})
+    def upsert(self, ids, embeddings, documents, metadatas):
+        self.upserts.append({
+            "ids": list(ids), "embeddings": [list(e) for e in embeddings],
+            "documents": list(documents), "metadatas": list(metadatas),
+        })
 
 
 def _install_flush_mocks(monkeypatch, docs):
@@ -1021,6 +1064,70 @@ def _install_flush_mocks(monkeypatch, docs):
     fake_embedding.info = lambda: {"provider": "fake", "model": "fake", "dim": 4}
     monkeypatch.setitem(sys.modules, "embedding", fake_embedding)
     return fake_collection
+
+
+def test_flush_upsert_passes_explicit_embeddings():
+    """Il flush deve rileggere il vettore e passarlo ESPLICITO in upsert().
+    Senza `embeddings=`, Chroma ri-embedderebbe documents[0] = writer semantico."""
+    coll = FakeFlushCollection({"id1": ("doc uno", {"source": "document"})})
+    result = rhi.flush_queue_backlog(collection=coll, chunk_ids=["id1"])
+    assert result["processed"] == 1
+    assert result["skipped"] == 0
+    assert result["skipped_missing_id"] == 0
+    assert result["skipped_missing_embedding"] == 0
+    assert len(coll.upserts) == 1
+    up = coll.upserts[0]
+    assert up["ids"] == ["id1"]
+    # vettore presente e non vuoto — non delegato all'embedding_function
+    assert up["embeddings"] and len(up["embeddings"][0]) == 4
+
+
+def test_flush_skips_record_without_embedding():
+    """Guard anti-bug: se include=['embeddings'] non restituisce un vettore per
+    un record, quel record NON va upsertato (Chroma lo ri-embedderebbe). Deve
+    saltare + contare come `skipped_missing_embedding`, mai upsert senza vettore."""
+    class _NoVecCollection:
+        def __init__(self):
+            self.upserts = []
+
+        def get(self, ids, include=None):
+            # id presente, ma vettore vuoto
+            return {"ids": list(ids), "documents": ["doc"], "metadatas": [{}],
+                    "embeddings": [[]]}
+
+        def upsert(self, **kw):
+            self.upserts.append(kw)
+
+    coll = _NoVecCollection()
+    result = rhi.flush_queue_backlog(collection=coll, chunk_ids=["x"])
+    assert result["processed"] == 0
+    assert result["skipped"] == 1
+    # guasto attribuito al contatore giusto, non confuso con missing-id
+    assert result["skipped_missing_embedding"] == 1
+    assert result["skipped_missing_id"] == 0
+    assert coll.upserts == []          # nessun upsert senza vettore
+
+
+def test_flush_skips_missing_id_distinct_counter():
+    """`skipped_missing_id` e `skipped_missing_embedding` sono guasti DIVERSI:
+    se collection.get non risolve l'id, si conta missing_id (non missing_embedding)."""
+    class _MissingIdCollection:
+        def __init__(self):
+            self.upserts = []
+
+        def get(self, ids, include=None):
+            return {"ids": [], "documents": [], "metadatas": [], "embeddings": []}
+
+        def upsert(self, **kw):
+            self.upserts.append(kw)
+
+    coll = _MissingIdCollection()
+    result = rhi.flush_queue_backlog(collection=coll, chunk_ids=["ghost"])
+    assert result["processed"] == 0
+    assert result["skipped"] == 1
+    assert result["skipped_missing_id"] == 1
+    assert result["skipped_missing_embedding"] == 0
+    assert coll.upserts == []
 
 
 # ── audit-level: benignità (topic + finestra seq) ───────────────────────────

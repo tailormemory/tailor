@@ -190,7 +190,7 @@ Independent of dry-run outcome:
 - Trap SIGTERM/SIGINT in nightly scripts that touch ChromaDB (root cause of the 1 May incident: brutal kill mid-write).
 - `repair_hnsw_index.py` resilient to chromadb 1.5.x Rust upsert segfault (catch exit 139 batch-by-batch instead of dying).
 - Implement `--prune-hnsw-ghosts` for the 50 superseded `doc_a288f7cb30f5` chunks.
-- Investigate the 44 SQL-only orphans skipped by `--apply` (`skipped_oversize`); add a `--best-effort-truncate` flag.
+- ~~Investigate the 44 SQL-only orphans skipped by `--apply` (`skipped_oversize`); add a `--best-effort-truncate` flag.~~ **Superseded (embedding-contract, 2026-07):** il contratto unico tronca a `MAX_EMBED_CHARS`, quindi i chunk lunghi non vengono piu' skippati ma ricostruiti (troncati) — il `--best-effort-truncate` proposto e' ora il comportamento di default. La chiave-risultato `skipped_oversize` e' stata rinominata `skipped_empty` e conta solo i chunk a documento vuoto (unico caso non recuperabile).
 - `rebuild_db.py`: auto-detect `OLD_METADATA_SEGMENT` (currently hard-coded to a stale UUID) and `DB_DIR` path.
 - `rm -rf /Users/jarvis/tailor/db/chroma/` vestigial directory (1.99 GB SQL phantom + corrupt HNSW dir, never read by production daemon).
 - README section on "ChromaDB HNSW resilience" as known issue for downstream forks of TAILOR.

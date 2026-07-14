@@ -75,8 +75,23 @@ MAINTENANCE_LOCK = os.path.join(BASE_DIR, "maintenance.lock")
 AUDIT_HISTORY_DIR = os.path.join(BASE_DIR, "logs", "hnsw_audits")
 COLLECTION_NAME = "tailor_kb_v2"
 
+# Contratto unico caricato per FILE via importlib: modulo puro (nessuna
+# dipendenza), quindi niente sys.path.insert(scripts/lib) a load-time. Evita di
+# esporre `config`, `embedding`, ecc. come nomi top-level (shadowing) quando
+# repair_hnsw_index viene importato (test, auto_flush). E' la fonte UNICA del
+# taglio del testo da embeddare.
+import importlib.util as _ilu  # noqa: E402
+_ec_spec = _ilu.spec_from_file_location(
+    "_tailor_embedding_contract",
+    os.path.join(BASE_DIR, "scripts", "lib", "embedding_contract.py"),
+)
+_ec_mod = _ilu.module_from_spec(_ec_spec)
+_ec_spec.loader.exec_module(_ec_mod)
+embedding_text = _ec_mod.embedding_text
+MAX_EMBED_CHARS = _ec_mod.MAX_EMBED_CHARS
+del _ec_spec, _ec_mod
+
 UPSERT_BATCH_SIZE = 10
-MAX_TEXT_CHARS = 4000  # mirrors ingest_docs.py
 DELTA_WINDOW_SECONDS = 7200  # 2 hours
 BACKUP_MAX_AGE_SECONDS = 3600  # 60 minutes
 DRIFT_WARNING = 800
@@ -923,34 +938,6 @@ def find_recent_backup(
 _RESERVED_META_KEYS = {"__int_id__", "chroma:document"}
 
 
-def _build_embedding_text(meta: dict[str, Any], doc_text: str) -> str:
-    """Reconstruct the text that ingest_docs.py would have used for embedding.
-
-    For document chunks (conv_id=doc_<hash>), the original embedding was computed
-    over `f"{prefix}\\n\\n{text}"` where prefix is built from folder/doc_type/title.
-    For doc_summary chunks, the prefix was already baked into chroma:document
-    by the summary writer, so we use chroma:document as-is.
-
-    For other sources (conversations, emails), there's no document-style prefix;
-    the original text in chroma:document is what was embedded.
-    """
-    conv_id = meta.get("conv_id") or ""
-    source = meta.get("source")
-    if source == "document" and conv_id.startswith("doc_") and not conv_id.startswith("doc_summary_"):
-        folder = meta.get("folder") or ""
-        doc_type = meta.get("doc_type") or ""
-        title = meta.get("title") or ""
-        prefix_parts = []
-        if folder:
-            prefix_parts.append(f"Cartella: {folder}")
-        if doc_type:
-            prefix_parts.append(f"Tipo: {doc_type}")
-        prefix_parts.append(f"File: {title}")
-        prefix = " | ".join(prefix_parts)
-        return f"{prefix}\n\n{doc_text}"
-    return doc_text
-
-
 def _strip_metadata_for_upsert(meta: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in meta.items() if k not in _RESERVED_META_KEYS}
 
@@ -991,7 +978,16 @@ def repair(
     progress=None,
 ) -> dict[str, Any]:
     """Re-embed and upsert all SQL-only orphans. Caller is responsible for
-    preconditions (maintenance mode, backup) and for the collection handle."""
+    preconditions (maintenance mode, backup) and for the collection handle.
+
+    IMPORTANTE — --apply CANONICALIZZA, NON ripristina. Il testo viene
+    embeddato via il contratto unico (nudo, troncato a MAX_EMBED_CHARS). Per i
+    chunk piu' lunghi di MAX_EMBED_CHARS il vettore ricostruito NON coincide con
+    quello storico: e' una MIGRAZIONE al contratto, non un restore bit-identico.
+    Quei chunk sono contati a parte in `migrated_truncated` e dichiarati nel
+    maintenance_log. La post-condizione sql_only_count==0 verifica la presenza
+    in HNSW, NON l'uguaglianza al vettore originale — by design.
+    """
     if report.collection_topic_ambiguous:
         raise RuntimeError("Cannot --apply while the collection WAL topic is ambiguous.")
     if report.has_unknowns():
@@ -1000,11 +996,12 @@ def repair(
             f"Investigate the UNEXPECTED DRIFT TYPES section of the audit first."
         )
     if not report.sql_only_orphans:
-        return {"repaired": 0, "batches": 0, "skipped_oversize": 0}
+        return {"repaired": 0, "batches": 0, "skipped_empty": 0, "migrated_truncated": 0}
 
     repaired = 0
     batches = 0
-    skipped_oversize = 0
+    skipped_empty = 0
+    migrated_truncated = 0
     repaired_ids: list[str] = []
 
     orphans = report.sql_only_orphans
@@ -1017,18 +1014,27 @@ def repair(
         for o in batch:
             doc_text = o.metadata.get("chroma:document") or ""
             if not doc_text:
-                # No text to embed; cannot recover this chunk via re-embed
-                skipped_oversize += 1
+                # Nessun testo da embeddare: chunk non ricostruibile via re-embed.
+                # Questo e' l'UNICO caso di skip rimasto dopo la rimozione del
+                # guard >4000 (il contratto tronca, quindi i chunk lunghi sono
+                # ricostruibili). La chiave-risultato si chiama `skipped_empty`:
+                # conta cio' che conta davvero (documento vuoto), non "oversize".
+                skipped_empty += 1
                 continue
-            if len(doc_text) > MAX_TEXT_CHARS:
-                # ingest_docs truncates documents to MAX_TEXT_CHARS, but the original
-                # embedding was over the full pre-truncation text; we cannot exactly
-                # reproduce that vector here. Skip and surface for human review.
-                skipped_oversize += 1
-                continue
+            # Contratto unico: embedda e salva lo STESSO testo (nudo, troncato).
+            # Niente piu' skip sui chunk lunghi: il contratto tronca, quindi il
+            # chunk e' ricostruibile (prima > MAX_EMBED_CHARS restavano orfani in
+            # silenzio). documents == testo embeddato: non salviamo cio' che non
+            # abbiamo embeddato.
+            embed_text = embedding_text(o.metadata.get("source"), o.metadata, doc_text)
+            if len(doc_text) > MAX_EMBED_CHARS:
+                # Chunk piu' lungo del contratto: il vettore ricostruito e'
+                # troncato e DIVERSO dallo storico -> canonicalizzazione al
+                # contratto, non ripristino. Contato a parte e dichiarato.
+                migrated_truncated += 1
             ids.append(o.embedding_id)
-            texts.append(_build_embedding_text(o.metadata, doc_text))
-            documents.append(doc_text)
+            texts.append(embed_text)
+            documents.append(embed_text)
             metadatas.append(_strip_metadata_for_upsert(o.metadata))
 
         if not ids:
@@ -1050,7 +1056,8 @@ def repair(
     return {
         "repaired": repaired,
         "batches": batches,
-        "skipped_oversize": skipped_oversize,
+        "skipped_empty": skipped_empty,
+        "migrated_truncated": migrated_truncated,
         "repaired_ids": repaired_ids,
     }
 
@@ -1116,35 +1123,57 @@ def flush_queue_backlog(
     skip/error che riducono i record consumati sono chiusi dal loop di top-up.
     """
     processed = 0
-    skipped = 0
+    # Due guasti DIVERSI, contatori distinti: id non risolto vs vettore assente.
+    skipped_missing_id = 0
+    skipped_missing_embedding = 0
     errors = 0
 
     for chunk_id in chunk_ids:
         try:
-            fetched = collection.get(ids=[chunk_id], include=["documents", "metadatas"])
+            fetched = collection.get(
+                ids=[chunk_id],
+                include=["embeddings", "documents", "metadatas"],
+            )
             ids = fetched.get("ids") or []
             if not ids:
-                skipped += 1
+                skipped_missing_id += 1
                 print(f"[flush-queue-backlog] skip missing id: {chunk_id}", file=sys.stderr)
+                continue
+
+            # Vettori ESPLICITI riletti dalla collection (come force_chroma_persist).
+            # Senza `embeddings=`, ChromaDB ri-embedda documents[0] via
+            # embedding_function -> writer semantico travestito da manutenzione
+            # (il bug: 3.058 chunk ri-embeddati dal 12/06). Se il record NON ha
+            # un vettore, NON upsertarlo senza vettore (ricadresti nel bug):
+            # salta, conta, logga.
+            embeddings = list(fetched.get("embeddings") or [])
+            if not embeddings or embeddings[0] is None or len(embeddings[0]) == 0:
+                skipped_missing_embedding += 1
+                print(f"[flush-queue-backlog] skip missing embedding: {chunk_id}", file=sys.stderr)
                 continue
 
             documents = fetched.get("documents") or [""]
             metadatas = fetched.get("metadatas") or [{}]
             collection.upsert(
                 ids=[ids[0]],
+                embeddings=[embeddings[0]],
                 documents=[documents[0]],
                 metadatas=[metadatas[0]],
             )
             processed += 1
             if progress and processed % 100 == 0:
-                progress(processed, len(chunk_ids), skipped, errors)
+                progress(processed, len(chunk_ids),
+                         skipped_missing_id + skipped_missing_embedding, errors)
         except Exception as e:
             errors += 1
             print(f"[flush-queue-backlog] error {chunk_id}: {type(e).__name__}: {e}", file=sys.stderr)
 
     return {
         "processed": processed,
-        "skipped": skipped,
+        # `skipped` = somma, retro-compatibile (top-up, progress, success).
+        "skipped": skipped_missing_id + skipped_missing_embedding,
+        "skipped_missing_id": skipped_missing_id,
+        "skipped_missing_embedding": skipped_missing_embedding,
         "errors": errors,
         "candidate_ids": len(chunk_ids),
     }
@@ -1391,6 +1420,10 @@ def main(argv: list[str] | None = None) -> int:
             return 4
 
         # Lazy imports — only needed for the mutating Chroma flush path.
+        # embedding.py fa `from config import` (serve scripts/lib) e, per
+        # openai/google, `from lib.api_keys import` (serve scripts): entrambi su
+        # path PRIMA dell'import, e solo qui (non a load-time -> no shadowing).
+        sys.path.insert(0, os.path.join(BASE_DIR, "scripts"))
         sys.path.insert(0, os.path.join(BASE_DIR, "scripts", "lib"))
         import chromadb  # noqa: E402
         from embedding import get_embeddings, info as embedding_info  # noqa: E402
@@ -1459,6 +1492,11 @@ def main(argv: list[str] | None = None) -> int:
             result["skipped"] += topup_result["skipped"]
             result["errors"] += topup_result["errors"]
             result["candidate_ids"] += topup_result["candidate_ids"]
+            # Granulari: .get default 0 -> robusto se un fake non li espone.
+            result["skipped_missing_id"] = (
+                result.get("skipped_missing_id", 0) + topup_result.get("skipped_missing_id", 0))
+            result["skipped_missing_embedding"] = (
+                result.get("skipped_missing_embedding", 0) + topup_result.get("skipped_missing_embedding", 0))
             result["topup_iterations"] += 1
             con = _open_sqlite_ro(DB_PATH)
             try:
@@ -1577,6 +1615,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     # Lazy imports — only needed for apply
+    # embedding.py: `from config import` (scripts/lib) + openai/google
+    # `from lib.api_keys import` (scripts). Entrambi su path prima dell'uso.
+    sys.path.insert(0, os.path.join(BASE_DIR, "scripts"))
     sys.path.insert(0, os.path.join(BASE_DIR, "scripts", "lib"))
     import chromadb  # noqa: E402
     from embedding import get_embeddings  # noqa: E402
@@ -1657,7 +1698,10 @@ def main(argv: list[str] | None = None) -> int:
                 mode="apply",
                 report=report,
                 action=f"repaired {result['repaired']} chunks in {result['batches']} batches"
-                       + (f" (skipped {result['skipped_oversize']} oversize)" if result['skipped_oversize'] else ""),
+                       + (f" (skipped {result['skipped_empty']} empty)" if result['skipped_empty'] else "")
+                       + (f"; {result['migrated_truncated']} chunk canonicalizzati al contratto "
+                          f"(troncati a {MAX_EMBED_CHARS}, vettore != storico)"
+                          if result.get('migrated_truncated') else ""),
                 extra={
                     "post_apply_sql_only_count": post.sql_only_count,
                     "backup_used": os.path.basename(backup),

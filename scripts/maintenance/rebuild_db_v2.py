@@ -29,7 +29,6 @@ import os
 import sqlite3
 import sys
 import time
-import requests
 import chromadb
 
 # ============================================================
@@ -37,10 +36,20 @@ import chromadb
 # ============================================================
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, BASE_DIR)
-from scripts.lib.config import get as cfg
-OLLAMA_URL = os.environ.get("OLLAMA_URL", cfg("ollama", "base_url") or "http://localhost:11434") + "/api/embed"
-EMBED_MODEL = cfg("embedding", "model") or "nomic-embed-text"
+# Contratto unico caricato per FILE via importlib (modulo puro, zero dipendenze):
+# niente sys.path.insert(scripts/lib) a load-time. Il provider `embedding` (che fa
+# `from config import` e, per openai/google, `from lib.api_keys import`) viene
+# importato DENTRO main(), dove scripts/ e scripts/lib/ sono messi su sys.path.
+import importlib.util as _ilu
+_ec_spec = _ilu.spec_from_file_location(
+    "_tailor_embedding_contract",
+    os.path.join(BASE_DIR, "scripts", "lib", "embedding_contract.py"),
+)
+_ec_mod = _ilu.module_from_spec(_ec_spec)
+_ec_spec.loader.exec_module(_ec_mod)
+embedding_text = _ec_mod.embedding_text
+MAX_EMBED_CHARS = _ec_mod.MAX_EMBED_CHARS
+del _ec_spec, _ec_mod
 
 DB_DIR = os.path.join(BASE_DIR, "db")
 SQLITE_PATH = os.path.join(DB_DIR, "chroma.sqlite3")
@@ -54,7 +63,7 @@ OLD_METADATA_SEGMENT = "56a260e7-1843-4667-8d8b-5d79a0223d51"
 
 READ_BATCH = 1000       # Chunk letti da SQLite per iterazione
 WRITE_BATCH = 100       # Chunk scritti in ChromaDB per batch
-EMBED_BATCH = 50        # Testi inviati a Ollama per chiamata
+EMBED_BATCH = 50        # Testi inviati al provider di embedding per chiamata
 CHECKPOINT_EVERY = 1000 # Save progress every N chunks
 
 CHECKPOINT_FILE = os.path.join(DB_DIR, "checkpoints", "rebuild_checkpoint.json")
@@ -62,19 +71,6 @@ CHECKPOINT_FILE = os.path.join(DB_DIR, "checkpoints", "rebuild_checkpoint.json")
 # ============================================================
 # FUNZIONI
 # ============================================================
-
-def get_embedding_batch(texts: list[str]) -> list[list[float]]:
-    """Generate embeddings for a batch of texts via Ollama."""
-    # Tronca a 4000 chars come fa il server MCP
-    truncated = [t[:4000] for t in texts]
-    payload = {
-        "model": EMBED_MODEL,
-        "input": truncated
-    }
-    r = requests.post(OLLAMA_URL, json=payload, timeout=120)
-    r.raise_for_status()
-    return r.json()["embeddings"]
-
 
 def load_checkpoint() -> int:
     """Load the last processed offset from checkpoint."""
@@ -157,16 +153,23 @@ def main():
     print(f"Dry run: {dry_run}")
     print(f"Resume: {resume}")
     print()
-    
-    # Verifica Ollama
+
+    # Provider di embedding CANONICO. embedding.py fa `from config import` (serve
+    # scripts/lib) e, per openai/google, `from lib.api_keys import` (serve
+    # scripts): entrambi su path PRIMA dell'import, e solo qui a runtime.
+    sys.path.insert(0, os.path.join(BASE_DIR, "scripts"))
+    sys.path.insert(0, os.path.join(BASE_DIR, "scripts", "lib"))
+    from embedding import get_embeddings, info as embedding_info
+
+    # Verifica provider di embedding CANONICO (config-driven, non Ollama hardcoded)
     if not dry_run:
         try:
-            test = requests.post(OLLAMA_URL, json={"model": EMBED_MODEL, "input": ["test"]}, timeout=10)
-            test.raise_for_status()
-            print("✅ Ollama raggiungibile, modello OK")
+            probe = get_embeddings(["test"])
+            if not probe or len(probe[0]) == 0:
+                raise RuntimeError("il provider ha restituito un embedding vuoto")
+            print(f"✅ Provider embedding OK: {embedding_info()}")
         except Exception as e:
-            print(f"❌ Ollama non raggiungibile: {e}")
-            print("   Assicurati che Ollama sia attivo: brew services start ollama")
+            print(f"❌ Provider embedding non raggiungibile: {e}")
             sys.exit(1)
     
     # Apri SQLite in read-only
@@ -253,16 +256,17 @@ def main():
     
     for batch, offset in read_all_from_sqlite(conn, start_offset):
         for embedding_id, document, meta in batch:
-            # Accumula per embedding batch
+            # Contratto unico: embedda e salva lo STESSO testo (nudo, troncato).
+            embed_text = embedding_text(meta.get("source"), meta, document)
             write_buffer_ids.append(embedding_id)
-            write_buffer_documents.append(document[:4000])
+            write_buffer_documents.append(embed_text)
             write_buffer_metadatas.append(meta)
-            embed_buffer_texts.append(document)
+            embed_buffer_texts.append(embed_text)
             
             # Quando abbiamo abbastanza testi, genera embedding
             if len(embed_buffer_texts) >= EMBED_BATCH:
                 try:
-                    embeddings = get_embedding_batch(embed_buffer_texts)
+                    embeddings = get_embeddings(embed_buffer_texts)
                     write_buffer_embeddings.extend(embeddings)
                     embed_buffer_texts = []
                 except Exception as e:
@@ -270,7 +274,7 @@ def main():
                     print(f"\n⚠️  Batch embedding error, retrying individually: {e}")
                     for txt in embed_buffer_texts:
                         try:
-                            emb = get_embedding_batch([txt])
+                            emb = get_embeddings([txt])
                             write_buffer_embeddings.extend(emb)
                         except Exception as e2:
                             print(f"  ❌ Skip chunk: {e2}")
@@ -317,7 +321,7 @@ def main():
     # Flush residui embed buffer
     if embed_buffer_texts:
         try:
-            embeddings = get_embedding_batch(embed_buffer_texts)
+            embeddings = get_embeddings(embed_buffer_texts)
             write_buffer_embeddings.extend(embeddings)
             embed_buffer_texts = []
         except Exception as e:
