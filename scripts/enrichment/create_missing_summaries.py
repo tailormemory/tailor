@@ -17,6 +17,7 @@ from datetime import datetime
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 from embedding import get_embedding, get_embeddings
+from embedding_contract import embedding_text
 DB_DIR = os.path.join(BASE_DIR, "db")
 DB_PATH = os.path.join(DB_DIR, "chroma.sqlite3")
 REGISTRY_FILE = os.path.join(DB_DIR, "doc_registry.json")
@@ -191,7 +192,6 @@ def create_summary_chunk(col, filename, folder, doc_type, date, file_type, file_
     content += f"[RIASSUNTO DOCUMENTO] {filename}\n"
     content += f"Cartella: {folder} | Tipo: {doc_type} | File: {file_type}\n\n"
     content += summary
-    embedding = get_embedding(content)
     rel_path = file_path.replace(CLOUD_LOCAL_ROOT + "/", "") if CLOUD_LOCAL_ROOT else path
     metadata = {
         "source": "document", "title": filename, "folder": folder, "doc_type": doc_type,
@@ -201,7 +201,10 @@ def create_summary_chunk(col, filename, folder, doc_type, date, file_type, file_
         "conv_id": f"doc_summary_{datetime.now().strftime('%Y%m%d')}",
         "create_time": time.time(),
     }
-    col.add(ids=[summary_id], documents=[content], embeddings=[embedding], metadatas=[metadata])
+    # Contratto unico: taglio dell'embedded centralizzato, niente divergenza.
+    embed_text = embedding_text("doc_summary", metadata, content)
+    embedding = get_embedding(embed_text)
+    col.add(ids=[summary_id], documents=[embed_text], embeddings=[embedding], metadatas=[metadata])
     return summary_id
 
 

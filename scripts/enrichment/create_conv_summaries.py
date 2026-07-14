@@ -34,6 +34,7 @@ from datetime import datetime
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 from embedding import get_embedding, get_embeddings
+from embedding_contract import embedding_text
 DB_DIR = os.path.join(BASE_DIR, "db")
 DB_PATH = os.path.join(DB_DIR, "chroma.sqlite3")
 LOG_PATH = os.path.join(BASE_DIR, "logs", "conv_summaries.log")
@@ -284,8 +285,6 @@ def write_summary_chunk(col, conv_id, source, title, date, summary):
     content += f"Fonte: {source} | Data: {date}\n\n"
     content += summary
 
-    embedding = get_embedding(content)
-
     metadata = {
         "source": source,
         "title": title,
@@ -300,9 +299,13 @@ def write_summary_chunk(col, conv_id, source, title, date, summary):
         "default_model": "",
     }
 
+    # Contratto unico: taglio dell'embedded centralizzato, niente divergenza.
+    embed_text = embedding_text("conv_summary", metadata, content)
+    embedding = get_embedding(embed_text)
+
     col.add(
         ids=[summary_id],
-        documents=[content],
+        documents=[embed_text],
         embeddings=[embedding],
         metadatas=[metadata],
     )

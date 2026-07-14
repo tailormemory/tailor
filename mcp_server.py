@@ -141,6 +141,7 @@ ENTITY_FETCH_CAP = 100
 
 # Embedding: loaded from lib.embedding (config-driven)
 from embedding import get_embedding, get_embeddings, info as embedding_info
+from embedding_contract import embedding_text, MAX_EMBED_CHARS
 # Collection name from config
 try:
     from scripts.lib.config import get as _cfg_get_top
@@ -1108,7 +1109,6 @@ class BearerAuthMiddleware:
                     pass
                 # Embed and upsert
                 try:
-                    embedding = get_embeddings([text[:4000]])[0]
                     # Parse timestamp once, derive both create_time and date_str
                     # from the parsed datetime to keep them consistent. If parsing
                     # fails, both fall back to safe empty/zero values (no garbage
@@ -1130,10 +1130,15 @@ class BearerAuthMiddleware:
                         "create_time": _create_time,
                         "default_model": source,
                         "chunk_index": 0,
-                        "char_count": min(len(text), 10000),
+                        "char_count": min(len(text), MAX_EMBED_CHARS),
                         "turn_count": len(messages),
                         "source": source,
                     }
+                    # Contratto unico: si embedda e si salva lo STESSO testo
+                    # (nudo, troncato a MAX_EMBED_CHARS). Il sistema non deve
+                    # salvare testo che non ha embeddato.
+                    embed_text = embedding_text("ingest_live", metadata, text)
+                    embedding = get_embeddings([embed_text])[0]
                     # Batch-1: verified_upsert verifies only id_list[0]; if this
                     # becomes batch-N, per-id coverage must be revisited.
                     # (C) getter → re-resolve per attempt across a maintenance
@@ -1143,7 +1148,7 @@ class BearerAuthMiddleware:
                     ok = verified_upsert(
                         get_collection,
                         ids=[chunk_id], embeddings=[embedding],
-                        documents=[text[:10000]], metadatas=[metadata],
+                        documents=[embed_text], metadatas=[metadata],
                         run_id=make_run_id("ingest_live"), source="ingest_live",
                         retry=2, retry_backoff=0.3, report=_report,
                     )
@@ -3039,7 +3044,6 @@ def kb_add(content: str, title: str, category: str = "general", source: str = "c
         prefix = "chatgpt" if source == "chatgpt" else "claude"
         chunk_id = f"{prefix}_{now.strftime('%Y%m%d_%H%M%S')}_{abs(hash(content)) % 10000:04d}"
         conv_id = f"{prefix}_session_{now.strftime('%Y%m%d')}"
-        embedding = get_embedding(content)
         meta = {
             "conv_id": conv_id, "title": title, "date": date_str,
             "create_time": timestamp, "default_model": source,
@@ -3051,6 +3055,10 @@ def kb_add(content: str, title: str, category: str = "general", source: str = "c
         meta["entity_types"] = json.dumps(types, ensure_ascii=False)
         meta["entities_extracted"] = 1
         meta["entities_count"] = len(entities)
+        # Contratto unico: si embedda e si salva lo STESSO testo
+        # (nudo, troncato a MAX_EMBED_CHARS).
+        embed_text = embedding_text("kb_add", meta, content)
+        embedding = get_embedding(embed_text)
         # Batch-1: verified_upsert verifies only id_list[0]; if this
         # becomes batch-N, per-id coverage must be revisited.
         # (C) pass get_collection (the getter) so the retry loop re-resolves
@@ -3060,7 +3068,7 @@ def kb_add(content: str, title: str, category: str = "general", source: str = "c
         ok = verified_upsert(
             get_collection,
             ids=[chunk_id], embeddings=[embedding],
-            documents=[content[:4000]], metadatas=[meta],
+            documents=[embed_text], metadatas=[meta],
             run_id=make_run_id("kb_add"), source="kb_add",
             retry=2, retry_backoff=(0.5, 1.0), report=_report,
         )
@@ -3120,7 +3128,6 @@ def kb_update_session(summary: str, key_facts: str, decisions: str = "", action_
         prefix = "chatgpt" if source == "chatgpt" else "claude"
         chunk_id = f"{prefix}_session_{now.strftime('%Y%m%d_%H%M%S')}"
         conv_id = f"{prefix}_session_{now.strftime('%Y%m%d')}"
-        embedding = get_embedding(full_doc)
         meta = {
             "conv_id": conv_id, "title": f"Sessione {source_label} {date_str}",
             "date": date_str, "create_time": timestamp, "default_model": source,
@@ -3132,6 +3139,10 @@ def kb_update_session(summary: str, key_facts: str, decisions: str = "", action_
         meta["entity_types"] = json.dumps(types, ensure_ascii=False)
         meta["entities_extracted"] = 1
         meta["entities_count"] = len(entities)
+        # Contratto unico: si embedda e si salva lo STESSO testo
+        # (nudo, troncato a MAX_EMBED_CHARS).
+        embed_text = embedding_text("kb_update_session", meta, full_doc)
+        embedding = get_embedding(embed_text)
         # Batch-1: verified_upsert verifies only id_list[0]; if this
         # becomes batch-N, per-id coverage must be revisited.
         # Known follow-up (out of A1 scope): chunk_id is second-
@@ -3144,7 +3155,7 @@ def kb_update_session(summary: str, key_facts: str, decisions: str = "", action_
         ok = verified_upsert(
             get_collection,
             ids=[chunk_id], embeddings=[embedding],
-            documents=[full_doc[:4000]], metadatas=[meta],
+            documents=[embed_text], metadatas=[meta],
             run_id=make_run_id("kb_update_session"), source="kb_update_session",
             retry=2, retry_backoff=(0.5, 1.0), report=_report,
         )
