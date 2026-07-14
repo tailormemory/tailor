@@ -8,12 +8,12 @@ sys.path.insert(0, os.path.join(BASE_DIR, "scripts", "lib"))
 sys.path.insert(0, os.path.join(BASE_DIR, "scripts", "ingest"))
 from config import get as cfg, load_config
 from embedding import get_embeddings
+from embedding_contract import embedding_text
 from ingest_helpers import verified_upsert, make_run_id
 
 DB_DIR = os.path.join(BASE_DIR, "db")
 COLLECTION_NAME = cfg("kb", "collection") or "tailor_kb_v2"
 BATCH_SIZE = 10
-MAX_TEXT_CHARS = 4000
 TARGET_CHUNK_CHARS = 1200
 OVERLAP_CHARS = 200
 
@@ -119,12 +119,11 @@ def main():
         run_id = make_run_id(f"upload_{stype}")
         for bs in range(0, total, BATCH_SIZE):
             batch = achunks[bs:bs+BATCH_SIZE]
-            txts = [f"Conversazione: {c['title']}" + (f" ({c['date']})" if c.get('date') else "") + f"\n\n{c['text']}" for c in batch]
-            txts = [t[:MAX_TEXT_CHARS] for t in txts]
-            try: embs = get_embeddings(txts)
+            # Testo embeddato == testo salvato: unica fonte via contratto.
+            docs=[embedding_text(stype, c, c["text"]) for c in batch]
+            try: embs = get_embeddings(docs)
             except Exception as e: print(f"  Emb err: {e}"); errs+=len(batch); continue
             ids=[c["chunk_id"] for c in batch]
-            docs=[c["text"][:MAX_TEXT_CHARS] for c in batch]
             metas=[{"conv_id":c.get("conv_id",""),"title":c.get("title",""),"date":c.get("date",""),
                 "create_time":c.get("create_time",0),"default_model":c.get("source",""),
                 "chunk_index":c.get("chunk_index",0),"char_count":c.get("char_count",0),

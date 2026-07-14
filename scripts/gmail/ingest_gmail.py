@@ -29,7 +29,8 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 DATA_DIR = os.path.join(BASE_DIR, "data")
 sys.path.insert(0, os.path.join(BASE_DIR, "scripts", "lib"))
 from config import get as cfg
-from embedding import get_embeddings as _embed_fn
+from embedding import get_embeddings
+from embedding_contract import embedding_text
 from ingest_helpers import verified_upsert, make_run_id
 
 DB_DIR = cfg("kb", "chromadb_path") or os.path.join(BASE_DIR, "db")
@@ -39,7 +40,6 @@ INPUT_FILE = os.path.join(DATA_DIR, "chunks_gmail.jsonl")
 COLLECTION_NAME = cfg("kb", "collection") or "tailor_kb_v2"
 
 BATCH_SIZE = 10
-MAX_TEXT_CHARS = 4000
 
 
 # ============================================================
@@ -53,23 +53,10 @@ def check_embedding():
     print(f"Embedding: {provider}/{model}")
     try:
         test = get_embeddings(["test"])
-        if test is None:
-            print("ERROR: embedding provider not reachable.")
-            sys.exit(1)
         print(f"Embedding OK — {len(test[0])} dimensions")
     except Exception as e:
         print(f"ERROR: embedding check failed: {e}")
         sys.exit(1)
-
-
-def get_embeddings(texts):
-    """Batch embedding via configured provider."""
-    truncated = [t[:MAX_TEXT_CHARS] for t in texts]
-    try:
-        return _embed_fn(truncated)
-    except Exception as e:
-        print(f"\nEmbedding error: {e}")
-        return None
 
 
 # ============================================================
@@ -125,29 +112,23 @@ def ingest_chunks(collection, chunks, dry_run=False, run_id: str | None = None):
     for batch_start in range(0, total, BATCH_SIZE):
         batch = chunks[batch_start:batch_start + BATCH_SIZE]
 
-        # Prepara testi con prefisso per embedding
-        texts = []
-        for c in batch:
-            prefix = c.get("embed_prefix", "")
-            text = c["text"]
-            if prefix:
-                texts.append(f"{prefix}\n\n{text}")
-            else:
-                texts.append(text)
+        # Testo embeddato == testo salvato: unica fonte via contratto.
+        documents = [embedding_text("email", c["metadata"], c["text"]) for c in batch]
 
         if dry_run:
             processed += len(batch)
             continue
 
-        # Embedding
-        embeddings = get_embeddings(texts)
-        if embeddings is None:
+        # Batch fallito -> contato in errors, l'ingest prosegue (fail-loud, non muore).
+        try:
+            embeddings = get_embeddings(documents)
+        except Exception as e:
+            print(f"\n  Embedding error: {e}")
             errors += len(batch)
             continue
 
         # Prepara dati per ChromaDB
         ids = [c["chunk_id"] for c in batch]
-        documents = [c["text"][:MAX_TEXT_CHARS] for c in batch]
         metadatas = [c["metadata"] for c in batch]
 
         try:
@@ -273,6 +254,18 @@ def main():
     print(f"  Errori: {errors:,}")
     print(f"  Tempo: {elapsed:.1f}s ({processed / max(1, elapsed):.1f} chunk/s)")
     print(f"  Total chunks in KB: {collection.count():,}")
+
+    # Fail-loud a soglia: pochi batch falliti != guasto sistemico.
+    FAIL_RATIO = 0.05
+    total = len(chunks)
+    if errors > 0:
+        ratio = errors / max(total, 1)
+        print(f"WARN: {errors}/{total} chunk falliti ({ratio:.1%})")
+        if ratio > FAIL_RATIO:
+            sys.exit(1)   # guasto sistemico -> fatal a valle
+        # sotto soglia: errore contato, exit 0.
+        # Layer A di sync_email.sh (invariante chunks->KB) prende comunque
+        # i chunk mancanti: non e' silenzio, e' un altro strato che grida.
 
 
 if __name__ == "__main__":

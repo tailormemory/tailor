@@ -41,6 +41,7 @@ import chromadb
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from embedding import get_embedding, get_embeddings
+from embedding_contract import embedding_text
 from config import get as cfg
 from ingest_helpers import verified_upsert, make_run_id
 from ocr_quality import assess_text_quality
@@ -64,7 +65,6 @@ REGISTRY_FILE = os.path.join(DB_DIR, "doc_registry.json")
 COLLECTION_NAME = cfg("kb", "collection") or "tailor_kb_v2"
 
 BATCH_SIZE = 10
-MAX_TEXT_CHARS = 4000
 
 # Chunking config (aligned with 2_chunk.py v2)
 TARGET_CHUNK_CHARS = 1200
@@ -1305,27 +1305,18 @@ def ingest_chunks(collection, chunks, run_id: str | None = None):
     for batch_start in range(0, total, BATCH_SIZE):
         batch = chunks[batch_start:batch_start + BATCH_SIZE]
 
-        texts = []
-        for c in batch:
-            folder = c['metadata'].get('folder', '')
-            doc_type = c['metadata'].get('doc_type', '')
-            title = c['metadata']['title']
-            prefix_parts = []
-            if folder:
-                prefix_parts.append(f"Cartella: {folder}")
-            if doc_type:
-                prefix_parts.append(f"Tipo: {doc_type}")
-            prefix_parts.append(f"File: {title}")
-            prefix = " | ".join(prefix_parts)
-            texts.append(f"{prefix}\n\n{c['text']}")
+        # Testo embeddato == testo salvato: unica fonte via contratto.
+        documents = [embedding_text("document", c["metadata"], c["text"]) for c in batch]
 
-        embeddings = get_embeddings(texts)
-        if embeddings is None:
+        # Batch fallito -> contato in errors, l'ingest prosegue (fail-loud, non muore).
+        try:
+            embeddings = get_embeddings(documents)
+        except Exception as e:
+            print(f"\n  Embedding error: {e}")
             errors += len(batch)
             continue
 
         ids = [c["chunk_id"] for c in batch]
-        documents = [c["text"][:MAX_TEXT_CHARS] for c in batch]
         metadatas = [c["metadata"] for c in batch]
 
         try:
@@ -1588,6 +1579,10 @@ def main():
     print(f"  Errori: {total_errors}")
     print(f"  Tempo: {elapsed:.1f}s")
     print(f"  Totale chunk in KB: {collection.count():,}")
+
+    # Fail-loud: batch falliti -> exit non-zero (il cron non deve tacere).
+    if total_errors > 0:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

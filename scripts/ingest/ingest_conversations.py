@@ -35,6 +35,7 @@ sys.path.insert(0, os.path.join(BASE_DIR, "scripts", "ingest"))
 
 from config import get as cfg, load_config
 from embedding import get_embeddings, info as embedding_info
+from embedding_contract import embedding_text
 from ingest_helpers import verified_upsert, make_run_id
 
 # ── Constants ─────────────────────────────────────────────────
@@ -47,7 +48,6 @@ TARGET_CHUNK_CHARS = 1200
 MAX_CHUNK_CHARS = 2000
 OVERLAP_CHARS = 200
 BATCH_SIZE = 10
-MAX_TEXT_CHARS = 4000
 
 
 # ── Chunker (unified) ────────────────────────────────────────
@@ -192,14 +192,8 @@ def ingest_chunks(chunks: list[dict], collection, dry_run: bool = False, run_id:
     for batch_start in range(0, total, BATCH_SIZE):
         batch = chunks[batch_start:batch_start + BATCH_SIZE]
 
-        # Prepare texts for embedding with context prefix
-        texts = []
-        for chunk in batch:
-            prefix = f"Conversazione: {chunk['title']}"
-            if chunk.get("date"):
-                prefix += f" ({chunk['date']})"
-            full = f"{prefix}\n\n{chunk['text']}"
-            texts.append(full[:MAX_TEXT_CHARS])
+        # Testo embeddato == testo salvato: unica fonte via contratto.
+        documents = [embedding_text(source, chunk, chunk["text"]) for chunk in batch]
 
         if dry_run:
             processed += len(batch)
@@ -207,7 +201,7 @@ def ingest_chunks(chunks: list[dict], collection, dry_run: bool = False, run_id:
 
         # Generate embeddings via abstraction layer
         try:
-            embeddings = get_embeddings(texts)
+            embeddings = get_embeddings(documents)
         except Exception as e:
             print(f"\n  Embedding error: {e}")
             errors += len(batch)
@@ -215,7 +209,6 @@ def ingest_chunks(chunks: list[dict], collection, dry_run: bool = False, run_id:
 
         # Prepare ChromaDB data
         ids = [c["chunk_id"] for c in batch]
-        documents = [c["text"][:MAX_TEXT_CHARS] for c in batch]
         metadatas = []
         for c in batch:
             metadatas.append({
