@@ -1091,6 +1091,27 @@ class OllamaNomicEmbeddingFunction:
         return embeddings
 
 
+def _len_or_zero(raw) -> int:
+    try:
+        return len(raw)
+    except TypeError:
+        return 0
+
+
+def _first_or_default(raw, default):
+    """Primo elemento di un ritorno di collection.get, senza valutarne la verità.
+
+    Il tipo dei campi di `get()` non è un contratto stabile: 1.5.9 ha convertito
+    `embeddings` da lista a numpy.ndarray, e `bool(ndarray)` solleva
+    "ValueError: ambiguous". Qui la presenza si testa SOLO con `is None` + len(),
+    così il guard regge qualunque container Chroma restituisca.
+    """
+    if raw is None or _len_or_zero(raw) == 0:
+        return default
+    first = raw[0]
+    return default if first is None else first
+
+
 def flush_queue_backlog(
     *,
     collection,
@@ -1134,8 +1155,8 @@ def flush_queue_backlog(
                 ids=[chunk_id],
                 include=["embeddings", "documents", "metadatas"],
             )
-            ids = fetched.get("ids") or []
-            if not ids:
+            resolved_id = _first_or_default(fetched.get("ids"), None)
+            if resolved_id is None:
                 skipped_missing_id += 1
                 print(f"[flush-queue-backlog] skip missing id: {chunk_id}", file=sys.stderr)
                 continue
@@ -1146,19 +1167,36 @@ def flush_queue_backlog(
             # (il bug: 3.058 chunk ri-embeddati dal 12/06). Se il record NON ha
             # un vettore, NON upsertarlo senza vettore (ricadresti nel bug):
             # salta, conta, logga.
-            embeddings = list(fetched.get("embeddings") or [])
-            if not embeddings or embeddings[0] is None or len(embeddings[0]) == 0:
+            # CAVEAT ndarray: da ChromaDB 1.5.9 `include=["embeddings"]` ritorna un
+            # numpy.ndarray, non una lista. Qualunque test di verità implicito
+            # (`not emb`, `emb or []`, `if emb:`) chiama bool(ndarray) ->
+            # "ValueError: truth value of an array ... is ambiguous", che il
+            # try/except qui sotto conta come error: flush a 0 processed.
+            # Presenza SOLO via `is None` + len().
+            emb_raw = fetched.get("embeddings")
+            vec = None
+            if emb_raw is not None and _len_or_zero(emb_raw) > 0:
+                candidate = emb_raw[0]
+                if candidate is not None and _len_or_zero(candidate) > 0:
+                    vec = candidate
+            if vec is None:
                 skipped_missing_embedding += 1
                 print(f"[flush-queue-backlog] skip missing embedding: {chunk_id}", file=sys.stderr)
                 continue
 
-            documents = fetched.get("documents") or [""]
-            metadatas = fetched.get("metadatas") or [{}]
+            # Stesso pattern del vettore, stesso motivo: non assumere il tipo di
+            # ritorno di collection.get. Oggi sono liste, ma `or [""]` chiamerebbe
+            # bool() su qualunque cosa Chroma decida di restituire domani (1.5.9
+            # ha già convertito embeddings a ndarray senza preavviso). Presenza
+            # via `is None` + len(). Documento mancante: stringa vuota. Metadata
+            # mancante: None, non {}, perché ChromaDB rifiuta dict metadata vuoti.
+            doc = _first_or_default(fetched.get("documents"), "")
+            meta = _first_or_default(fetched.get("metadatas"), None)
             collection.upsert(
-                ids=[ids[0]],
-                embeddings=[embeddings[0]],
-                documents=[documents[0]],
-                metadatas=[metadatas[0]],
+                ids=[resolved_id],
+                embeddings=[vec],
+                documents=[doc],
+                metadatas=[meta],
             )
             processed += 1
             if progress and processed % 100 == 0:

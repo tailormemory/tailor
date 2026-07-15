@@ -32,6 +32,7 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -1045,6 +1046,19 @@ class FakeFlushCollection:
         })
 
 
+class FakeFlushCollectionNdarray(FakeFlushCollection):
+    """Come FakeFlushCollection, ma `include=["embeddings"]` ritorna un
+    numpy.ndarray 2D — è ciò che fa ChromaDB >= 1.5.9 (il fake a LISTA non
+    riproduce il bug: bool(list) non solleva, bool(ndarray) sì).
+    ids/documents/metadatas restano liste, come nel client reale."""
+
+    def get(self, ids, include=None):
+        out = super().get(ids, include=include)
+        if "embeddings" in (include or []):
+            out["embeddings"] = np.array(out["embeddings"], dtype=np.float32)
+        return out
+
+
 def _install_flush_mocks(monkeypatch, docs):
     fake_collection = FakeFlushCollection(docs)
 
@@ -1106,6 +1120,130 @@ def test_flush_skips_record_without_embedding():
     assert result["skipped_missing_embedding"] == 1
     assert result["skipped_missing_id"] == 0
     assert coll.upserts == []          # nessun upsert senza vettore
+
+
+def test_flush_handles_ndarray_embeddings():
+    """REGRESSIONE ChromaDB 1.5.9: get(include=['embeddings']) ritorna ndarray.
+    Il guard non deve valutare la verità dell'array (`not emb`, `emb or []`) —
+    solleverebbe ValueError: ambiguous, contata come error -> errors=N/N,
+    processed=0, flush che non drena (incident: 1572/1572)."""
+    docs = {f"id{i}": (f"doc {i}", {"source": "document"}) for i in range(3)}
+    coll = FakeFlushCollectionNdarray(docs)
+    result = rhi.flush_queue_backlog(collection=coll, chunk_ids=list(docs))
+
+    assert result["errors"] == 0        # nessun ValueError: ambiguous truth value
+    assert result["processed"] == 3     # il flush drena davvero
+    assert result["skipped"] == 0
+    assert result["skipped_missing_embedding"] == 0
+    # vettore riletto e passato esplicito, anche arrivando come ndarray
+    assert len(coll.upserts) == 3
+    for up in coll.upserts:
+        assert len(up["embeddings"][0]) == 4
+
+
+def test_flush_skips_record_without_embedding_ndarray():
+    """Il ramo skip deve reggere l'ndarray quanto la lista: record senza vettore
+    (shape (1, 0)) -> skipped_missing_embedding, mai un upsert senza vettore
+    (Chroma lo ri-embedderebbe) e mai un ValueError travestito da error."""
+    class _NoVecNdarrayCollection:
+        def __init__(self):
+            self.upserts = []
+
+        def get(self, ids, include=None):
+            return {"ids": list(ids), "documents": ["doc"], "metadatas": [{}],
+                    "embeddings": np.empty((1, 0), dtype=np.float32)}
+
+        def upsert(self, **kw):
+            self.upserts.append(kw)
+
+    coll = _NoVecNdarrayCollection()
+    result = rhi.flush_queue_backlog(collection=coll, chunk_ids=["x"])
+    assert result["errors"] == 0
+    assert result["processed"] == 0
+    assert result["skipped_missing_embedding"] == 1
+    assert coll.upserts == []
+
+
+@pytest.mark.parametrize("embeddings", [
+    None,
+    [],
+    [None],
+    np.array([], dtype=np.float32),
+    np.array(0.1, dtype=np.float32),
+    np.array([np.array(0.1, dtype=np.float32)], dtype=object),
+])
+def test_flush_skips_unusable_embedding_shapes(embeddings):
+    """Forme assenti/scalari non sono vettori upsertabili: skip, non error."""
+    class _UnusableEmbeddingCollection:
+        def __init__(self):
+            self.upserts = []
+
+        def get(self, ids, include=None):
+            return {"ids": list(ids), "documents": ["doc"], "metadatas": [None],
+                    "embeddings": embeddings}
+
+        def upsert(self, **kw):
+            self.upserts.append(kw)
+
+    coll = _UnusableEmbeddingCollection()
+    result = rhi.flush_queue_backlog(collection=coll, chunk_ids=["x"])
+    assert result["errors"] == 0
+    assert result["processed"] == 0
+    assert result["skipped_missing_embedding"] == 1
+    assert coll.upserts == []
+
+
+def test_flush_handles_ndarray_ids_documents_metadatas():
+    """Il guard non deve assumere il tipo di NESSUN campo di collection.get:
+    1.5.9 ha convertito embeddings a ndarray senza preavviso, ids/documents/
+    metadatas possono seguire. Con tutti e quattro come ndarray il flush deve
+    comunque drenare, senza ValueError: ambiguous."""
+    class _AllNdarrayCollection:
+        def __init__(self):
+            self.upserts = []
+
+        def get(self, ids, include=None):
+            return {
+                "ids": np.array(list(ids), dtype=object),
+                "documents": np.array(["doc uno"], dtype=object),
+                "metadatas": np.array([{"source": "document"}], dtype=object),
+                "embeddings": np.array([[0.1, 0.2, 0.3, 0.4]], dtype=np.float32),
+            }
+
+        def upsert(self, **kw):
+            self.upserts.append(kw)
+
+    coll = _AllNdarrayCollection()
+    result = rhi.flush_queue_backlog(collection=coll, chunk_ids=["id1"])
+    assert result["errors"] == 0
+    assert result["processed"] == 1
+    assert result["skipped"] == 0
+    assert coll.upserts[0]["ids"] == ["id1"]
+    assert coll.upserts[0]["documents"] == ["doc uno"]
+    assert coll.upserts[0]["metadatas"] == [{"source": "document"}]
+
+
+def test_flush_upserts_record_with_vector_but_no_document():
+    """Documento/metadata assenti (None) NON bloccano l'upsert: il vettore c'è,
+    ed è l'unica cosa che il flush deve preservare. Documento fallback a "";
+    metadata resta None perché ChromaDB 1.5.9 rifiuta {} come metadata vuoto."""
+    class _NoDocCollection:
+        def __init__(self):
+            self.upserts = []
+
+        def get(self, ids, include=None):
+            return {"ids": list(ids), "documents": [None], "metadatas": [None],
+                    "embeddings": np.array([[0.1, 0.2, 0.3, 0.4]], dtype=np.float32)}
+
+        def upsert(self, **kw):
+            self.upserts.append(kw)
+
+    coll = _NoDocCollection()
+    result = rhi.flush_queue_backlog(collection=coll, chunk_ids=["x"])
+    assert result["errors"] == 0
+    assert result["processed"] == 1
+    assert coll.upserts[0]["documents"] == [""]
+    assert coll.upserts[0]["metadatas"] == [None]
 
 
 def test_flush_skips_missing_id_distinct_counter():
