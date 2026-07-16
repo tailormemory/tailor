@@ -27,6 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from scripts.lib.config import get_model_advisor_config, get_model_advisor_max_size, get as cfg_get
 from scripts.lib.env_loader import load_env
+from scripts.lib.telegram_notify import redact
 load_env()
 
 logging.basicConfig(
@@ -562,9 +563,11 @@ async def notify_telegram(advisories: list[dict]):
                     log.info(f"Telegram notification sent ({len(advisories)} advisories)")
                 else:
                     body = await r.text()
-                    log.warning(f"Telegram send failed: {r.status} {body[:200]}")
+                    # Redigi PRIMA di troncare: [:200] spezzerebbe il token.
+                    log.warning(f"Telegram send failed: {r.status} {redact(body, token)[:200]}")
     except Exception as e:
-        log.warning(f"Telegram notification failed: {e}")
+        # aiohttp incorpora l'URL (quindi il token) nelle sue eccezioni.
+        log.warning(redact(f"Telegram notification failed: {e}", token))
 
 
 # ══════════════════════════════════════════════════════════════

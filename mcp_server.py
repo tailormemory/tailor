@@ -113,6 +113,7 @@ if __name__ == "__main__":
 # Configurazione
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(BASE_DIR, "scripts", "lib"))
+from telegram_notify import redact  # noqa: E402  (redazione token nei log/ritorni)
 sys.path.insert(0, os.path.join(BASE_DIR, "scripts"))  # enables `from lib.X import ...` used in some modules
 
 # ── Auto-rollback: MUST run before any module that reads tailor.yaml ──
@@ -3377,7 +3378,10 @@ def send_telegram(text: str, parse_mode: str = "Markdown") -> str:
         else:
             return f"Telegram API error: {data.get('description', 'unknown')}"
     except Exception as e:
-        return f"Telegram send error: {str(e)}"
+        # NON è un log: è il valore di ritorno del tool MCP, che finisce
+        # nel contesto dell'LLM e nella transcript. `e` incorpora l'URL,
+        # che contiene il token -> redigere qui è più urgente che in un log.
+        return redact(f"Telegram send error: {str(e)}", TELEGRAM_BOT_TOKEN)
 
 
 

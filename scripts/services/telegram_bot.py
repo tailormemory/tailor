@@ -29,6 +29,7 @@ sys.path.insert(0, ROOT_DIR)
 sys.path.insert(0, os.path.join(ROOT_DIR, "scripts"))
 
 from lib.config import load_config, get
+from lib.telegram_notify import redact
 from lib.session_store import init_db, get_or_create_session, add_message, get_history, get_expired_sessions, get_session_messages, close_session, get_session_count
 from lib.llm_client import get_brain, get_classifier, TOOLS
 
@@ -69,18 +70,35 @@ signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
 
 def now(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-def log(msg): print(f"[{now()}] {msg}", file=sys.stderr)
+
+def log(msg):
+    """Ogni riga di stderr passa da qui -> è QUI che si redige.
+
+    Il bot token vive dentro l'URL dell'API (`api.telegram.org/bot<TOKEN>/...`)
+    e `requests` incorpora l'URL nel messaggio delle sue eccezioni. `tg_api`
+    loggava `{e}` nudo: 2.801 righe di logs/telegram_v5_stderr.log contenevano
+    il token VIVO in chiaro. I log stanno nel working tree, leggibili da
+    qualunque sessione agent (CLAUDE.md §2) — .gitignore non protegge da Read.
+
+    Redigere nel choke point invece che sui singoli callsite: copre tg_api, i
+    poll error e ogni log futuro, senza dover ricordarsi di farlo ogni volta.
+    Chi bypassa log() (traceback.print_exc, send_message) redige a mano.
+    """
+    print(f"[{now()}] {redact(str(msg), BOT_TOKEN)}", file=sys.stderr)
 
 # ═══════════════════════════════════════════════════════════════
 # Telegram API
 # ═══════════════════════════════════════════════════════════════
 
 def tg_api(method, data=None):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"  # <- il token vive QUI
     try:
         resp = requests.post(url, json=data, timeout=POLL_TIMEOUT+10) if data else requests.get(url, timeout=POLL_TIMEOUT+10)
         return resp.json()
     except Exception as e:
+        # `e` contiene l'URL (quindi il token): è la riga che ha prodotto le
+        # 2.801 righe leakate. Redige log() — vedi lì. NON stampare `e` per
+        # altre vie senza passare da redact().
         log(f"TG error ({method}): {e}"); return None
 
 def send_message(text, parse_mode="Markdown"):
@@ -326,7 +344,7 @@ def handle_show_status():
                 f"\u2022 Sessioni TG: {sess['total_sessions']} ({sess['active_sessions']} attive)\n"
                 f"\u2022 Messaggi TG: {sess['total_messages']}\n"
                 f"\u2022 Ora: {now()}")
-    except Exception as e: return f"\u26a0\ufe0f {e}"
+    except Exception as e: return f"\u26a0\ufe0f {redact(str(e), BOT_TOKEN)}"
 
 # ═══════════════════════════════════════════════════════════════
 # General Handler — LLM Brain with Tool Use
@@ -418,7 +436,8 @@ def check_and_capture_sessions():
             log(f"Session {sid} captured: {parsed.get('summary', '')[:80]}")
         except Exception as e:
             log(f"Session capture error for {sid}: {e}")
-            close_session(sid, f"error: {e}")
+            # close_session persiste su DB: redigi anche lì, non è solo un log.
+            close_session(sid, f"error: {redact(str(e), BOT_TOKEN)}")
 
 # ═══════════════════════════════════════════════════════════════
 # Message Router
@@ -500,8 +519,12 @@ def poll():
                     send_message(response)
                     
                 except Exception as e:
-                    log(f"Error: {e}"); traceback.print_exc(file=sys.stderr)
-                    send_message(f"\u26a0\ufe0f {str(e)[:200]}")
+                    log(f"Error: {e}")
+                    # print_exc bypassa log(): formatta e redigi a mano.
+                    print(redact(traceback.format_exc(), BOT_TOKEN), file=sys.stderr)
+                    # Redigere PRIMA di troncare: [:200] taglierebbe il token a
+                    # met\u00e0, e un token spezzato non combacia pi\u00f9 col replace.
+                    send_message(f"\u26a0\ufe0f {redact(str(e), BOT_TOKEN)[:200]}")
                     
         except Exception as e:
             log(f"Poll error: {e}"); time.sleep(10)

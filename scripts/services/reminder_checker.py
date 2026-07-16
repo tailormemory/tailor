@@ -26,6 +26,7 @@ from filelock import FileLock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 from env_loader import load_env
+from telegram_notify import redact
 load_env()
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -59,7 +60,8 @@ def send_telegram(text):
             return True
         return False
     except Exception as e:
-        print(f"TG error: {e}", file=sys.stderr); return False
+        # `e` incorpora l'URL, che contiene BOT_TOKEN.
+        print(redact(f"TG error: {e}", BOT_TOKEN), file=sys.stderr); return False
 
 def run_script(script_path, args=None):
     """Run a Python script and capture stdout as message."""

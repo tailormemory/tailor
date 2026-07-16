@@ -56,6 +56,7 @@ import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 from env_loader import load_env  # noqa: E402
+from telegram_notify import redact  # noqa: E402
 
 load_env()
 
@@ -121,7 +122,7 @@ def send_telegram(text: str) -> bool:
     try:
         resp = requests.post(url, json=body, timeout=15)
     except Exception as e:
-        log("WARN", f"Telegram POST raised: {type(e).__name__}: {e}")
+        log("WARN", redact(f"Telegram POST raised: {type(e).__name__}: {e}", TG_TOKEN))
         return False
     if resp.status_code == 200:
         return True
@@ -130,11 +131,12 @@ def send_telegram(text: str) -> bool:
         try:
             resp = requests.post(url, json=body, timeout=15)
         except Exception as e:
-            log("WARN", f"Telegram retry POST raised: {type(e).__name__}: {e}")
+            log("WARN", redact(f"Telegram retry POST raised: {type(e).__name__}: {e}", TG_TOKEN))
             return False
         if resp.status_code == 200:
             return True
-    log("WARN", f"Telegram non-200: status={resp.status_code} body={resp.text[:200]}")
+    log("WARN", f"Telegram non-200: status={resp.status_code} "
+        f"body={redact(resp.text, TG_TOKEN)[:200]}")
     return False
 
 
