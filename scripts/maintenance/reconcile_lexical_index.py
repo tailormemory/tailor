@@ -35,6 +35,9 @@ import sys
 import time
 from dataclasses import dataclass, field
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+from telegram_notify import send_telegram  # noqa: E402
+
 # ============================================================
 # CONFIGURAZIONE
 # ============================================================
@@ -135,6 +138,19 @@ def compute_fingerprint(row: dict) -> str:
         h.update(value)
         h.update(b"\x00")
     return h.hexdigest()
+
+
+class ReconcileAborted(RuntimeError):
+    """Il guardiano ha bloccato il run. Porta con sé il report.
+
+    Sottoclasse di RuntimeError: i callsite che catturano RuntimeError (main,
+    test esistenti) continuano a funzionare. Serve perché `reconcile()` solleva
+    PRIMA di ritornare il report, ma il messaggio FAIL ha bisogno dei conteggi.
+    """
+
+    def __init__(self, message: str, report: dict):
+        super().__init__(message)
+        self.report = report
 
 
 @dataclass
@@ -494,6 +510,83 @@ def apply_plan(conn, plan: ReconcilePlan, rows: dict, fingerprints: dict) -> Non
 
 
 # ============================================================
+# NOTIFICA — testo puro qui, invio (I/O) sotto
+# ============================================================
+
+
+def build_notification(report, error: str = None) -> str:
+    """Testo del messaggio Telegram, o `None` se non c'è niente da dire. Pura.
+
+    Un job schedulato che può abortire da solo DEVE gridare, o diventa il triage
+    fermo 60 notti. Ma un messaggio ogni notte è un messaggio che si ignora — la
+    notifica quindi è per eccezione, non per abitudine:
+
+    - ABORT -> FAIL: l'evento che non deve passare inosservato.
+    - churn > 0 su indice non-bootstrap -> INFO: un incrementale sano è pochi
+      chunk/notte; migliaia sotto il 20% è un sintomo da vedere PRIMA che
+      diventi il 20% e blocchi il job.
+    - run pulito (churn 0) o bootstrap -> None: silenzio.
+    """
+    if error is not None:
+        lines = [
+            "❌ *TAILOR lexical reconciler — FAIL*",
+            "",
+            "Il guardiano ha abortito il run: l'indice NON è stato modificato "
+            "(nessun apply parziale).",
+            "",
+            f"`{error}`",
+        ]
+        if report is not None:
+            lines += [
+                "",
+                f"inserted {report['inserted']:,} · deleted {report['deleted']:,} · "
+                f"updated {report['updated']:,} · unchanged {report['unchanged']:,}",
+                f"KB {report['kb_rows']:,} · indice {report['index_rows_before']:,}",
+            ]
+            if report["fts_divergent"] > 0:
+                lines.append(f"FTS divergente: {report['fts_divergent']:,} righe")
+        lines += ["", "L'indice resta com'era: il retrieval lessicale serve dati stale."]
+        return "\n".join(lines)
+
+    if report["bootstrap"]:
+        return None  # il primo popolamento è atteso, non è un evento
+    if report["churn"] == 0:
+        return None  # run pulito: silenzio
+
+    lines = [
+        "ℹ️ *TAILOR lexical reconciler*",
+        "",
+        f"{report['churn']:,} righe riconciliate su {report['kb_rows']:,} in KB "
+        f"({report['guard']}).",
+        "",
+        f"inserted {report['inserted']:,} · deleted {report['deleted']:,} · "
+        f"updated {report['updated']:,}",
+    ]
+    if report["fts_divergent"] > 0:
+        lines.append(
+            f"⚠️ {report['fts_divergent']:,} righe con FTS divergente dal sidecar, ricostruite"
+        )
+    return "\n".join(lines)
+
+
+def notify(text: str, enabled: bool = True) -> bool:
+    """Manda `text` se c'è qualcosa da mandare. Non solleva MAI.
+
+    `send_telegram` è già best-effort, ma il try/except resta: l'indice conta
+    più della notifica, e un errore inatteso nel path di notifica NON deve
+    trasformare un reconcile riuscito in un exit non-zero (né un abort corretto
+    in un traceback che ne nasconde il motivo).
+    """
+    if not enabled or text is None:
+        return False
+    try:
+        return send_telegram(text)
+    except Exception as e:  # noqa: BLE001 — deliberato: nessuna eccezione passa
+        print(f"WARN: notifica Telegram fallita: {type(e).__name__}: {e}", file=sys.stderr)
+        return False
+
+
+# ============================================================
 # ORCHESTRAZIONE
 # ============================================================
 
@@ -539,7 +632,7 @@ def reconcile(chroma_path: str, index_path: str, max_churn_ratio: float, dry_run
         )
 
         if not ok:
-            raise RuntimeError(message)
+            raise ReconcileAborted(message, report)
 
         if not dry_run:
             apply_plan(index_conn, plan, rows, kb_fingerprints)
@@ -588,16 +681,33 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--dry-run", action="store_true", help="calcola il piano, non applica")
     parser.add_argument("--stats", action="store_true", help="statistiche dell'indice, poi esci")
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="non mandare Telegram (default: notifica attiva su abort e churn anomalo). "
+        "--dry-run implica --quiet: non cambia nulla, quindi non c'è nessun evento.",
+    )
     args = parser.parse_args(argv)
 
     if args.stats:
         return show_stats(args.index_db)
 
+    # Un dry-run non muta niente -> non c'è evento da notificare, e chi lo lancia
+    # sta guardando il terminale.
+    notify_enabled = not args.quiet and not args.dry_run
+
     start = time.time()
     try:
         report = reconcile(args.chroma_db, args.index_db, args.max_churn, dry_run=args.dry_run)
-    except RuntimeError as exc:
+    except ReconcileAborted as exc:
         print(f"❌ RECONCILE ABORTITO: {exc}", file=sys.stderr)
+        notify(build_notification(exc.report, error=str(exc)), notify_enabled)
+        return 1
+    except RuntimeError as exc:
+        # Segmento ambiguo / collection assente: aborta anche questo, e da
+        # schedulato sarebbe muto quanto il guardiano. Grida pure lui.
+        print(f"❌ RECONCILE ABORTITO: {exc}", file=sys.stderr)
+        notify(build_notification(None, error=str(exc)), notify_enabled)
         return 1
 
     elapsed = time.time() - start
@@ -617,6 +727,8 @@ def main(argv=None) -> int:
     print(f"Guardiano:          {report['guard']}")
     print(f"Applicato:          {report['applied']}")
     print(f"Tempo:              {elapsed:.1f}s")
+
+    notify(build_notification(report), notify_enabled)
     return 0
 
 

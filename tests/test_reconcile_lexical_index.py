@@ -19,12 +19,15 @@ import pytest
 from scripts.maintenance.reconcile_lexical_index import (
     DOCUMENT_KEY,
     FTS_DIVERGENT,
+    ReconcileAborted,
     ReconcilePlan,
     as_text,
+    build_notification,
     build_plan,
     check_churn,
     compute_fingerprint,
     is_bootstrap,
+    notify,
     open_index,
     read_index_state,
     reconcile,
@@ -124,6 +127,38 @@ def kb(tmp_path):
 @pytest.fixture
 def index_path(tmp_path):
     return tmp_path / "lexical_index.sqlite3"
+
+
+@pytest.fixture(autouse=True)
+def telegram_inviati(monkeypatch):
+    """RETE DI SICUREZZA — nessun test può mandare un Telegram VERO.
+
+    `autouse` per necessità, non per comodità: `/etc/tailor/env` è 640
+    root:staff e `jarvis` è in staff, quindi `ensure_env()` trova token e chat
+    e `send_telegram` POSTA DAVVERO sul canale di produzione. Qualunque test che
+    chiami `main()` sul path abort (es. `test_exit_code_non_zero_quando_scatta`)
+    manderebbe un FAIL fantasma a Emiliano a ogni `pytest`. È già successo una
+    volta, e i test PASSAVANO: asserivano l'exit code, non l'assenza di effetti.
+
+    Ritorna la lista dei messaggi intercettati: i test sulla notifica ci leggono
+    dentro, tutti gli altri la ignorano ed è solo un bavaglio.
+    """
+    from scripts.maintenance import reconcile_lexical_index as mod
+    import telegram_notify
+
+    inviati = []
+    monkeypatch.setattr(mod, "send_telegram", lambda text: inviati.append(text) or True)
+
+    # Difesa in profondità: `mod.send_telegram` è la seam vera (il reconciler
+    # lega il nome all'import), ma se un domani qualcuno chiamasse l'helper per
+    # un'altra via, deve fallire RUMOROSAMENTE invece di postare in produzione.
+    def _trappola(*a, **kw):
+        raise AssertionError(
+            "invio Telegram REALE da un test: la seam mockata è stata bypassata"
+        )
+
+    monkeypatch.setattr(telegram_notify, "send_telegram", _trappola)
+    return inviati
 
 
 def _run(kb, index_path, max_churn=0.20, dry_run=False):
@@ -687,6 +722,218 @@ class TestSegmentDatabase:
             reconcile(str(path), str(index_path), 0.20)
 
 
+class TestNotificaTesto:
+    """`build_notification` è pura: il contenuto si verifica senza rete."""
+
+    def _report(self, **overrides):
+        report = {
+            "inserted": 0,
+            "deleted": 0,
+            "updated": 0,
+            "unchanged": 100,
+            "kb_rows": 100,
+            "index_rows_before": 100,
+            "bootstrap": False,
+            "churn": 0,
+            "fts_divergent": 0,
+            "guard": "churn 0/100 = 0.0% entro la soglia 20.0%",
+            "applied": True,
+            "segment_id": "seg",
+        }
+        report.update(overrides)
+        return report
+
+    def test_run_pulito_non_notifica(self):
+        assert build_notification(self._report()) is None
+
+    def test_bootstrap_non_notifica(self):
+        # 100% di churn, ma è il primo popolamento: atteso, non è un evento.
+        report = self._report(bootstrap=True, inserted=100, unchanged=0, churn=100)
+        assert build_notification(report) is None
+
+    def test_churn_anomalo_sotto_soglia_notifica(self):
+        report = self._report(
+            updated=3000, unchanged=97000, kb_rows=100000, index_rows_before=100000,
+            churn=3000, guard="churn 3000/100000 = 3.0% entro la soglia 20.0%",
+        )
+        text = build_notification(report)
+
+        assert text is not None
+        assert "3,000 righe riconciliate" in text
+        assert "100,000 in KB" in text
+        assert "3.0%" in text
+        assert "FAIL" not in text
+
+    def test_churn_di_una_riga_notifica(self):
+        # La soglia dell'INFO è churn > 0, non "abbastanza grande": voglio
+        # saperlo prima che diventi il 20%.
+        report = self._report(updated=1, unchanged=99, churn=1)
+        assert build_notification(report) is not None
+
+    def test_info_riporta_fts_divergente(self):
+        report = self._report(updated=55, unchanged=45, churn=55, fts_divergent=55)
+        text = build_notification(report)
+        assert "55 righe con FTS divergente" in text
+        assert "⚠️" in text
+
+    def test_abort_costruisce_il_messaggio_fail(self):
+        report = self._report(
+            updated=40436, unchanged=121308, kb_rows=161744, index_rows_before=161744,
+            churn=40436, applied=False,
+            guard="churn 40436/161744 = 25.0% > soglia 20.0% — divergenza di massa",
+        )
+        errore = (
+            "churn 40436/161744 = 25.0% > soglia 20.0% "
+            "({'inserted': 0, 'deleted': 0, 'updated': 40436, 'unchanged': 121308}) "
+            "— divergenza di massa, NON procedo"
+        )
+
+        text = build_notification(report, error=errore)
+
+        assert "FAIL" in text
+        assert "25.0%" in text  # la percentuale, non solo "è fallito"
+        assert "40436/161744" in text  # churn/corpus grezzi
+        assert "updated 40,436" in text
+        assert "unchanged 121,308" in text
+        assert "KB 161,744" in text
+        assert "NON è stato modificato" in text  # niente apply parziale
+        assert "NON procedo" in text  # il motivo, verbatim dal guardiano
+
+    def test_abort_senza_report_resta_informativo(self):
+        # Segmento ambiguo / collection assente: nessun report, ma il motivo sì.
+        text = build_notification(None, error="Segmento METADATA ambiguo per tailor_kb_v2")
+        assert "FAIL" in text
+        assert "Segmento METADATA ambiguo" in text
+
+
+class TestNotificaInvio:
+    """`notify` non deve poter far fallire il reconciler (requisito 3)."""
+
+    def test_telegram_che_solleva_non_propaga(self, monkeypatch):
+        from scripts.maintenance import reconcile_lexical_index as mod
+
+        def esplode(text):
+            raise ConnectionError("Telegram irraggiungibile")
+
+        monkeypatch.setattr(mod, "send_telegram", esplode)
+        assert notify("qualcosa") is False  # niente eccezione
+
+    def test_niente_da_dire_niente_invio(self, monkeypatch):
+        from scripts.maintenance import reconcile_lexical_index as mod
+
+        inviati = []
+        monkeypatch.setattr(mod, "send_telegram", lambda t: inviati.append(t) or True)
+        assert notify(None) is False
+        assert inviati == []
+
+    def test_disabilitata_non_invia(self, monkeypatch):
+        from scripts.maintenance import reconcile_lexical_index as mod
+
+        inviati = []
+        monkeypatch.setattr(mod, "send_telegram", lambda t: inviati.append(t) or True)
+        assert notify("testo", enabled=False) is False
+        assert inviati == []
+
+
+class TestNotificaWiring:
+    """Il path completo via CLI, con l'invio mockato."""
+
+    @pytest.fixture
+    def spia(self, telegram_inviati):
+        # L'intercettazione è già garantita dalla fixture autouse: qui è solo
+        # un alias leggibile. Nessun test riconfigura il mock per conto suo.
+        return telegram_inviati
+
+    def _cli(self, kb, index_path, *extra):
+        from scripts.maintenance.reconcile_lexical_index import main
+
+        return main(["--chroma-db", str(kb), "--index-db", str(index_path), *extra])
+
+    def test_bootstrap_non_manda_nulla(self, kb, index_path, spia):
+        assert self._cli(kb, index_path) == 0
+        assert spia == []
+
+    def test_run_pulito_non_manda_nulla(self, kb, index_path, spia):
+        self._cli(kb, index_path)
+        spia.clear()
+        assert self._cli(kb, index_path) == 0
+        assert spia == []
+
+    def test_churn_incrementale_manda_info(self, kb, index_path, spia):
+        self._cli(kb, index_path)
+        spia.clear()
+        _rewrite_kb(kb, {f"c{n}": _chunk(n) for n in range(1, 12)})  # +1 chunk
+
+        assert self._cli(kb, index_path) == 0
+
+        assert len(spia) == 1
+        assert "1 righe riconciliate" in spia[0]
+        assert "FAIL" not in spia[0]
+
+    def test_abort_manda_fail_ed_esce_1(self, kb, index_path, spia):
+        self._cli(kb, index_path)
+        spia.clear()
+        chunks = {f"c{n}": _chunk(n) for n in range(1, 11)}
+        for n in (1, 2, 3):
+            chunks[f"c{n}"]["document"] = "riscritto in massa"
+        _rewrite_kb(kb, chunks)
+
+        assert self._cli(kb, index_path) == 1
+
+        assert len(spia) == 1
+        assert "FAIL" in spia[0]
+        assert "30.0%" in spia[0]
+
+    def test_quiet_non_manda_su_abort(self, kb, index_path, spia):
+        self._cli(kb, index_path)
+        chunks = {f"c{n}": _chunk(n) for n in range(1, 11)}
+        for n in (1, 2, 3):
+            chunks[f"c{n}"]["document"] = "riscritto in massa"
+        _rewrite_kb(kb, chunks)
+        spia.clear()
+
+        assert self._cli(kb, index_path, "--quiet") == 1  # exit code invariato
+        assert spia == []
+
+    def test_dry_run_implica_quiet(self, kb, index_path, spia):
+        self._cli(kb, index_path)
+        _rewrite_kb(kb, {f"c{n}": _chunk(n) for n in range(1, 12)})
+        spia.clear()
+
+        assert self._cli(kb, index_path, "--dry-run") == 0
+        assert spia == []
+
+    def test_telegram_rotto_non_cambia_exit_code(self, kb, index_path, monkeypatch):
+        """Requisito 3: l'indice conta più della notifica."""
+        from scripts.maintenance import reconcile_lexical_index as mod
+
+        def esplode(text):
+            raise ConnectionError("Telegram irraggiungibile")
+
+        monkeypatch.setattr(mod, "send_telegram", esplode)
+
+        # Il churn incrementale (successo) resta 0 anche se la notifica esplode.
+        self._cli(kb, index_path)
+        _rewrite_kb(kb, {f"c{n}": _chunk(n) for n in range(1, 12)})
+        assert self._cli(kb, index_path) == 0
+        # E l'indice è stato scritto davvero, notifica o meno.
+        assert len(read_index_state(open_index(str(index_path)))) == 11
+
+    def test_telegram_rotto_non_maschera_labort(self, kb, index_path, monkeypatch):
+        from scripts.maintenance import reconcile_lexical_index as mod
+
+        monkeypatch.setattr(
+            mod, "send_telegram", lambda t: (_ for _ in ()).throw(ConnectionError("giù"))
+        )
+        self._cli(kb, index_path)
+        chunks = {f"c{n}": _chunk(n) for n in range(1, 11)}
+        for n in (1, 2, 3):
+            chunks[f"c{n}"]["document"] = "riscritto in massa"
+        _rewrite_kb(kb, chunks)
+
+        assert self._cli(kb, index_path) == 1  # exit 1, non un traceback
+
+
 class TestGuardiano:
     def test_soglia_scatta_e_non_applica(self, kb, index_path):
         _run(kb, index_path)
@@ -720,7 +967,7 @@ class TestGuardiano:
         assert report["updated"] == 3
         assert report["applied"] is True
 
-    def test_exit_code_non_zero_quando_scatta(self, kb, index_path, capsys):
+    def test_exit_code_non_zero_quando_scatta(self, kb, index_path, capsys, telegram_inviati):
         from scripts.maintenance.reconcile_lexical_index import main
 
         _run(kb, index_path)
@@ -733,6 +980,11 @@ class TestGuardiano:
 
         assert code == 1
         assert "RECONCILE ABORTITO" in capsys.readouterr().err
+        # Questo test prende il path di notifica: senza la fixture autouse
+        # manderebbe un FAIL vero in produzione a ogni pytest. L'asserzione
+        # rende l'effetto esplicito invece di lasciarlo latente.
+        assert len(telegram_inviati) == 1
+        assert "FAIL" in telegram_inviati[0]
 
 
 class TestSegmentFilter:
