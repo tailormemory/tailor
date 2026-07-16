@@ -143,6 +143,7 @@ ENTITY_FETCH_CAP = 100
 # Embedding: loaded from lib.embedding (config-driven)
 from embedding import get_embedding, get_embeddings, info as embedding_info
 from embedding_contract import embedding_text, MAX_EMBED_CHARS
+from fts5_sanitize import sanitize_terms, sanitize_column_terms, INDEXED_COLUMNS
 # Collection name from config
 try:
     from scripts.lib.config import get as _cfg_get_top
@@ -1895,21 +1896,30 @@ def _compose_rerank_pool(items: list, n_results: int) -> list:
     Funzione PURA: opera solo su `items` (lista di tuple (key, dict) dove dict
     contiene almeno 'source_type', 'score', 'date'). Non tocca ChromaDB/SQLite.
 
-    Policy ADDITIVA (B2b-core): i due flussi hanno quote separate invece di un
+    Policy ADDITIVA (B2b-core): i flussi hanno quote separate invece di un
     unico ordinamento "tutti semantic poi tutti entity" con slice singolo — che
     relegava gli entity-hit validi (score 0.5 fisso) in coda e li tagliava fuori
     dal pool del cross-encoder.
 
       - semantic: ordinati per (-score, date ASC), primi  n_results*3
       - entity:   ordinati per (-score, date ASC), primi  n_results
-      - pool = semantic[:3n] + entity[:n]   (entity AGGIUNTI, mai sostituiscono semantic)
+      - lexical:  ordinati per (-score, date ASC), primi  n_results
+      - pool = semantic[:3n] + entity[:n] + lexical[:n]
+        (entity e lexical AGGIUNTI, mai sostituiscono semantic)
+
+    L'additivita' e' anche cio' che rende il ramo lessicale sano SENZA calibrazione
+    di scala (A1): il suo score e' -rank bm25, non un cosine, quindi non e'
+    confrontabile con quello degli altri flussi. Le quote separate fanno sì che i
+    due score si ordinino solo DENTRO il proprio flusso; il ranking cross-flusso
+    resta al cross-encoder a valle.
 
     Conseguenze:
-      - Query senza entity → pool = semantic[:3n], IDENTICO al comportamento
-        pre-fix (zero regressione sulle query puramente semantiche).
-      - Query con entity → pool max = n_results*4; nessun semantic espulso.
-      - Dedup difensivo: se una key comparisse in entrambi i flussi (non dovrebbe,
-        seen_ids dedup a monte) tiene la prima occorrenza (semantic), niente duplicati.
+      - Query senza entity né lexical → pool = semantic[:3n], IDENTICO al
+        comportamento pre-fix (zero regressione sulle query puramente semantiche).
+      - Query con entity+lexical → pool max = n_results*5; nessun semantic espulso.
+      - Dedup difensivo: se una key comparisse in piu' flussi (non dovrebbe,
+        seen_ids dedup a monte) tiene la prima occorrenza (semantic, poi entity,
+        poi lexical), niente duplicati.
 
     Il tie-break date ASC resta invariato (policy separata, fuori scope).
 
@@ -1924,10 +1934,13 @@ def _compose_rerank_pool(items: list, n_results: int) -> list:
     entity = sorted(
         (it for it in items if it[1]["source_type"] == "entity"), key=_sort_key
     )
+    lexical = sorted(
+        (it for it in items if it[1]["source_type"] == "lexical"), key=_sort_key
+    )
 
-    pool = semantic[:n_results * 3] + entity[:n_results]
+    pool = semantic[:n_results * 3] + entity[:n_results] + lexical[:n_results]
 
-    # Dedup preservando l'ordine, prima occorrenza vince (semantic prima di entity).
+    # Dedup preservando l'ordine, prima occorrenza vince (semantic, poi entity, poi lexical).
     seen = set()
     deduped = []
     for key, val in pool:
@@ -1936,6 +1949,29 @@ def _compose_rerank_pool(items: list, n_results: int) -> list:
         seen.add(key)
         deduped.append((key, val))
     return deduped
+
+
+def _lexical_match_expr(query: str) -> str:
+    """Traduce la query utente in un'espressione FTS5 MATCH. Funzione PURA.
+
+    Intent-parse DETERMINISTICO (B1): nessun NL, nessun LLM, nessuna euristica —
+    solo una forma letterale riconosciuta.
+
+      - `col:valore` con `col` in INDEXED_COLUMNS → terms SCOPATI sulla colonna
+        (es. 'email_from:gianluca@x.com' → 'email_from:("gianluca" "x" "com")').
+      - tutto il resto (inclusi i prefissi ignoti tipo 'foo:bar') → terms
+        UNSCOPED su tutte le colonne indicizzate: il ':' non e' alfanumerico,
+        quindi il tokenizer lo tratta come separatore e non finisce nei token.
+
+    Il quoting lo fa sempre il sanitizer (mai barewords) — vedi fts5_sanitize.
+
+    Returns: expr FTS5, oppure '' se la query non ha token alfanumerici (un
+    MATCH '' e' invalido in FTS5 → il chiamante salta il ramo).
+    """
+    m = re.match(r"^(\w+):(.+)$", query.strip()) if query else None
+    if m and m.group(1).lower() in INDEXED_COLUMNS:
+        return sanitize_column_terms(m.group(1), m.group(2))
+    return sanitize_terms(query)
 
 
 def _cosine_relevance(q_vec, c_vec) -> float:
@@ -1973,22 +2009,24 @@ def _cosine_relevance(q_vec, c_vec) -> float:
 
 def _hybrid_collect(query: str, n_results: int, source_filter: str,
                     include_superseded: bool, *, diag: bool = False) -> dict:
-    """STEP 1-3b della pipeline hybrid: retrieval semantic + entity + supersede filter.
+    """STEP 1-3b della pipeline hybrid: retrieval semantic + entity + lexical + supersede filter.
 
     Logica CONDIVISA tra kb_hybrid_search (path produzione) e l'endpoint diagnostico
     read-only. Estratta verbatim da kb_hybrid_search → i due path producono gli stessi
     candidati a parità di (query, n_results, source_filter, include_superseded).
 
-    Read-only: legge la collection Chroma (client vivo via get_collection) e
-    entity_index.sqlite3 in mode=ro. Nessuna scrittura su DB/queue/file.
+    Read-only: legge la collection Chroma (client vivo via get_collection),
+    entity_index.sqlite3 e lexical_index.sqlite3 in mode=ro. Nessuna scrittura su
+    DB/queue/file.
 
     Args:
         diag: se True popola stages/timings con snapshot per-stage (semantic pre-merge,
-            entity pre-cap, entity post-cap). In produzione (False) gli snapshot non
-            vengono costruiti → overhead nullo, comportamento invariato.
+            entity pre-cap, entity post-cap, lexical). In produzione (False) gli snapshot
+            non vengono costruiti → overhead nullo, comportamento invariato.
 
     Returns dict:
         seen_ids:    {cid: {"doc","meta","score","source_type","date"}} POST supersede
+                     (source_type ∈ {"semantic","entity","lexical"})
         entity_hits: [{"entity","chunk_ids"}]
         raw_count:   n. candidati PRIMA del supersede filter (distingue i due messaggi
                      "no results" di kb_hybrid_search)
@@ -1999,6 +2037,7 @@ def _hybrid_collect(query: str, n_results: int, source_filter: str,
     import re as _re
     import time as _time
     ENTITY_DB_PATH = os.path.join(DB_DIR, "entity_index.sqlite3")
+    LEXICAL_DB_PATH = os.path.join(DB_DIR, "lexical_index.sqlite3")
 
     stages = {} if diag else None
     timings = {} if diag else None
@@ -2194,6 +2233,110 @@ def _hybrid_collect(query: str, n_results: int, source_filter: str,
         # post-cap: fetchati e aggiunti (post slice [:ENTITY_FETCH_CAP], post source_filter, PRE-supersede).
         stages["entity_candidates_post_cap"] = {
             "count": len(entity_post_snapshot), "items": entity_post_snapshot
+        }
+
+    # --- STEP 3.5: Lexical branch (FTS5 sidecar) ---
+    # Ramo ADDITIVO: la FTS5 recupera i chunk che il match esatto trova e il vettore
+    # manca (nomi propri rari, path, indirizzi email). Non tocca STEP 1/2/3: se il
+    # ramo salta o solleva, semantic+entity restano identici a prima.
+    _t35 = _now()
+    lexical_snapshot = [] if diag else None
+    lexical_error = None
+    try:
+        match_expr = _lexical_match_expr(query)
+
+        # match_expr vuoto = nessun token alfanumerico nella query: un MATCH ''
+        # e' sintatticamente invalido in FTS5 → si salta il ramo, non si solleva.
+        if match_expr and os.path.exists(LEXICAL_DB_PATH):
+            # mode=ro + busy_timeout: l'indice ha un writer notturno (reconciler
+            # 06:30). Aprire rw creerebbe/migrerebbe il file; senza busy_timeout
+            # una search concorrente al rebuild fallirebbe con "database is locked".
+            lex_conn = _sqlite3.connect(f"file:{LEXICAL_DB_PATH}?mode=ro", uri=True)
+            try:
+                lex_conn.execute("PRAGMA busy_timeout=30000")
+                lex_cursor = lex_conn.cursor()
+                lex_limit = min(n_results * 3, 30)  # overfetch ×3, specchia semantic
+                # Nessuna whitelist di source, DI PROPOSITO: dovrebbe derivare dai
+                # source realmente presenti nell'indice e andrebbe fuori sync al
+                # primo source nuovo (es. `gemini` c'e' nell'indice ma non era
+                # nella whitelist → falso negativo silenzioso). Il sidecar filtra
+                # qualunque valore: source ignoto → join vuoto → ramo vuoto, che
+                # e' la risposta corretta, non un errore.
+                if source_filter:
+                    # I7: il filtro source si fa sul sidecar NON-FTS (lexical_meta),
+                    # pre-query, senza toccare Chroma. `source` non e' una colonna
+                    # FTS → non e' cercabile via MATCH, va joinata.
+                    # NB: con l'alias `f` il MATCH resta sul NOME TABELLA
+                    # (`lexical_fts MATCH ?`): `f MATCH ?` solleva "no such column: f".
+                    lex_cursor.execute(
+                        """
+                        SELECT f.chunk_id, f.rank
+                        FROM lexical_fts f
+                        JOIN lexical_meta m ON m.chunk_id = f.chunk_id
+                        WHERE lexical_fts MATCH ? AND m.source = ?
+                        ORDER BY f.rank LIMIT ?
+                        """,
+                        (match_expr, source_filter, lex_limit),
+                    )
+                else:
+                    lex_cursor.execute(
+                        "SELECT chunk_id, rank FROM lexical_fts WHERE lexical_fts MATCH ? "
+                        "ORDER BY rank LIMIT ?",
+                        (match_expr, lex_limit),
+                    )
+                lexical_rank = {row[0]: row[1] for row in lex_cursor.fetchall()}
+            finally:
+                lex_conn.close()
+
+            # I1: la FTS ritorna SOLO id+rank, mai contenuto — doc/meta si
+            # ri-prendono da Chroma, unica fonte di verita' del testo.
+            new_lexical_ids = [c for c in lexical_rank if c not in seen_ids]
+            FETCH_BATCH = 40
+            for i in range(0, len(new_lexical_ids), FETCH_BATCH):
+                batch_ids = new_lexical_ids[i:i + FETCH_BATCH]
+                # NO embeddings: A1 ordina per rank bm25, non per cosine.
+                batch_result = collection.get(ids=batch_ids, include=["documents", "metadatas"])
+                # ZIP SU batch_result["ids"], MAI su batch_ids: Chroma non preserva
+                # l'ordine e droppa gli id inesistenti → zippare sulla richiesta
+                # disallineerebbe rank↔chunk. Zippando sulla risposta lo stale-drop
+                # (id nella FTS ma non piu' in Chroma) e' gratis.
+                for cid, doc, meta in zip(batch_result["ids"], batch_result["documents"],
+                                          batch_result["metadatas"]):
+                    if source_filter and meta.get("source", "") != source_filter:
+                        continue
+                    if cid in seen_ids:
+                        continue
+                    # score = -rank: il rank bm25 di FTS5 e' negativo e piu'-negativo
+                    # = piu' rilevante. Negandolo diventa positivo-decrescente e
+                    # slotta nel sort (-score, date) di _compose_rerank_pool senza
+                    # toccarlo. NB: e' una scala DIVERSA dal cosine dei rami
+                    # semantic/entity — la fetta additiva (A1) evita il confronto
+                    # cross-scala, il ranking finale lo fa il cross-encoder.
+                    score = -lexical_rank[cid]
+                    seen_ids[cid] = {
+                        "doc": doc, "meta": meta, "score": score,
+                        "source_type": "lexical", "date": meta.get("date", "")
+                    }
+                    if diag:
+                        lexical_snapshot.append({
+                            "chunk_id": cid, "rank": lexical_rank[cid], "score": score,
+                            "source_type": "lexical",
+                            "doc_type": str(meta.get("doc_type", ""))[:64]
+                        })
+    except Exception as _lex_err:
+        # Loud ma non fatale: il lessicale e' additivo, non deve poter rompere la
+        # search. stderr (non Telegram: sarebbe una notifica PER QUERY).
+        print(f"[hybrid] lexical branch failed: {type(_lex_err).__name__}: {_lex_err}",
+              file=sys.stderr, flush=True)
+        # Il diag deve distinguere "ramo fallito" da "nessun candidato": senza
+        # questo, count=0 e' ambiguo e un ramo rotto si legge come una query
+        # senza hit lessicali. None su successo, stringa su fallimento.
+        lexical_error = f"{type(_lex_err).__name__}: {_lex_err}"
+    if diag:
+        timings["lexical_ms"] = (_now() - _t35) * 1000.0
+        stages["lexical_candidates"] = {
+            "count": len(lexical_snapshot), "items": lexical_snapshot,
+            "error": lexical_error
         }
 
     raw_count = len(seen_ids)
