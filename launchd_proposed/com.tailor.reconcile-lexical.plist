@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tailor.reconcile-lexical</string>
+    <key>UserName</key>
+    <string>jarvis</string>
+    <key>GroupName</key>
+    <string>staff</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/jarvis/tailor/scripts/services/run_reconcile_lexical.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/jarvis/tailor</string>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>6</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/Users/jarvis/tailor/logs/reconcile_lexical_stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/jarvis/tailor/logs/reconcile_lexical_stderr.log</string>
+</dict>
+</plist>
