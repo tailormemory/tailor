@@ -884,6 +884,23 @@ class TestNotificaWiring:
         assert "FAIL" in spia[0]
         assert "30.0%" in spia[0]
 
+    def test_errore_sqlite_manda_fail_ed_esce_1(self, kb, index_path, spia, monkeypatch):
+        # Una torn read da scrittura concorrente arriva come sqlite3.DatabaseError,
+        # che NON è una RuntimeError: senza handler dedicato risalirebbe fino a
+        # launchd, muta. Da job schedulato nessuno la vedrebbe mai.
+        from scripts.maintenance import reconcile_lexical_index as mod
+
+        def esplode(*args, **kwargs):
+            raise sqlite3.DatabaseError("database disk image is malformed")
+
+        monkeypatch.setattr(mod, "reconcile", esplode)
+
+        assert self._cli(kb, index_path) == 1
+
+        assert len(spia) == 1
+        assert "FAIL" in spia[0]
+        assert "database disk image is malformed" in spia[0]  # il motivo, non solo "è fallito"
+
     def test_quiet_non_manda_su_abort(self, kb, index_path, spia):
         self._cli(kb, index_path)
         chunks = {f"c{n}": _chunk(n) for n in range(1, 11)}

@@ -293,11 +293,18 @@ def get_metadata_segment(conn) -> str:
 
 
 def open_kb_readonly(chroma_path: str):
-    """Apre la KB in sola lettura. `immutable=1`: niente WAL, niente lock,
-    nessuna scrittura possibile — la KB non si tocca (design §2). Niente
-    PersistentClient: istanziarlo caricherebbe l'HNSW e i writer chromadb.
+    """Apre la KB in sola lettura, COORDINANDOSI con i writer.
+
+    `mode=ro` (non `immutable=1`): la KB è viva — MCP (KeepAlive) può scrivere
+    in qualsiasi momento. `immutable=1` salterebbe lock e journal e su un file
+    scrivibile in journal_mode=delete produrrebbe torn read / SQLITE_CORRUPT.
+    `mode=ro` prende lock condivisi → letture consistenti. busy_timeout: attende
+    invece di errorare se un commit MCP tiene EXCLUSIVE nell'istante della lettura.
+    Niente PersistentClient: caricherebbe l'HNSW e i writer chromadb.
     """
-    return sqlite3.connect(f"file:{chroma_path}?mode=ro&immutable=1", uri=True)
+    conn = sqlite3.connect(f"file:{chroma_path}?mode=ro", uri=True)
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
 
 
 def read_kb_rows(conn, segment_id: str) -> dict:
@@ -702,6 +709,12 @@ def main(argv=None) -> int:
     except ReconcileAborted as exc:
         print(f"❌ RECONCILE ABORTITO: {exc}", file=sys.stderr)
         notify(build_notification(exc.report, error=str(exc)), notify_enabled)
+        return 1
+    except sqlite3.DatabaseError as exc:
+        # Torn/malformed read da scrittura concorrente: raro con mode=ro, ma se
+        # capita NON deve morire in silenzio. Grida come gli altri abort.
+        print(f"❌ RECONCILE ABORTITO (sqlite): {exc}", file=sys.stderr)
+        notify(build_notification(None, error=f"sqlite: {exc}"), notify_enabled)
         return 1
     except RuntimeError as exc:
         # Segmento ambiguo / collection assente: aborta anche questo, e da
