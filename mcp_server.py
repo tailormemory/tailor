@@ -2404,10 +2404,11 @@ def kb_hybrid_search(query: str, n_results: int = 10, source_filter: str = "", i
 
         sem_count = sum(1 for _, v in top_items if v["source_type"] == "semantic")
         ent_count = sum(1 for _, v in top_items if v["source_type"] == "entity")
+        lex_count = sum(1 for _, v in top_items if v["source_type"] == "lexical")
 
         output = [
             f"Hybrid search: {len(seen_ids)} total results (semantic: {sem_count}, "
-            f"entities: {ent_count} nei top {len(top_items)})\n{entity_summary}"
+            f"entities: {ent_count}, lexical: {lex_count} nei top {len(top_items)})\n{entity_summary}"
         ]
 
         # Lookup atomic facts for chunks in results
@@ -2423,8 +2424,10 @@ def kb_hybrid_search(query: str, n_results: int = 10, source_filter: str = "", i
             doc_type = meta.get("doc_type", "")
             category = meta.get("category", "")
             extra = " | ".join(filter(None, [folder, doc_type, f"[{category}]" if category else ""]))
-            tag = "SEM" if item["source_type"] == "semantic" else "ENT"
-            score_str = f"{item['score']:.2f}" if item["source_type"] == "semantic" else "entity"
+            _stype = item["source_type"]
+            tag = {"semantic": "SEM", "lexical": "LEX"}.get(_stype, "ENT")
+            # semantic e lexical hanno uno score numerico (lexical = -rank FTS5); entity no.
+            score_str = f"{item['score']:.2f}" if _stype in ("semantic", "lexical") else "entity"
 
             facts_block = format_facts_block(chunk_facts.get(cid, []))
             fileref = format_document_fileref(meta, base_url=base_url)
@@ -2518,6 +2521,7 @@ def _hybrid_diagnostic(query: str, n_results: int = 10, source_filter: str = "",
             "raw_candidates": collected["raw_count"], "after_supersede": len(seen_ids),
             "final_semantic": sum(1 for it in final_items if it["source_type"] == "semantic"),
             "final_entity": sum(1 for it in final_items if it["source_type"] == "entity"),
+            "final_lexical": sum(1 for it in final_items if it["source_type"] == "lexical"),
         },
         "stages": stages, "timings": timings,
     }
