@@ -71,7 +71,11 @@ ENUMS = {
         "chunk_boundary",
         "unknown",
     },
-    "gold_type": {"single_chunk", "multi_chunk", "doc_summary", "entity", "semantic"},
+    # Solo due valori: il tipo deve rispecchiare la cardinalità di `gold`
+    # (vedi check di coerenza in validate_shape). "doc_summary"/"entity"/
+    # "semantic" non sono più ammessi — non compaiono nel corpus e non
+    # esprimono una cardinalità.
+    "gold_type": {"single_chunk", "multi_chunk"},
     "lang": {"it", "en", "cross"},
     "status": {"draft", "ready"},
 }
@@ -226,6 +230,17 @@ def validate_shape(rec: dict) -> list:
         errors.append("gold deve essere lista di stringhe")
         gold = []  # evita crash nei check successivi
 
+    # gold_type ↔ len(gold): il tipo dichiara la cardinalità, non può mentire.
+    # gold vuoto (draft) non vincola nulla: la cardinalità non è ancora fissata.
+    gold_type = rec.get("gold_type")
+    if gold_type in ENUMS["gold_type"] and len(gold) > 0:
+        expected_type = "single_chunk" if len(gold) == 1 else "multi_chunk"
+        if gold_type != expected_type:
+            errors.append(
+                f"gold_type={gold_type!r} incoerente con len(gold)={len(gold)}: "
+                f"atteso {expected_type!r}"
+            )
+
     # status ↔ gold
     status = rec.get("status")
     if status == "ready" and len(gold) == 0:
@@ -248,6 +263,12 @@ def validate_warnings(rec: dict) -> list:
     warnings = []
     if rec.get("holdout") is True and rec.get("status") == "draft":
         warnings.append("holdout=true su status=draft (gold non ancora fissato)")
+    if rec.get("status") == "ready" and rec.get("source_doc_id") is None:
+        warnings.append(
+            "status=ready con source_doc_id=null — legittimo per un gold di tipo "
+            "summary il cui doc sorgente non è in KB (cfr. miss_analisi_sangue_2025); "
+            "promemoria per i consumer che assumono ready ⇒ source_doc_id"
+        )
     return warnings
 
 
