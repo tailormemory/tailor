@@ -42,7 +42,7 @@ TOOLS = [
             "properties": {
                 "query": {"type": "string", "description": "Search query"},
                 "n_results": {"type": "integer", "description": "Number of results (default 5)", "default": 5},
-                "source_filter": {"type": "string", "description": "Filter by source: document, email, claude, chatgpt, or empty for all", "default": ""},
+                "source_filter": {"type": "string", "description": "Filter by any source present in the KB (document, email, claude, chatgpt, gemini, telegram, ...), or empty for all. Applied verbatim: unknown source -> empty results, not unfiltered ones.", "default": ""},
             },
             "required": ["query"]
         }

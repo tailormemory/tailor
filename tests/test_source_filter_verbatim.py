@@ -92,6 +92,18 @@ def test_kb_search_source_noti_invariati(_recording_env, source):
     assert stub.query_kwargs[0].get("where") == {"source": source}
 
 
+@pytest.mark.parametrize("source", ["document", "chatgpt", "claude", "email"])
+def test_hybrid_collect_source_noti_invariati(_recording_env, source):
+    stub = _recording_env
+
+    mcp_server._hybrid_collect(
+        "rinnovo contratto annuale", n_results=5, source_filter=source,
+        include_superseded=True, diag=False,
+    )
+
+    assert stub.query_kwargs[0].get("where") == {"source": source}
+
+
 # ── source vuoto → nessun where (ricerca su tutta la KB) ──────────────────────
 
 def test_kb_search_source_vuoto_nessun_where(_recording_env):
