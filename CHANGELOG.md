@@ -131,7 +131,105 @@ Template for upcoming changes. Move entries under a new version heading on relea
 ### Docs
 -->
 
+---
+
+## [1.4.0] — 2026-07-18 — Hybrid lexical search & pipeline integrity
+
 ### Added
+
+- **Ricerca ibrida lessicale (FTS5).** Indice lessicale sidecar
+  (`db/lexical_index.sqlite3`, tokenizer `unicode61 remove_diacritics` su
+  `document`, `title`, `folder`, `doc_type`, `email_from`, `file_path`) con ramo
+  dedicato nel retrieval ibrido: la FTS è un indice di soli id+rank, il contenuto
+  è ri-fetchato da ChromaDB, e la fetta è additiva nel pool di rerank
+  (`semantic[:3n] + entity[:n] + lexical[:n]`) senza toccare la quota semantica —
+  senza item lessicali il pool è identico a prima. Score `-rank bm25`: non
+  confrontabile col cosine degli altri rami, quindi le quote separate ordinano
+  solo dentro il proprio flusso e il ranking cross-flusso resta al cross-encoder.
+  Sanitizer di query dedicato (mai barewords: ogni token esce quotato con i `"`
+  interni raddoppiati, control-safe, con varianti scopate per colonna che
+  degradano a unscoped su colonna ignota) e intent-parse deterministico
+  `col:valore`, senza NL né LLM. Il ramo è in try/except: il lessicale non può
+  rompere la search. Reconciler giornaliero (06:30, LaunchDaemon) che riallinea
+  l'indice alla KB per id+fingerprint, in sola lettura (`mode=ro` +
+  `busy_timeout`, coordinato col writer MCP vivo), con guardiano anti-churn
+  (`--max-churn 0.20` → abort) e notifica Telegram su abort/churn anomalo.
+  Nuovi: [`scripts/lib/fts5_sanitize.py`](scripts/lib/fts5_sanitize.py),
+  [`scripts/maintenance/reconcile_lexical_index.py`](scripts/maintenance/reconcile_lexical_index.py),
+  `scripts/services/run_reconcile_lexical.sh`,
+  `launchd_proposed/com.tailor.reconcile-lexical.plist`. Commit
+  [`c95711c`](https://github.com/tailormemory/tailor/commit/c95711c),
+  [`81cdf98`](https://github.com/tailormemory/tailor/commit/81cdf98),
+  [`83c1fda`](https://github.com/tailormemory/tailor/commit/83c1fda),
+  [`2e396fa`](https://github.com/tailormemory/tailor/commit/2e396fa),
+  [`b10f641`](https://github.com/tailormemory/tailor/commit/b10f641),
+  [`d5c7474`](https://github.com/tailormemory/tailor/commit/d5c7474).
+
+- **Label sorgente a 3 vie nel risultato ibrido.** Ogni risultato è etichettato
+  `SEM`/`ENT`/`LEX` con score coerente per ramo; contatori e diagnostica estesi
+  (`final_lexical`). File: [`mcp_server.py`](mcp_server.py). Commit
+  [`98186ec`](https://github.com/tailormemory/tailor/commit/98186ec).
+
+- **Corpus diagnostico retrieval + validatore.** Corpus di diagnosi e regression
+  per il tuning del retrieval (**non** un benchmark statistico), schema v3:
+  `origin`, `expected_failure_mode`, `gold_type` e `holdout` separano la leva
+  candidata dalla forma del gold. Validatore read-only che verifica l'esistenza
+  dei gold in KB leggendo il segmento metadata via sqlite `mode=ro` (pattern del
+  reconciler, nessun `PersistentClient` → nessuna race SIGSEGV), fail-closed se
+  la KB non è verificabile. Nuovi:
+  [`eval/retrieval_corpus.jsonl`](eval/retrieval_corpus.jsonl),
+  [`eval/validate_corpus.py`](eval/validate_corpus.py). Commit
+  [`4e581f4`](https://github.com/tailormemory/tailor/commit/4e581f4),
+  [`67c7659`](https://github.com/tailormemory/tailor/commit/67c7659).
+
+- **Censimento e re-embed vettoriale dei chunk difformi.** Nuovo strumento:
+  dry-run di censimento empirico vettoriale (ricostruzione byte-esatta del testo
+  storicamente embeddato, riconosciuto per `cos = 1.000000` col vettore in
+  indice) su snapshot HNSW offline, senza `PersistentClient`; execute gated su
+  maintenance lock ricontrollato a ogni batch (exit 3 se il lock si perde), con
+  upsert vector-only (documenti e metadati verbatim dal `get` live, embeddings
+  espliciti), skip degli id mancanti per non resuscitare chunk cancellati e
+  checkpoint idempotente con `fsync`. Nuovo:
+  [`scripts/maintenance/reembed_prefixed.py`](scripts/maintenance/reembed_prefixed.py).
+  Commit [`a0974a6`](https://github.com/tailormemory/tailor/commit/a0974a6).
+
+- **Endpoint diagnostico read-only della pipeline di ranking.**
+  `/api/diag/hybrid-search?q=&n=&source=&include_superseded=` espone
+  `kb_hybrid_search` stage per stage con i tempi di ciascuno: candidati semantici,
+  candidati entity pre- e post-cap, sopravvissuti al filtro supersede, pool
+  composto in ingresso al cross-encoder e ordine finale — ogni item con
+  `chunk_id`, rank, score, `source_type` e `doc_type` — più `timings` per step
+  (`semantic_ms`, `entity_extract_ms`, `entity_fetch_ms`, `supersede_ms`,
+  `pool_ms`, `rerank_ms`, `total_ms`) e i contatori di composizione. Serve a
+  vedere *dove* un chunk cade, invece di dedurlo dal risultato finale. Read-only
+  per costruzione: la collection è aperta con un getter dedicato (mai
+  `get_or_create`), la logica di raccolta è la STESSA funzione del path di
+  produzione (`_hybrid_collect`, con `diag` come solo interruttore) così la
+  diagnostica non può divergere da ciò che misura, e il rerank non ha fallback
+  remoto — se il cross-encoder locale non è disponibile il backend è dichiarato
+  `unavailable` e l'ordine resta quello del pool, invece di far uscire i documenti
+  verso un servizio esterno. Dietro autenticazione come le altre API. File:
+  [`mcp_server.py`](mcp_server.py). Commit
+  [`4fa49d8`](https://github.com/tailormemory/tailor/commit/4fa49d8).
+
+- **`kb_find_document` esposto al chat agent web.** Il tool esisteva lato MCP ma
+  non era in `TOOLS` né nei `TOOL_HANDLERS`, quindi l'agent della dashboard non
+  poteva chiamarlo: ora è dichiarato con lo schema allineato alla firma reale
+  (`query` obbligatoria, `n_results` default 10) e instradato dall'handler. Solo
+  wiring: nessuna nuova logica, nessuna regola di strategia nel system prompt,
+  nessun tocco al ranking. File:
+  [`scripts/lib/llm_client.py`](scripts/lib/llm_client.py),
+  [`scripts/lib/tool_executor.py`](scripts/lib/tool_executor.py). Commit
+  [`c965156`](https://github.com/tailormemory/tailor/commit/c965156).
+
+- **Dashboard installabile come PWA su home screen iOS/Android.** Nuovo
+  `dashboard/manifest.json` (display `standalone`, scope `/`, start_url
+  `/dashboard`, theme e background `#000000`, icone 192/512 `any maskable`) e i
+  tag `<head>` necessari a iOS (`link manifest`, `apple-touch-icon`,
+  `apple-mobile-web-app-*`, `theme-color`); icone PNG incluse come asset. File:
+  [`dashboard/index.html`](dashboard/index.html),
+  [`dashboard/manifest.json`](dashboard/manifest.json). Commit
+  [`17cd199`](https://github.com/tailormemory/tailor/commit/17cd199).
 
 - **Supporto file Markdown (`.md`/`.markdown`) nell'ingest.** Aggiunte le
   estensioni a `ingest.supported_extensions`; nuovo path di chunking dedicato
@@ -143,7 +241,121 @@ Template for upcoming changes. Move entries under a new version heading on relea
   condiviso con PDF/docx/pptx invariato. `tailor.yaml.example` allineato.
   File: [`scripts/ingest/ingest_docs.py`](scripts/ingest/ingest_docs.py).
 
+### Changed
+
+- **Quota entity additiva nel pool di rerank.** `_compose_rerank_pool` ordinava
+  tutti i candidati semantici prima di tutti gli entity e tagliava con una slice
+  unica `[:3n]`: gli entity-hit validi finivano sistematicamente in coda e un
+  entity a rank profondo non entrava MAI nel pool del cross-encoder, per quanto
+  pertinente. Ora i due flussi sono ordinati separatamente e il pool è
+  `semantic[:3n] + entity[:n]`: gli entity si **aggiungono**, non sostituiscono —
+  zero semantic espulsi — con dedup difensivo (prima occorrenza) sulle chiavi
+  presenti in entrambi. Una query senza entity produce un pool identico al
+  pre-fix: zero regressione sul percorso puramente semantico. Preparato da un
+  refactor a parità di comportamento: selezione degli entity resa deterministica
+  (candidati ordinati prima del loop, `ORDER BY chunk_id` nella query, così il
+  cap è ripetibile) e composizione del pool estratta in funzione pura, senza
+  accesso a ChromaDB/SQLite e quindi testabile in isolamento. File:
+  [`mcp_server.py`](mcp_server.py). Commit
+  [`b277516`](https://github.com/tailormemory/tailor/commit/b277516),
+  [`ecba703`](https://github.com/tailormemory/tailor/commit/ecba703).
+
+- **Contratto di embedding unico.** `embedding_text(source, meta, document)`:
+  testo nudo, troncatura unica a `MAX_EMBED_CHARS`, zero rami su `source`/`meta`
+  (che restano in firma solo per non toccare i callsite in futuro). Ogni prefisso
+  per provenienza era uno schema implicito — non esiste nella query, embeddata
+  nuda, quindi i vettori prefissati stavano fuori dal manifold della query. 12
+  writer allineati: 4 di ingest (docs, conversazioni, upload, gmail — rimosso
+  anche il secondo path di embedding che gmail aveva in proprio), 3 su MCP
+  (`kb_add`, `kb_update_session`, `/api/ingest-live`), 2 di enrichment (summary)
+  e 3 di manutenzione. Il flush del backlog queue **non ri-embedda più**: passava
+  `upsert()` senza `embeddings=`, così ChromaDB risintetizzava i vettori dal
+  documento e una via pensata solo per far avanzare il contatore di persist era
+  di fatto un writer semantico (3.058 chunk riscritti dal 12/06); ora rilegge i
+  vettori memorizzati e li passa espliciti, rifiutando i record senza vettore.
+  `repair --apply` è esplicito sul fatto che per i chunk oltre soglia il vettore
+  ricostruito è una migrazione al contratto, non un restore (contato a parte come
+  `migrated_truncated` e dichiarato nel maintenance log). Nuovo:
+  [`scripts/lib/embedding_contract.py`](scripts/lib/embedding_contract.py). Commit
+  [`bd0914c`](https://github.com/tailormemory/tailor/commit/bd0914c),
+  [`9934a35`](https://github.com/tailormemory/tailor/commit/9934a35),
+  [`d393f3a`](https://github.com/tailormemory/tailor/commit/d393f3a),
+  [`848347d`](https://github.com/tailormemory/tailor/commit/848347d).
+
 ### Fixed
+
+- **Pipeline sync email fail-loud.** Il notturno riportava successo per ~60 notti
+  senza fare nulla: il triage usciva 0 con un warning e `sync_email.sh` non
+  controllava `$?`, quindi chunk e ingest giravano su dati stale mentre la KB
+  smetteva in silenzio di avanzare. Ora ogni step verifica l'exit code e aborta
+  non-zero; guardia anti-silenzio post-ingest a tre livelli che rilegge la KB da
+  sqlite (`mode=ro`) riusando le funzioni reali di chunking per non poter
+  divergere: **A** (exit 10) ogni `chunk_id` prodotto deve esistere in KB;
+  **C** (exit 12) ogni email utile che passa i filtri e ha ancora testo deve
+  avere ≥1 chunk; **B** (exit 11) heartbeat sul conteggio email fermo per N
+  notti consecutive mentre l'export porta id nuovi. Sul percorso `run-sync` del
+  triage: gate separati e distinguibili per **missing/empty id** e **duplicate
+  id** (prima collassavano sulla stessa chiave `""` e i missing venivano
+  riportati come duplicati), journal di sync corrotto ora fatale con path e
+  numero di riga invece di righe scartate in silenzio, e le email in errore non
+  contano più come fatte al `--resume` (rientrano in coda e vengono ritentate),
+  con exit non-zero e sommario esplicito sul residuo. File:
+  [`sync_email.sh`](sync_email.sh),
+  [`scripts/gmail/triage_gmail.py`](scripts/gmail/triage_gmail.py). Commit
+  [`4d3a880`](https://github.com/tailormemory/tailor/commit/4d3a880),
+  [`4985e5d`](https://github.com/tailormemory/tailor/commit/4985e5d),
+  [`a2992dd`](https://github.com/tailormemory/tailor/commit/a2992dd),
+  [`c1cc972`](https://github.com/tailormemory/tailor/commit/c1cc972).
+
+- **`/api/ingest-live`: embeddava il vettore del primo carattere.** La chiamata
+  passava una *stringa* a `get_embeddings`, che si aspetta `list[str]`: il
+  provider Ollama la iterava per carattere producendo un vettore per carattere, e
+  il ramo di flatten teneva `embedding[0]` — il vettore del PRIMO CARATTERE.
+  Ha corrotto in silenzio ogni chunk `live_` (cos ~0,567 verso l'embedding vero
+  del testo completo, cos 1,0 verso quello del primo carattere). Ora passa una
+  lista di un elemento; il ramo di flatten è rimosso, era ciò che consumava il
+  bug rendendolo invisibile. I chunk `live_` esistenti NON sono riparati da
+  questo cambio (re-embed separato, vedi lo strumento in *Added*). File:
+  [`mcp_server.py`](mcp_server.py). Commit
+  [`e94fb4a`](https://github.com/tailormemory/tailor/commit/e94fb4a).
+
+- **Flush ndarray-safe su ChromaDB 1.5.9.** Da 1.5.9
+  `collection.get(include=["embeddings"])` ritorna un `numpy.ndarray`, non una
+  lista: il guard del flush ne valutava la verità (`or []`, `not embeddings`) e
+  sollevava "truth value of an array ... is ambiguous", che il try/except del loop
+  contava come *error*. Ogni record falliva prima dell'upsert (run 08:03:
+  `errors=1572/1572`, `processed=0`, queue e drift invariati): il flush non
+  drenava più nulla e lo faceva contando errori invece di gridare. La presenza si
+  testa ora solo con `is None` + `len()`, esteso a `ids`/`documents`/`metadatas`;
+  metadata mancante ricade su `None` e non su `{}` (1.5.9 rifiuta il dict vuoto).
+  Verificato live: queue 740 → 1, drift 739 → 0, `skipped=0`. File:
+  [`scripts/maintenance/repair_hnsw_index.py`](scripts/maintenance/repair_hnsw_index.py).
+  Commit [`3b7c77d`](https://github.com/tailormemory/tailor/commit/3b7c77d).
+
+- **Candidati entity ordinati per cosine reale invece che per data.** Gli
+  entity-hit ricevevano uno score costante `0.5`, quindi la chiave di ordinamento
+  `(-score, date)` del pool collassava sulla data: gli entity erano ranked per
+  recency, non per pertinenza, e `entity[:n]` selezionava i più vecchi invece dei
+  più pertinenti — un ranking finto. Ora sono scorati con la cosine reale fra il
+  vettore della query (già in scope dallo step semantico: nessuna chiamata di
+  embedding aggiuntiva) e il vettore del chunk, recuperato con
+  `include=["embeddings"]` sulla `get()` già presente. La collection è
+  `hnsw:space=cosine` e il ramo semantico calcola già `max(0, 1-dist)`: i due
+  rami atterrano sulla stessa scala senza calibrazione. Vettore mancante o
+  malformato ricade su `0.0`, mai su `0.5` — `0.5` non è neutro, batterebbe
+  candidati con cosine bassa ma reale. Correttezza, non tuning: quota e cap
+  restano invariati. File: [`mcp_server.py`](mcp_server.py). Commit
+  [`aa91a69`](https://github.com/tailormemory/tailor/commit/aa91a69).
+
+- **Dedup dei candidati entity prima del cap.** Il ramo entity accodava un
+  `chunk_id` una volta per ogni entity-hit corrispondente (il guard `cid not in
+  seen_ids` non intercetta i ripetuti: contiene solo i candidati semantici e non
+  si aggiorna nel loop). Una query a 3 entità produceva 277 righe per 109 chunk
+  unici (61% duplicati), così il cap affettava una lista gonfiata e alla fetch
+  arrivavano ~98 chunk unici. Dedup order-preserving; il cap è estratto in
+  costante perché non possa divergere dalla diagnostica che lo misura. File:
+  [`mcp_server.py`](mcp_server.py). Commit
+  [`9377f1c`](https://github.com/tailormemory/tailor/commit/9377f1c).
 
 - **Auto-flush queue HNSW: burst allineato al `sync_threshold`.** Il burst di
   re-upsert (`repair_hnsw_index.py --flush-queue-backlog`) era dimensionato a
@@ -155,6 +367,73 @@ Template for upcoming changes. Move entries under a new version heading on relea
   0), con loop di top-up capped e success-criterion che richiede l'allineamento
   (`drift % sync_threshold == 0`). Validato sul campo: queue 607 -> 0 al primo
   ciclo auto-flush. File: [`scripts/maintenance/repair_hnsw_index.py`](scripts/maintenance/repair_hnsw_index.py).
+
+- **Chat agent: risposta vuota al cap di iterazioni.** Raggiunto il tetto di
+  iterazioni tool, il loop emetteva un errore nudo e nessun testo — bolla muta su
+  query KB reali. Ora fa una chiamata finale in streaming **senza** tool, che
+  sintetizza dai `tool_result` già raccolti. La sola richiesta finale però
+  terminava su un blocco `tool_result` senza istruzione e il modello, pronto a
+  chiamare un altro tool, non aveva aggancio per rispondere: viene appeso un
+  blocco di testo dopo i `tool_result`, su una **copia** locale dei messaggi
+  (lo storico resta immutato, niente poison dei turni successivi). Il nudge è
+  anti-allucinazione — rispondi solo dai risultati raccolti, dichiara se sono
+  insufficienti — così un retrieval-miss resta un miss dichiarato invece di
+  diventare una risposta inventata. Se la sintesi torna comunque vuota:
+  messaggio deterministico più un errore che riporta lo `stop_reason` della
+  chiamata finale, per distinguere il silenzio nonostante il nudge dal troncamento
+  per `max_tokens` (alzato a 1500 per questa sola chiamata) da un'anomalia dello
+  stream. File: [`scripts/lib/llm_client.py`](scripts/lib/llm_client.py). Commit
+  [`0771cfa`](https://github.com/tailormemory/tailor/commit/0771cfa),
+  [`e836a42`](https://github.com/tailormemory/tailor/commit/e836a42).
+
+- **Chat agent: HTTP 400 da blocchi di testo whitespace-only.** Il separatore
+  `"\n\n"` finiva nel testo finale, veniva persistito e riproposto al modello, che
+  rifiutava la richiesta ("text content blocks must contain non-whitespace text").
+  Ora la ricostruzione dello storico esclude dal replay gli assistant
+  whitespace-only — filtro applicato PRIMA di ogni richiesta, quindi protegge
+  anche dai record già corrotti a database — mentre i `tool_calls` restano per la
+  UI. In persistenza il testo reale è preservato verbatim (nessuno strip
+  distruttivo): il messaggio è marcato come "senza testo" solo se lo strip è
+  vuoto, i turni con soli tool salvano `content=""` e i turni senza né testo né
+  tool non producono record. I delta whitespace continuano a essere streammati al
+  frontend come separatore visivo. File:
+  [`scripts/lib/chat_api.py`](scripts/lib/chat_api.py),
+  [`scripts/lib/llm_client.py`](scripts/lib/llm_client.py). Commit
+  [`0771cfa`](https://github.com/tailormemory/tailor/commit/0771cfa).
+
+### Security
+
+- **Redaction del bot token in log e output dei tool.** Il token vive nell'URL
+  `api.telegram.org/bot<TOKEN>/`, che le eccezioni di `requests` incorporano:
+  finiva in chiaro nei log. Redatto nel choke point di logging del bot e nei siti
+  che lo bypassano, nei 5 duplicati di `send_telegram` e nel valore di ritorno che
+  finiva nel contesto MCP; la redazione avviene **prima** di ogni troncamento.
+  Nuovo: [`scripts/lib/telegram_notify.py`](scripts/lib/telegram_notify.py).
+  Commit [`dcdf474`](https://github.com/tailormemory/tailor/commit/dcdf474).
+
+- **Scanner esteso alla forma del token dentro `logs/` e URL.** Lo scanner
+  notturno riportava "clean (0 findings)" per giorni mentre un log conteneva il
+  bot token vivo su 2.801 righe. Due cause indipendenti: (a) `logs/` era escluso
+  **in blocco** dall'allowlist per il rumore di una sola regola — l'esclusione è
+  ora mirata a quella regola, e `logs/` resta scansionato da tutte le altre;
+  (b) la regola di default per i token Telegram richiede un confine di parola
+  prima delle cifre, che fra `bot` e il token nell'URL non c'è — cioè non vedeva
+  esattamente la forma in cui il token leakka davvero. Aggiunta una regola custom
+  con boundary solo a destra. Verificato con un canarino iniettato e poi rimosso;
+  falsi positivi della regola custom: 0. Commit
+  [`2966ddd`](https://github.com/tailormemory/tailor/commit/2966ddd).
+
+- **Guard di rete nei test contro egress Telegram.** `/etc/tailor/env` è
+  `640 root:staff` e l'utente di servizio è in `staff`: qualunque test che
+  raggiunge `send_telegram` trova token e chat id e posta **davvero** sul canale
+  di produzione — è successo, e i test passavano lo stesso perché asserivano
+  l'exit code, non l'assenza di effetti. `conftest.py` copre ora l'intera suite su
+  due assi complementari: env azzerato (chiude i sottoprocessi, che ereditano
+  `os.environ` e cortocircuitano prima della POST) più `ENV_FILE` puntato a un
+  path inesistente (senza, `ensure_env()` rileggerebbe il token da disco), e trappole
+  in-process su `requests` e `aiohttp` che sollevano su una POST verso Telegram
+  lasciando passare intatto tutto il resto. Commit
+  [`2e22f96`](https://github.com/tailormemory/tailor/commit/2e22f96).
 
 
 ---
@@ -1081,7 +1360,8 @@ First public release. Self-hosted AI memory framework with persistent, searchabl
 
 ---
 
-[Unreleased]: https://github.com/tailormemory/tailor/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/tailormemory/tailor/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/tailormemory/tailor/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/tailormemory/tailor/compare/v1.2.10...v1.3.0
 [1.2.10]: https://github.com/tailormemory/tailor/compare/v1.2.9...v1.2.10
 [1.2.9]: https://github.com/tailormemory/tailor/compare/v1.2.8...v1.2.9
