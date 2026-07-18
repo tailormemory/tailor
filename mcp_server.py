@@ -1824,7 +1824,9 @@ def kb_search(query: str, n_results: int = 5, source_filter: str = "", include_s
     Args:
         query: The question or topic to search (e.g. "crypto investment decisions")
         n_results: Number of results to return (default 5, max 20)
-        source_filter: Filter by source: "document", "chatgpt", "claude" or "" for all
+        source_filter: Filter by any source present in the KB ("document", "chatgpt",
+            "claude", "email", "gemini", ...), or "" for all. Applied verbatim: an
+            unknown source yields empty results, not unfiltered ones.
         include_superseded: If True, include chunks superseded by more recent info (default False)
     """
     n_results = min(max(n_results, 1), 20)
@@ -1833,7 +1835,11 @@ def kb_search(query: str, n_results: int = 5, source_filter: str = "", include_s
         collection = get_collection()
         fetch_n = n_results * 3 if not include_superseded else n_results * 3
         kwargs = dict(query_embeddings=[embedding], n_results=fetch_n)
-        if source_filter in ("document", "chatgpt", "claude", "email"):
+        # Nessuna whitelist di source: il filtro si applica verbatim (stessa
+        # semantica del ramo lessicale, vedi _hybrid_collect STEP 4). Source
+        # ignoto → where non matcha → zero risultati, che e' la risposta
+        # corretta; una whitelist darebbe fallthrough NON filtrato.
+        if source_filter:
             kwargs["where"] = {"source": source_filter}
         results = collection.query(**kwargs)
         if not results or not results["documents"] or not results["documents"][0]:
@@ -2054,7 +2060,9 @@ def _hybrid_collect(query: str, n_results: int, source_filter: str,
     semantic_n = min(n_results * 3, 30)
     embedding = get_embedding(query)
     sem_kwargs = dict(query_embeddings=[embedding], n_results=semantic_n)
-    if source_filter in ("document", "chatgpt", "claude", "email"):
+    # Filtro verbatim, nessuna whitelist: vedi il commento in STEP 4 (ramo
+    # lessicale). Source ignoto → zero risultati, mai fallthrough non filtrato.
+    if source_filter:
         sem_kwargs["where"] = {"source": source_filter}
     sem_results = collection.query(**sem_kwargs)
 
@@ -2367,7 +2375,9 @@ def kb_hybrid_search(query: str, n_results: int = 10, source_filter: str = "", i
     Args:
         query: The question or topic to search (e.g. "what decisions were made about project X?")
         n_results: Number of results (default 10, max 30)
-        source_filter: Filter by source: "document", "chatgpt", "claude", "email" or "" for all
+        source_filter: Filter by any source present in the KB ("document", "chatgpt",
+            "claude", "email", "gemini", ...), or "" for all. Applied verbatim: an
+            unknown source yields empty results, not unfiltered ones.
         include_superseded: If True, include chunks superseded by more recent info (default False)
     """
     n_results = min(max(n_results, 1), 30)
