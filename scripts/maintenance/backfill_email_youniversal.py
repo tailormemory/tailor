@@ -90,6 +90,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -138,12 +139,48 @@ class MaintenanceLost(RuntimeError):
     """Lock sparito o diventato stale a meta' run -> abort immediato."""
 
 
+# argv del processo MCP, cercato in `ps -o command=` per l'anti PID-reuse.
+# Su macOS ps mostra il binario (Python.app/.../Python) seguito dallo script
+# come argomento, quindi il substring check sul path dello script e' affidabile.
+MCP_PROC_MARKER = "mcp_server.py"
+
+
+def _pid_is_mcp(pid: int) -> tuple[bool, str]:
+    """Il PID e' davvero il MCP? (anti PID-reuse).
+
+    kill -0 prova solo che UN processo con quel PID esiste: dopo un wrap del
+    contatore PID il numero puo' essere stato riassegnato a un processo
+    qualunque, e un lock stale passerebbe per valido. Qui si verifica anche
+    l'identita'. Se `ps` stesso fallisce l'identita' non e' VALIDABILE, e non
+    validabile == rifiuto: con Chroma in gioco l'errore da preferire e' il
+    falso negativo (mi fermo per niente), mai il falso positivo (due
+    PersistentClient = SIGSEGV).
+    """
+    try:
+        r = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, f"identita' PID {pid} NON validabile (ps fallito: {e})"
+    if r.returncode != 0:
+        return False, (f"identita' PID {pid} NON validabile "
+                       f"(ps rc={r.returncode})")
+    cmd = (r.stdout or "").strip()
+    if not cmd:
+        return False, f"identita' PID {pid} NON validabile (ps senza output)"
+    if MCP_PROC_MARKER not in cmd:
+        return False, (f"lock STALE: PID {pid} NON e' il MCP — PID riusato da "
+                       f"altro processo (cmd={cmd[:70]!r})")
+    return True, cmd
+
+
 def maintenance_state() -> tuple[bool, str]:
-    """(ok, motivo). ok=True solo con lock presente e PID vivo.
+    """(ok, motivo). ok=True solo con lock presente, PID vivo E che sia il MCP.
 
     Il PID nel lock e' quello del MCP che ha eseguito _enter_maintenance, cioe'
     che ha CHIUSO il client Chroma. Se quel processo non esiste piu', il lock e'
-    un residuo: il MCP corrente (altro PID) puo' avere Chroma aperto.
+    un residuo: il MCP corrente (altro PID) puo' avere Chroma aperto. Se esiste
+    ma non e' un MCP, il PID e' stato riusato: stesso residuo, travestito da
+    lock valido.
     """
     if not os.path.exists(MAINTENANCE_LOCK):
         return False, f"nessun lock in {MAINTENANCE_LOCK}"
@@ -165,7 +202,10 @@ def maintenance_state() -> tuple[bool, str]:
         return False, (f"lock STALE: PID {pid} non esiste piu' "
                        f"(il MCP che rilascio' Chroma e' morto)")
     except PermissionError:
-        pass   # esiste ma di altro utente: vivo, va bene
+        pass   # esiste ma di altro utente (il MCP gira come root): vivo, ok
+    is_mcp, why = _pid_is_mcp(pid)
+    if not is_mcp:
+        return False, why
     return True, f"lock valido (MCP pid={pid})"
 
 
@@ -446,9 +486,26 @@ def execute(limit_emails: int | None) -> int:
         logf.close()
         return 0
 
-    import chromadb
-    client = chromadb.PersistentClient(path=DB_DIR)
-    coll = client.get_collection(COLLECTION_NAME)
+    # GATE prima di APRIRE il client, non solo prima di scrivere: lo scan dei
+    # 618MB dura minuti e la maintenance puo' cadere proprio li'. Senza questa
+    # guardia il PersistentClient si aprirebbe comunque — e aprirlo mentre il
+    # MCP ha riaperto il suo e' gia' il SIGSEGV, molto prima del primo upsert.
+    try:
+        _assert_maintenance("prima di PersistentClient")
+        import chromadb
+        client = chromadb.PersistentClient(path=DB_DIR)
+        _assert_maintenance("prima di get_collection")
+        coll = client.get_collection(COLLECTION_NAME)
+    except MaintenanceLost as e:
+        sys.stderr.write(
+            f"\nABORT: maintenance mode persa durante lo scan ({e}).\n"
+            f"  lock atteso in {MAINTENANCE_LOCK}\n"
+            f"  NESSUNA scrittura effettuata (client mai aperto).\n"
+            f"  rientra in maintenance (kill -USR1 <mcp_pid>) e rilancia lo\n"
+            f"  stesso comando.\n")
+        log(f"[ABORT] maintenance persa prima del client: {e}")
+        logf.close()
+        return 3
 
     ckpt = open(CHECKPOINT_PATH, "a")
     emails_ok = chunks_ok = 0
