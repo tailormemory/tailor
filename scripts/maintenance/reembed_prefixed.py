@@ -213,7 +213,21 @@ def cos(a: np.ndarray, b: np.ndarray) -> float:
 # ACCESSO SQLITE READ-ONLY
 # ============================================================================
 def ro_connect() -> sqlite3.Connection:
-    return sqlite3.connect(f"file:{SQLITE_PATH}?mode=ro&immutable=1", uri=True)
+    """Sola lettura COORDINATA con i writer (lezione P6).
+
+    `mode=ro` e NON `immutable=1`: il censimento gira a KB viva (il dry-run per
+    contratto non richiede maintenance mode, e il MCP in KeepAlive puo'
+    scrivere in qualsiasi istante). `immutable=1` salterebbe lock e journal e
+    su un file scrivibile in journal_mode=delete produrrebbe torn read /
+    SQLITE_CORRUPT — qui il danno e' silenzioso e si propaga: i candidati
+    letti male finiscono nel targets file che poi guida le riscritture di
+    --execute. `mode=ro` prende lock condivisi. busy_timeout: attende invece
+    di errorare se un commit MCP tiene EXCLUSIVE nell'istante della lettura.
+    Riferimento: reconcile_lexical_index.py:295-307.
+    """
+    conn = sqlite3.connect(f"file:{SQLITE_PATH}?mode=ro", uri=True)
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
 
 
 def vector_segment_dir(con: sqlite3.Connection) -> str:
