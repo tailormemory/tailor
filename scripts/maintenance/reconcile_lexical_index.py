@@ -12,7 +12,7 @@ Invarianti rispettate (design P6 §2bis):
          interrogabile per il filtro pre-query del ramo lessicale.
 
 L'indice è un **accessorio, non una fonte** (I1): rigenerabile da zero. Questo
-job non tocca la KB (`mode=ro&immutable=1`, nessun PersistentClient) e non è
+job non tocca la KB (`mode=ro` + busy_timeout, nessun PersistentClient) e non è
 agganciato a nessun writer.
 
 Uso:

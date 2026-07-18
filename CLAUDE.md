@@ -161,7 +161,7 @@ L'agente riporta il comando, non lo esegue.
 
 - **Scope**: 1 commit = 1 cambio logico. No bundling unrelated edits.
 - **Message format**: conventional commits — `feat(area):`, `fix(area):`, `refactor:`, `docs(area):`. Em-dash (`—`) come separatore in titoli `[x.y.z]` del CHANGELOG (vedi entry recenti).
-- **Trailer**: `Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>` alla fine del messaggio (policy harness).
+- **Trailer**: `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>` alla fine del messaggio (policy harness).
 - **Niente push automatico**. `git push origin main` lo lancia Emiliano dopo review.
 - **Niente file `docs/releases/vX.Y.Z.md`**: il canonico è `CHANGELOG.md` + GitHub Release page. Mai duplicare.
 - **`[Unreleased]` in CHANGELOG**: contiene solo cambi non ancora versionati. Al release, promuovere in `[X.Y.Z]` e ripristinare il template commento.

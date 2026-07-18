@@ -353,14 +353,16 @@ Automated enrichment runs every night:
 | Time | Job | Description |
 |---|---|---|
 | 02:30 | **Backup** | SQLite databases |
+| 03:00 | **Pipeline** | Cloud sync → doc ingest → entities → facts → supersession → derivation → profile |
+| 04:00 | **Email** | Gmail/IMAP export → triage → chunk → ingest |
+| 06:30 | **Reconciler** | Lexical index reconciliation (FTS5) |
+| 08:00/14:00/20:00 | **Auto-flush** | HNSW queue flush (gated) |
+
 > **Important**: Set `TAILOR_HOME` in your crontab so the pipeline resolves paths correctly:
 > ```
 > TAILOR_HOME=/path/to/tailor
 > 0 3 * * * cd /path/to/tailor && ./sync_and_ingest.sh
 > ```
-
-| 03:00 | **Pipeline** | Cloud sync → doc ingest → entities → facts → supersession → derivation → profile |
-| 04:00 | **Email** | Gmail/IMAP export → triage → chunk → ingest |
 
 Safety features: ChromaDB integrity check before any write operation, graceful SIGTERM with 15s grace period (no `kill -9`), automatic restore from backup on corruption, Telegram alerts on failure.
 
