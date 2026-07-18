@@ -20,15 +20,17 @@ except BlockingIOError:
 # OS rilascia il lock automaticamente a chiusura FD / exit processo
 # ── end lock ──────────────────────────────────────────────────────────────
 
-import os, sys, json, subprocess, requests
+import os, sys, json, subprocess
 from datetime import datetime, timedelta
 from filelock import FileLock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 from env_loader import load_env
-from telegram_notify import redact
+from telegram_notify import send_telegram
 load_env()
 
+# Non li usa più send_telegram (che rilegge l'env da sé), ma restano: run_script
+# li propaga ai subprocess, e il gate qui sotto tiene il fail-fast su env mancante.
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -48,20 +50,6 @@ def load_reminders():
 def save_reminders(rem):
     with FileLock(LOCK_FILE, timeout=5):
         with open(REMINDERS_FILE, "w") as f: json.dump(rem, f, indent=2, ensure_ascii=False)
-
-def send_telegram(text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    try:
-        resp = requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
-        data = resp.json()
-        if data.get("ok"): return True
-        if "can't parse" in data.get("description","").lower():
-            requests.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=10)
-            return True
-        return False
-    except Exception as e:
-        # `e` incorpora l'URL, che contiene BOT_TOKEN.
-        print(redact(f"TG error: {e}", BOT_TOKEN), file=sys.stderr); return False
 
 def run_script(script_path, args=None):
     """Run a Python script and capture stdout as message."""

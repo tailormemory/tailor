@@ -52,11 +52,11 @@ import time
 from datetime import datetime
 from typing import NamedTuple
 
-import requests
+import requests  # health check MCP post-restart in restart_mcp(), non solo Telegram
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 from env_loader import load_env  # noqa: E402
-from telegram_notify import redact  # noqa: E402
+from telegram_notify import send_telegram  # noqa: E402
 
 load_env()
 
@@ -94,9 +94,6 @@ MCP_HEALTH_URL = "http://127.0.0.1:8787/api/auth/check"
 
 TS_FMT = "%Y-%m-%d %H:%M:%S"
 
-TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
-
 
 # ─────────────────────────────── logging ────────────────────────────────────
 
@@ -107,37 +104,6 @@ def log(level: str, message: str) -> None:
     with open(LOG_PATH, "a") as f:
         f.write(line + "\n")
     print(line, flush=True)
-
-
-# ─────────────────────────────── telegram ───────────────────────────────────
-
-def send_telegram(text: str) -> bool:
-    """Best-effort. Markdown con fallback a plain text su parse-error (come
-    queue_depth_monitor). Un fallimento Telegram NON deve abortire la procedura."""
-    if not TG_TOKEN or not TG_CHAT:
-        log("WARN", "Telegram skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID empty")
-        return False
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    body = {"chat_id": TG_CHAT, "text": text, "parse_mode": "Markdown"}
-    try:
-        resp = requests.post(url, json=body, timeout=15)
-    except Exception as e:
-        log("WARN", redact(f"Telegram POST raised: {type(e).__name__}: {e}", TG_TOKEN))
-        return False
-    if resp.status_code == 200:
-        return True
-    if resp.status_code == 400 and "can't parse" in resp.text.lower():
-        body.pop("parse_mode", None)
-        try:
-            resp = requests.post(url, json=body, timeout=15)
-        except Exception as e:
-            log("WARN", redact(f"Telegram retry POST raised: {type(e).__name__}: {e}", TG_TOKEN))
-            return False
-        if resp.status_code == 200:
-            return True
-    log("WARN", f"Telegram non-200: status={resp.status_code} "
-        f"body={redact(resp.text, TG_TOKEN)[:200]}")
-    return False
 
 
 # ──────────────────────────── helpers / subprocess ──────────────────────────
@@ -646,21 +612,21 @@ def run_procedure(audit: dict, dry_run: bool) -> int:
     send_telegram(
         "🧹 *TAILOR auto-flush — START*\n"
         f"Collection pending: `{cqp0}` (min {qmin}) · queue_total globale: `{queue0}`\n"
-        f"Indice pulito ({ghost_note}) → flush #6975 automatico in corso."
+        f"Indice pulito ({ghost_note}) → flush #6975 automatico in corso.", log=log
     )
 
     mcp_pid = find_mcp_pid()
     if mcp_pid is None:
         log("ERROR", "MCP non identificato univocamente — abort, niente maintenance")
         send_telegram("❌ *TAILOR auto-flush — FAIL*\nMCP assente o con PID multipli: impossibile "
-                      "identificarlo univocamente. Nessuna azione eseguita.")
+                      "identificarlo univocamente. Nessuna azione eseguita.", log=log)
         return 1
 
     # Backup PRIMA della maintenance (il tool flush rifiuta senza backup <60 min).
     # Verifica integrità con gzip -t: backup_db.sh può ritornare 0 con un .gz troncato.
     if not run_backup() or not verify_backup():
         send_telegram("❌ *TAILOR auto-flush — FAIL*\nBackup fallito o corrotto (`gzip -t`): "
-                      "flush annullato (nessuna maintenance, nessuna mutazione).")
+                      "flush annullato (nessuna maintenance, nessuna mutazione).", log=log)
         return 1
 
     signaled = False
@@ -672,11 +638,11 @@ def run_procedure(audit: dict, dry_run: bool) -> int:
         if os.path.exists(MAINTENANCE_LOCK):
             log("ABORT", "maintenance.lock comparso tra audit e flush — altra operazione in corso")
             send_telegram("⏸️ *TAILOR auto-flush — ABORT*\nUn'altra manutenzione ha preso il "
-                          "`maintenance.lock` mentre stavamo per agire. Nessun flush eseguito.")
+                          "`maintenance.lock` mentre stavamo per agire. Nessun flush eseguito.", log=log)
             return 0
         if not signal_maintenance_on(mcp_pid):
             send_telegram("❌ *TAILOR auto-flush — FAIL*\nInvio SIGUSR1 a MCP fallito. "
-                          "Nessun flush eseguito.")
+                          "Nessun flush eseguito.", log=log)
             return 1
         signaled = True
         if _wait_lock(present=True, timeout_s=MAINTENANCE_LOCK_WAIT_S):
@@ -712,7 +678,7 @@ def run_procedure(audit: dict, dry_run: bool) -> int:
         log("FAIL", "maintenance non confermata (lock non comparso) — flush non eseguito")
         send_telegram(
             "❌ *TAILOR auto-flush — FAIL*\nMaintenance ON non confermata (`maintenance.lock` "
-            f"non comparso). Flush non eseguito. Restart MCP: `{restart_state}`."
+            f"non comparso). Flush non eseguito. Restart MCP: `{restart_state}`.", log=log
         )
         return 1
 
@@ -742,7 +708,7 @@ def run_procedure(audit: dict, dry_run: bool) -> int:
                 "⚠️ *TAILOR auto-flush — PARTIAL / FAIL-RESTART*\n"
                 f"Mutazione rifiutata dal tool (`{refuse_err}`, gestito) ma **restart MCP "
                 f"FALLITO**: `{restart_state}`.\n"
-                "Restart manuale: `sudo launchctl unload/load /Library/LaunchDaemons/com.tailor.mcp.plist`."
+                "Restart manuale: `sudo launchctl unload/load /Library/LaunchDaemons/com.tailor.mcp.plist`.", log=log
             )
             return 1
         if refuse_err in ("queue_empty", "collection_queue_empty"):
@@ -753,7 +719,7 @@ def run_procedure(audit: dict, dry_run: bool) -> int:
                 "watermark (`collection_queue_pending=0`): il WAL non ha backlog flushabile "
                 "per questa collection. NON ritentare il flush — investigare i write/persist "
                 "mancanti o valutare un rebuild dell'indice.\n"
-                f"Restart MCP: `{restart_state}`."
+                f"Restart MCP: `{restart_state}`.", log=log
             )
             return 0
         if refuse_err == "ambiguous_collection_topic":
@@ -762,7 +728,7 @@ def run_procedure(audit: dict, dry_run: bool) -> int:
                 "⚠️ *TAILOR auto-flush — ESCALATION — MUTAZIONE RIFIUTATA (topic WAL ambiguo)*\n"
                 "Il tool non ha risolto univocamente il topic della collection nel WAL: "
                 "mutazione rifiutata, nessuna scrittura. Investigare i topic duplicati.\n"
-                f"Restart MCP: `{restart_state}`."
+                f"Restart MCP: `{restart_state}`.", log=log
             )
             return 0
         # anomalous_drift + unknown_drift_types (difesa futura) → stessa escalation.
@@ -778,7 +744,7 @@ def run_procedure(audit: dict, dry_run: bool) -> int:
             f"sql_only_orphans=`{sql_only}` anomalous_ghosts=`{anomalous}` "
             f"blocking_unknown=`{blocking}`.\n"
             "Non auto-remediabile: investigare / rebuild manuale. Vedi RUNBOOK_drift_alert.md §2.\n"
-            f"Restart MCP: `{restart_state}`."
+            f"Restart MCP: `{restart_state}`.", log=log
         )
         return 0
 
@@ -787,11 +753,11 @@ def run_procedure(audit: dict, dry_run: bool) -> int:
         if restarted:
             log("NOOP", "flush gate-skip: queue già sotto soglia al momento del flush (rc=0)")
             send_telegram("ℹ️ *TAILOR auto-flush — NO-OP*\nLa queue si è drenata da sola prima del "
-                          "flush. Restart MCP: OK.")
+                          "flush. Restart MCP: OK.", log=log)
             return 0
         log("PARTIAL", f"flush NO-OP ma restart MCP stato={restart_state}")
         send_telegram("⚠️ *TAILOR auto-flush — PARTIAL / FAIL-RESTART*\nLa queue si è drenata "
-                      f"prima del flush, ma restart MCP fallito: `{restart_state}`.")
+                      f"prima del flush, ma restart MCP fallito: `{restart_state}`.", log=log)
         return 1
 
     flush_contract_ok = (
@@ -811,7 +777,7 @@ def run_procedure(audit: dict, dry_run: bool) -> int:
                 f"Queue total (globale): `{queue0}` → `{post_queue}`\n"
                 f"Drift: `{pre.get('drift')}` → `{post.get('drift')}`\n"
                 f"Vector seq Δ: `{(flush_json or {}).get('vector_seq_delta')}`{partial_note}\n"
-                "Restart MCP: OK (graceful)"
+                "Restart MCP: OK (graceful)", log=log
             )
             return 0
         # Flush OK ma MCP non riavviato → PARTIAL (l'HNSW in-memory resta stale)
@@ -820,7 +786,7 @@ def run_procedure(audit: dict, dry_run: bool) -> int:
             "⚠️ *TAILOR auto-flush — PARTIAL*\n"
             f"Flush OK (queue `{queue0}` → `{post_queue}`) ma **restart MCP FALLITO**: "
             f"`{restart_state}`.\n"
-            "Restart manuale: `sudo launchctl unload/load /Library/LaunchDaemons/com.tailor.mcp.plist`."
+            "Restart manuale: `sudo launchctl unload/load /Library/LaunchDaemons/com.tailor.mcp.plist`.", log=log
         )
         return 1
 
@@ -836,7 +802,7 @@ def run_procedure(audit: dict, dry_run: bool) -> int:
         f"Flush rc=`{flush_rc}` (queue `{queue0}` → `{post_queue}`).\n"
         f"{ghost_note}"
         f"Restart MCP: `{restart_state}`.\n"
-        "Non ritentare alla cieca: vedi `logs/auto_flush.log` e RUNBOOK_drift_alert.md §3."
+        "Non ritentare alla cieca: vedi `logs/auto_flush.log` e RUNBOOK_drift_alert.md §3.", log=log
     )
     return 1
 
@@ -871,7 +837,7 @@ def main() -> int:
         MAINTENANCE_LOCK = args.maintenance_lock
 
     if args.force_start_telegram:
-        ok = send_telegram("🧪 TEST — TAILOR auto-flush path notifica OK (ignora questo messaggio).")
+        ok = send_telegram("🧪 TEST — TAILOR auto-flush path notifica OK (ignora questo messaggio).", log=log)
         log("FORCE_TG", f"sent={ok}")
         return 0 if ok else 1
 
@@ -916,7 +882,7 @@ def main() -> int:
             send_telegram(
                 "⚠️ *TAILOR auto-flush — ESCALATION (schema invalid)*\n"
                 "Audit JSON incoerente/malformato: impossibile valutare la benignità dei ghost. "
-                "Nessun flush eseguito. Verificare `repair_hnsw_index.py --audit --json` e i log."
+                "Nessun flush eseguito. Verificare `repair_hnsw_index.py --audit --json` e i log.", log=log
             )
             log("ESCALATE", "schema_invalid")
             return 0
@@ -934,7 +900,7 @@ def main() -> int:
             f"{mixed}\n"
             + ("⚠️ audit schema legacy: benignità sconosciuta, conservativo.\n" if gc.legacy else "")
             + "`--apply` per orphans; ghost anomali → *investigare / rebuild manuale*. "
-            "Vedi RUNBOOK_drift_alert.md §2."
+            "Vedi RUNBOOK_drift_alert.md §2.", log=log
         )
         log("ESCALATE", reason)
         return 0

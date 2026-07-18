@@ -239,16 +239,42 @@ class TestNessunLeakNelRepo:
         "rel",
         [
             "scripts/services/telegram_bot.py",
-            "scripts/services/auto_flush_queue.py",
-            "scripts/services/queue_depth_monitor.py",
-            "scripts/services/chromadb_version_check.py",
-            "scripts/services/reminder_checker.py",
             "scripts/services/model_advisor.py",
             "mcp_server.py",
         ],
     )
-    def test_ogni_sender_importa_redact(self, rel):
+    def test_ogni_sender_residuo_importa_redact(self, rel):
+        """Chi manda ancora per conto proprio deve almeno redigere.
+
+        Sono i tre non consolidati: `telegram_bot` ha un choke-point di log
+        tutto suo, `model_advisor` e `mcp_server` ritornano stringhe verso
+        l'LLM invece di loggare. Gli altri cinque non compaiono più qui perché
+        non hanno più un sender proprio — vedi il test qui sotto.
+        """
         assert "telegram_notify import redact" in self._src(rel)
+
+    @pytest.mark.parametrize(
+        "rel",
+        [
+            "scripts/services/auto_flush_queue.py",
+            "scripts/services/queue_depth_monitor.py",
+            "scripts/services/chromadb_version_check.py",
+            "scripts/services/heartbeat.py",
+            "scripts/services/reminder_checker.py",
+        ],
+    )
+    def test_i_cinque_daemon_non_hanno_un_sender_proprio(self, rel):
+        """Il guard anti-leak per questi cinque non è più testuale: è che il
+        codice che potrebbe leakare non esiste più nel file.
+
+        Ricomparire con un `def send_telegram` locale significherebbe rifare la
+        copia — e la copia è precisamente ciò che portava il token in chiaro
+        nei log al primo blip di rete.
+        """
+        src = self._src(rel)
+        assert "from telegram_notify import send_telegram" in src
+        assert "def send_telegram" not in src
+        assert "api.telegram.org" not in src
 
     def test_telegram_bot_redige_nel_choke_point(self):
         # Il log() è l'unica via per stderr: se redige lì, tg_api è coperto.
@@ -263,40 +289,20 @@ class TestNessunLeakNelRepo:
         assert "traceback.print_exc(file=sys.stderr)" not in src
         assert "redact(traceback.format_exc(), BOT_TOKEN)" in src
 
-    @pytest.mark.parametrize(
-        "rel",
-        [
-            "scripts/services/auto_flush_queue.py",
-            "scripts/services/queue_depth_monitor.py",
-            "scripts/services/chromadb_version_check.py",
-        ],
-    )
-    def test_trittico_senza_eccezione_nuda(self, rel):
-        src = self._src(rel)
-        for livello in ("WARN", "ERROR"):
-            assert (
-                f'log("{livello}", f"Telegram POST raised: {{type(e).__name__}}: {{e}}")'
-                not in src
-            )
-            assert (
-                f'log("{livello}", f"Telegram retry POST raised: {{type(e).__name__}}: {{e}}")'
-                not in src
-            )
-        assert "redact(f\"Telegram POST raised" in src
+    def test_canonico_senza_eccezione_nuda(self):
+        """Le due forme che leakavano nel trittico, ora in un posto solo.
 
-    @pytest.mark.parametrize(
-        "rel",
-        [
-            "scripts/services/auto_flush_queue.py",
-            "scripts/services/queue_depth_monitor.py",
-            "scripts/services/chromadb_version_check.py",
-        ],
-    )
-    def test_non200_redige_prima_di_troncare(self, rel):
-        src = self._src(rel)
+        Prima erano tre asserzioni parametrizzate su tre sorgenti; il POST e il
+        retry vivono adesso qui dentro, quindi qui basta guardarli una volta.
+        """
+        src = self._src("scripts/lib/telegram_notify.py")
+        assert 'f"Telegram POST raised: {type(e).__name__}: {e}")' not in src
+        assert 'f"Telegram retry POST raised: {type(e).__name__}: {e}")' not in src
+        assert 'redact(f"Telegram POST raised' in src
+        assert 'redact(f"Telegram retry POST raised' in src
         # `resp.text[:200]` nudo taglierebbe il token a metà: irredimibile.
         assert "body={resp.text[:200]}" not in src
-        assert "redact(resp.text, TG_TOKEN)[:200]" in src
+        assert "redact(resp.text, token)[:200]" in src
 
     def test_mcp_server_non_ritorna_leccezione_nuda(self):
         # È il RETURN di un tool MCP: finisce nel contesto dell'LLM, non in un
@@ -305,11 +311,17 @@ class TestNessunLeakNelRepo:
         assert 'return f"Telegram send error: {str(e)}"' not in src
         assert 'redact(f"Telegram send error: {str(e)}", TELEGRAM_BOT_TOKEN)' in src
 
-    def test_heartbeat_resta_senza_leak(self):
-        # Non è stato toccato perché `except Exception: pass` non logga nulla.
-        # Se un domani qualcuno ci mette un log, questo test lo fa notare.
+    def test_heartbeat_logga_su_file_non_su_stderr(self):
+        """Heartbeat prima ingoiava tutto con `except Exception: pass`; ora il
+        canonico i WARN li scrive davvero, e la destinazione conta.
+
+        Gira ogni 5 minuti sotto launchd: con `log=None` finirebbero su stderr,
+        cioè nel log di sistema, a ogni ciclo. L'adapter esiste solo per questo
+        (la `log(msg)` del job è mono-argomento e non combacia con la firma).
+        """
         src = self._src("scripts/services/heartbeat.py")
-        assert "except Exception:\n        pass" in src
+        assert "def _tg_log(level, message):" in src
+        assert "send_telegram(msg, log=_tg_log)" in src
 
 
 class TestContratto:

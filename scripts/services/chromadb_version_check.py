@@ -25,7 +25,7 @@ from packaging.version import InvalidVersion, Version
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 from env_loader import load_env  # noqa: E402
-from telegram_notify import redact  # noqa: E402
+from telegram_notify import send_telegram  # noqa: E402
 
 load_env()
 
@@ -34,9 +34,6 @@ REQUIREMENTS = os.path.join(BASE_DIR, "requirements.txt")
 LOG_PATH = os.path.join(BASE_DIR, "logs", "chromadb_version_check.log")
 PYPI_URL = "https://pypi.org/pypi/chromadb/json"
 PINNED_RE = re.compile(r"^chromadb==(?P<ver>\d+\.\d+\.\d+(?:[-.+\w]*)?)\s*$", re.MULTILINE)
-
-TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
 def log(status: str, message: str) -> None:
@@ -83,35 +80,6 @@ def fetch_latest_pypi() -> tuple[str, str] | None:
     return latest, upload_time
 
 
-def send_telegram(text: str) -> bool:
-    """POST sendMessage to Telegram. Return True on HTTP 200."""
-    if not TG_TOKEN or not TG_CHAT:
-        log("ERROR", "Telegram skipped: TG_TOKEN or TG_CHAT empty")
-        return False
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    body = {"chat_id": TG_CHAT, "text": text, "parse_mode": "Markdown"}
-    try:
-        resp = requests.post(url, json=body, timeout=15)
-    except Exception as e:
-        log("ERROR", redact(f"Telegram POST raised: {type(e).__name__}: {e}", TG_TOKEN))
-        return False
-    if resp.status_code == 200:
-        return True
-    if resp.status_code == 400 and "can't parse" in resp.text.lower():
-        # Markdown parse failure → retry plain
-        body.pop("parse_mode", None)
-        try:
-            resp = requests.post(url, json=body, timeout=15)
-        except Exception as e:
-            log("ERROR", redact(f"Telegram retry POST raised: {type(e).__name__}: {e}", TG_TOKEN))
-            return False
-        if resp.status_code == 200:
-            return True
-    log("ERROR", f"Telegram non-200: status={resp.status_code} "
-        f"body={redact(resp.text, TG_TOKEN)[:200]}")
-    return False
-
-
 def build_alert(pinned: str, latest: str, upload_date: str) -> str:
     return (
         f"🔔 *chromadb update available*\n"
@@ -136,7 +104,7 @@ def main() -> int:
     if args.force_alert:
         msg = build_alert(pinned="X.Y.Z (forced)", latest="X.Y.W (forced)", upload_date="2026-05-04")
         msg = "⚠️ TEST FORCED ALERT — ignore content\n\n" + msg
-        ok = send_telegram(msg)
+        ok = send_telegram(msg, log=log)
         log("FORCE_ALERT", f"sent={ok}")
         print(f"force-alert sent={ok}")
         return 0 if ok else 1
@@ -159,7 +127,7 @@ def main() -> int:
 
     if v_latest > v_pinned:
         msg = build_alert(pinned, latest, upload_date)
-        ok = send_telegram(msg)
+        ok = send_telegram(msg, log=log)
         log("UPDATE_AVAILABLE", f"pinned={pinned} latest={latest} released={upload_date} telegram_sent={ok}")
         print(f"UPDATE_AVAILABLE pinned={pinned} latest={latest} telegram_sent={ok}")
         return 0

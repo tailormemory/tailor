@@ -66,12 +66,10 @@ import sqlite3
 import sys
 from datetime import datetime, timedelta
 
-import requests
-
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # per import auto_flush_queue
 from env_loader import load_env  # noqa: E402
-from telegram_notify import redact  # noqa: E402
+from telegram_notify import send_telegram  # noqa: E402
 # Stessa fonte del gate auto-flush: la soglia (queue_min) e la cache dell'audit
 # per-collection che il gate persiste a ogni run (collection_queue_pending_count).
 # Il monitor NON rieffettua l'audit: legge la cache (vedi read_collection_pending).
@@ -109,9 +107,6 @@ DRIFT_WARNING = 800   # drift > 800  → WARNING (tollerante: lazy compaction no
 DRIFT_CRITICAL = 1500 # drift > 1500 → CRITICAL (problema reale, oltre sync_threshold)
 
 TS_FMT = "%Y-%m-%d %H:%M:%S"
-
-TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
 def log(level: str, message: str) -> None:
@@ -442,33 +437,6 @@ def format_wal_aging_alert(snap: dict, level: str, window_hours: int) -> str:
     return "\n".join(lines)
 
 
-def send_telegram(text: str) -> bool:
-    if not TG_TOKEN or not TG_CHAT:
-        log("ERROR", "Telegram skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID empty")
-        return False
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    body = {"chat_id": TG_CHAT, "text": text, "parse_mode": "Markdown"}
-    try:
-        resp = requests.post(url, json=body, timeout=15)
-    except Exception as e:
-        log("ERROR", redact(f"Telegram POST raised: {type(e).__name__}: {e}", TG_TOKEN))
-        return False
-    if resp.status_code == 200:
-        return True
-    if resp.status_code == 400 and "can't parse" in resp.text.lower():
-        body.pop("parse_mode", None)
-        try:
-            resp = requests.post(url, json=body, timeout=15)
-        except Exception as e:
-            log("ERROR", redact(f"Telegram retry POST raised: {type(e).__name__}: {e}", TG_TOKEN))
-            return False
-        if resp.status_code == 200:
-            return True
-    log("ERROR", f"Telegram non-200: status={resp.status_code} "
-        f"body={redact(resp.text, TG_TOKEN)[:200]}")
-    return False
-
-
 def maintenance_lock_present() -> bool:
     return os.path.exists(MAINTENANCE_LOCK)
 
@@ -700,7 +668,7 @@ def _emit_queue_signal(args: argparse.Namespace, state: dict, key: str,
         log("DRY_RUN", f"{kind} {summary}")
         print(f"DRY-RUN would alert ({kind}) {summary}:\n{msg}")
         return False, False
-    ok = send_telegram(msg)
+    ok = send_telegram(msg, log=log)
     if ok:
         state[key] = {"last_alert_ts": datetime.now().strftime(TS_FMT), "kind": kind}
     log("ALERT", f"{kind} {summary} sent={ok}")
@@ -833,7 +801,7 @@ def handle_drift(args: argparse.Namespace, queue_snap: dict | None) -> int:
                 log("DRIFT_DRY_RUN", f"{key} drift={r['drift']} status={status}")
                 print(f"DRIFT DRY-RUN would alert {key}:\n{msg}")
                 continue
-            ok = send_telegram(msg)
+            ok = send_telegram(msg, log=log)
             if ok:
                 new_state[key] = {
                     "last_alert_ts": r["ts"],
@@ -891,7 +859,7 @@ def main() -> int:
             f"Stuck: forced (>={STUCK_WINDOW_HOURS}h simulato)\n"
             "Run: `python scripts/maintenance/repair_hnsw_index.py`"
         )
-        ok = send_telegram(msg)
+        ok = send_telegram(msg, log=log)
         log("FORCE_ALERT", f"sent={ok}")
         print(f"force-alert sent={ok}")
         return 0 if ok else 1

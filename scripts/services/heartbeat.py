@@ -22,21 +22,19 @@ except BlockingIOError:
 # OS rilascia il lock automaticamente a chiusura FD / exit processo
 # ── end lock ──────────────────────────────────────────────────────────────
 
-import os, sys, json, subprocess, socket, requests
+import os, sys, json, subprocess, socket
 from datetime import datetime
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 from config import get as cfg
 from i18n import t
 from env_loader import load_env
+from telegram_notify import send_telegram
 load_env()
 APP_NAME = cfg("branding", "app_name") or "TAILOR"
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 STATE_FILE = os.path.join(BASE_DIR, "db", "checkpoints", "heartbeat_state.json")
 LOG_PATH = os.path.join(BASE_DIR, "logs", "heartbeat.log")
-
-TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # Load services from config, fallback to defaults
 _svc_cfg = cfg("services") or []
@@ -62,6 +60,14 @@ def log(msg):
     os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
     with open(LOG_PATH, "a") as f:
         f.write(f"[{ts}] {msg}\n")
+
+
+def _tg_log(level, message):
+    """Adatta il `log(msg)` mono-argomento di questo job al `log(level, message)`
+    che si aspetta telegram_notify. Senza adapter servirebbe `log=None`, che
+    stampa su stderr: qui il job gira ogni 5 minuti sotto launchd, quindi ogni
+    WARN finirebbe nel log di sistema come rumore ricorrente."""
+    log(f"{level}: {message}")
 
 
 def check_port(port):
@@ -93,19 +99,6 @@ def load_state():
 def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
-
-
-def send_telegram(text):
-    if not TG_TOKEN or not TG_CHAT:
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT, "text": text, "parse_mode": "Markdown"},
-            timeout=10
-        )
-    except Exception:
-        pass
 
 
 def main():
@@ -151,11 +144,11 @@ def main():
 
     if alerts:
         msg = f"🚨 *{APP_NAME} Alert*\n\n" + "\n".join(alerts)
-        send_telegram(msg)
+        send_telegram(msg, log=_tg_log)
 
     if recoveries:
         msg = f"✅ *{APP_NAME} Recovery*\n\n" + "\n".join(recoveries)
-        send_telegram(msg)
+        send_telegram(msg, log=_tg_log)
 
 
 if __name__ == "__main__":

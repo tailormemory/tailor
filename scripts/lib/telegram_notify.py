@@ -1,19 +1,23 @@
 """Invio Telegram best-effort, condiviso fra i job di manutenzione.
 
-Porting fedele di `scripts/services/auto_flush_queue.py:113` (Markdown con
-fallback a plain text su parse-error, best-effort, non solleva mai). Nasce come
-helper condiviso perché `send_telegram` oggi è copiaincollato in SEI posti con
-firme divergenti — `auto_flush_queue` e `chromadb_version_check` ritornano bool,
-`heartbeat` e `reminder_checker` None, `mcp_server:3350` una stringa:
+Implementazione canonica per i cinque daemon, che la importano tutti da qui:
 
-    mcp_server.py:3350, scripts/services/heartbeat.py:98,
-    scripts/services/chromadb_version_check.py:85,
-    scripts/services/queue_depth_monitor.py:444,
-    scripts/services/auto_flush_queue.py:113,
-    scripts/services/reminder_checker.py:51
+    scripts/services/auto_flush_queue.py, queue_depth_monitor.py,
+    chromadb_version_check.py, heartbeat.py, reminder_checker.py
 
-Questo modulo NON li migra (sono daemon in produzione: è un cambio a sé, con il
-suo giro di test). È il punto di arrivo quando si deciderà di consolidarli.
+Nasce come porting fedele della copia di `auto_flush_queue` (Markdown con
+fallback a plain text su parse-error, best-effort, non solleva mai) — la più
+completa delle sei che convivevano con firme divergenti (chi bool, chi None).
+
+`mcp_server.py:3498` resta ESCLUSO di proposito: non è la stessa funzione con un
+altro nome. È un tool MCP, il suo valore di ritorno è una stringa che finisce nel
+transcript dell'LLM come esito osservabile, non un bool per il chiamante. Farlo
+passare di qui cambierebbe il contratto verso il modello, non solo il codice.
+
+`log` è un callable(level, message) opzionale. Con `log=None` i WARN vanno su
+stderr: per un job sotto launchd che gira di frequente è rumore ricorrente nel
+log di sistema, quindi passare il logger del job (o un adapter, se la firma non
+combacia — vedi `heartbeat._tg_log`).
 
 CONTRATTO: `send_telegram` non solleva MAI e non termina MAI il processo. Un job
 di manutenzione non deve poter morire per colpa della propria notifica.
@@ -43,9 +47,9 @@ def redact(text: str, token: str = "") -> str:
         Max retries exceeded with url: /bot<TOKEN>/sendMessage (Caused by ...)
 
     — quindi loggare `{e}` nudo scrive il token in chiaro al primo blip di rete.
-    Verificato empiricamente, non dedotto. È il bug che hanno OGGI tutte e sei
-    le copie di send_telegram (auto_flush_queue.py:124, queue_depth_monitor.py,
-    chromadb_version_check.py, heartbeat.py, reminder_checker.py, mcp_server.py).
+    Verificato empiricamente, non dedotto. Era il bug delle copie duplicate di
+    send_telegram nei daemon, ora tutte rimpiazzate da questo modulo; resta
+    esportata perché è utile a chiunque logghi un'eccezione di rete propria.
 
     Due reti: sostituzione esatta del token noto + regex sul pattern, che copre
     anche un token vecchio/diverso o un URL costruito altrove. Mai redazione

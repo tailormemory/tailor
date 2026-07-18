@@ -328,7 +328,7 @@ def test_gate_collection_pending_malformed_escalates_schema_invalid():
 def _drive_main_escalation(monkeypatch, audit_obj, sent):
     monkeypatch.setattr(afq.sys, "argv", ["auto_flush_queue.py"])
     monkeypatch.setattr(afq, "log", lambda *a, **k: None)
-    monkeypatch.setattr(afq, "send_telegram", lambda t: sent.append(t) or True)
+    monkeypatch.setattr(afq, "send_telegram", lambda t, **_: sent.append(t) or True)
     monkeypatch.setattr(afq, "run_audit", lambda: audit_obj)
     monkeypatch.setattr(afq, "queue_min", lambda: 300)
     monkeypatch.setattr(afq, "_acquire_run_lock", lambda: object())
@@ -507,7 +507,7 @@ def _stub_procedure(monkeypatch, tmp_path, *, flush=None, flush_raises=False,
 
     monkeypatch.setattr(afq, "MAINTENANCE_LOCK", str(tmp_path / "noexist.lock"))
     monkeypatch.setattr(afq, "queue_min", lambda: 300)
-    monkeypatch.setattr(afq, "send_telegram", lambda m: calls["telegram"].append(m) or True)
+    monkeypatch.setattr(afq, "send_telegram", lambda m, **_: calls["telegram"].append(m) or True)
     monkeypatch.setattr(afq, "find_mcp_pid", lambda: 1000)
     monkeypatch.setattr(afq, "run_backup", lambda: True)
     monkeypatch.setattr(afq, "verify_backup", lambda: True)
