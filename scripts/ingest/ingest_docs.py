@@ -352,22 +352,52 @@ def acquire_single_instance_lock(lock_path=None):
     """
     import fcntl
 
-    fd = open(lock_path or LOCK_FILE, "w")
+    # "a+" e non "w": la open in modalita' write tronca il file PRIMA che il
+    # flock sia stato tentato, quindi una seconda istanza — che il lock non lo
+    # ottiene nemmeno — cancellerebbe comunque il PID scritto dalla prima,
+    # lasciando un lockfile vuoto e la diagnostica inservibile.
+    fd = open(lock_path or LOCK_FILE, "a+")
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         fd.close()
         return None
+
+    # Solo ora che il lock e' nostro possiamo riscrivere il contenuto.
+    # In "a+" la O_APPEND forza comunque le write in coda: e' il truncate() a
+    # rendere la riscrittura un rimpiazzo invece di un accodamento.
+    fd.seek(0)
+    fd.truncate()
     fd.write(f"{os.getpid()}\n")
     fd.flush()
     return fd
 
 
 def save_registry(registry):
-    """Salva il registro."""
+    """Salva il registro in modo atomico: tmp + os.replace().
+
+    --status legge il registry senza prendere il lock, e una write in-place
+    lo esporrebbe a un JSON troncato a meta'. os.replace() e' atomico su
+    POSIX: il reader vede sempre o il file vecchio intero o quello nuovo
+    intero, mai uno stato intermedio. Vale anche per un crash a meta' write —
+    resta valido il vecchio, e al massimo si perde l'ultimo run.
+    """
     os.makedirs(os.path.dirname(REGISTRY_FILE), exist_ok=True)
-    with open(REGISTRY_FILE, "w", encoding="utf-8") as f:
-        json.dump(registry, f, indent=2, ensure_ascii=False)
+    tmp_path = REGISTRY_FILE + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(registry, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, REGISTRY_FILE)
+    except Exception:
+        # Non lasciare in giro un tmp parziale che confonda la diagnostica.
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
 
 
 def file_hash(filepath):
