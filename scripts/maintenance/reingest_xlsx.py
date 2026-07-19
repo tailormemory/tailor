@@ -106,6 +106,14 @@ significano DELETE su un file gia' scollegato, cioe' invalidazione persa in
 silenzio. Quindi si aborta se build_entity_index.py risulta attivo (pgrep) o se
 entity_index.sqlite3 sparisce / cambia inode tra l'avvio e un cleanup.
 
+Il controllo e' ripetuto SUBITO DOPO il cleanup, prima del primo upsert: la
+finestra pericolosa e' proprio quella tra invalidazione e riscrittura, e il
+check pre-cleanup da solo non la copre. Se scatta li', il file ha gia' subito la
+delete Chroma ma potrebbe aver perso l'invalidazione dei sidecar: non e'
+registrabile come successo -> mark_file_failed("entity_index_race"), niente
+checkpoint, abort del run. Al resume viene rifatto da capo, il che e' sicuro
+perche' il cleanup e' idempotente e i chunk_id sono deterministici sull'hash.
+
 ================================================================================
 VINCOLI
 ================================================================================
@@ -118,9 +126,12 @@ VINCOLI
     intero.
   * REGISTRY salvato per-file (save_registry e' atomica: tmp + os.replace), non
     a fine run: un'interruzione a meta' non deve buttare via i file gia' fatti.
-  * CHECKPOINT scritto SOLO dopo un save_registry riuscito, e solo con
-    errors == 0 and processed == len(chunks). Un upsert parziale non e' un
-    successo: va a mark_file_failed e viene ritentato.
+  * CHECKPOINT `path\\thash`, scritto SOLO dopo un save_registry riuscito e solo
+    con errors == 0 and processed == len(chunks). Un upsert parziale non e' un
+    successo: va a mark_file_failed e viene ritentato. Al resume il match e' su
+    (path, contenuto): un file cambiato dopo il checkpoint viene rifatto invece
+    di essere saltato per sempre, e le righe legacy solo-path valgono come
+    non-match (con warning).
   * mark_file_failed SOLO su file davvero tentati (embedding / cleanup / upsert
     parziale). Mai su assenti, fuori_watch, fallback_only o estrazione vuota:
     quei file non sono un tentativo fallito, e gonfiare il loro fail_count li
@@ -178,6 +189,8 @@ ASSUMED_EMBED_RATE = 20.0   # chunk/s
 # classi che NON sono skip benigni: vanno stampate come warning.
 WARN_CLASSES = ("assente", "modified", "fuori_watch", "escluso_da_scan",
                 "estrazione_vuota")
+# warning che NON sono uno skip: il file prosegue e viene ri-processato.
+CHECKPOINT_WARN = ("checkpoint_non_match",)
 
 
 # ============================================================================
@@ -303,11 +316,30 @@ def _build_file_info(filepath: str, folder: str, fhash: str) -> dict:
 # ============================================================================
 # CLASSIFICAZIONE
 # ============================================================================
-def load_checkpoint() -> set[str]:
+def load_checkpoint() -> dict[str, str]:
+    """path -> hash del contenuto al momento del checkpoint.
+
+    Il formato e' `path\\thash`: un checkpoint solo-path direbbe "questo path
+    e' stato fatto", che non e' la domanda giusta. Se il file cambia dopo il
+    checkpoint, il re-ingest da fare e' quello del contenuto NUOVO, e un match
+    per path lo salterebbe per sempre.
+
+    Le righe legacy solo-path (checkpoint scritti prima di questo formato)
+    mappano a "": non provano il contenuto, quindi valgono come NON-match e il
+    file viene ri-processato — con warning, perche' e' lavoro rifatto e
+    l'operatore deve sapere perche'.
+    """
     if not os.path.exists(CHECKPOINT_PATH):
-        return set()
+        return {}
+    done: dict[str, str] = {}
     with open(CHECKPOINT_PATH) as f:
-        return {l.strip() for l in f if l.strip()}
+        for line in f:
+            line = line.rstrip("\n")
+            if not line.strip():
+                continue
+            path, _, h = line.partition("\t")
+            done[path.strip()] = h.strip()
+    return done
 
 
 def _is_header_aware(sections: list) -> bool:
@@ -315,7 +347,7 @@ def _is_header_aware(sections: list) -> bool:
     return any(s.get("metadata", {}).get("prechunked") for s in sections)
 
 
-def classify(registry: dict, done: set[str], limit_files: int | None = None,
+def classify(registry: dict, done: dict[str, str], limit_files: int | None = None,
              verbose: bool = True):
     """Ritorna (plan, buckets, stats).
 
@@ -324,8 +356,8 @@ def classify(registry: dict, done: set[str], limit_files: int | None = None,
     """
     plan: list[tuple[dict, list]] = []
     buckets: dict[str, list] = {c: [] for c in
-                               ("header_aware", "fallback_only", "checkpoint")}
-    for c in WARN_CLASSES:
+                                ("header_aware", "fallback_only", "checkpoint")}
+    for c in WARN_CLASSES + CHECKPOINT_WARN:
         buckets[c] = []
     stats = {"candidati": 0, "chunk": 0, "chars": 0, "sezioni": 0}
 
@@ -351,15 +383,26 @@ def classify(registry: dict, done: set[str], limit_files: int | None = None,
             buckets["assente"].append((filepath, "non esiste su disco"))
             continue
 
-        if filepath in done:
-            buckets["checkpoint"].append((filepath, ""))
-            continue
-
         try:
             fhash = ing.file_hash(filepath)
         except OSError as e:
             buckets["assente"].append((filepath, f"illeggibile: {e}"))
             continue
+
+        # Checkpoint DOPO l'hash: il match e' su (path, contenuto), non sul
+        # path. Costa una sha256 in piu' per file gia' fatto, ma evita di
+        # saltare per sempre un file cambiato dopo il checkpoint. Sta comunque
+        # PRIMA dell'estrazione, che e' la parte cara.
+        if filepath in done:
+            ck_hash = done[filepath]
+            if ck_hash == fhash:
+                buckets["checkpoint"].append((filepath, ""))
+                continue
+            buckets["checkpoint_non_match"].append(
+                (filepath, "riga legacy senza hash" if not ck_hash
+                 else f"hash cambiato dal checkpoint ({ck_hash[:12]} -> "
+                      f"{fhash[:12]})"))
+            # nessun continue: il file prosegue la classifica e viene rifatto.
 
         # Estrazione: unica fonte della classificazione.
         try:
@@ -458,8 +501,11 @@ def dry_run(limit_files: int | None, probe: int, show: int) -> int:
     for c in WARN_CLASSES:
         print(f"  {c:<30} : {len(buckets[c]):,}"
               + ("   <-- WARNING" if buckets[c] else ""))
+    n_ck = len(buckets["checkpoint_non_match"])
+    print(f"  checkpoint NON match (rifatti)   : {n_ck:,}"
+          + ("   <-- WARNING" if n_ck else ""))
 
-    for c in WARN_CLASSES:
+    for c in WARN_CLASSES + CHECKPOINT_WARN:
         if not buckets[c]:
             continue
         print(f"\n--- WARNING [{c}] ({len(buckets[c])}) ---")
@@ -565,7 +611,7 @@ def execute(limit_files: int | None) -> int:
     log(f"[scan]    header_aware={len(buckets['header_aware'])} "
         f"fallback_only={len(buckets['fallback_only'])} "
         f"checkpoint={len(buckets['checkpoint'])}")
-    for c in WARN_CLASSES:
+    for c in WARN_CLASSES + CHECKPOINT_WARN:
         if buckets[c]:
             log(f"[warn]    {c}: {len(buckets[c])}")
     log(f"[scan]    {len(plan)} file da re-ingerire, {st['chunk']} chunk")
@@ -635,6 +681,26 @@ def execute(limit_files: int | None) -> int:
                 log(f"  ERRORE cleanup pre-upsert, file SALTATO: {e}")
                 continue
 
+            # Il cleanup e' appena avvenuto: la delete Chroma e' andata, ma
+            # l'invalidazione dei sidecar puo' essere finita su un
+            # entity_index.sqlite3 gia' scollegato da un rebuild concorrente —
+            # cioe' persa in silenzio, lasciando in KB entita' che puntano a
+            # chunk_id che sto per riscrivere con testo diverso. Il file NON e'
+            # in uno stato registrabile come successo: mark_file_failed e
+            # abort. Al resume viene rifatto da capo, e va bene: il cleanup e'
+            # idempotente (delete di chunk gia' spariti = no-op) e i chunk_id
+            # sono deterministici sull'hash.
+            try:
+                _assert_entity_index_stable(entity_baseline, "dopo cleanup")
+            except EntityIndexBusy:
+                total_errors += 1
+                fail_count = ing.mark_file_failed(
+                    registry, f, "entity_index_race")
+                ing.save_registry(registry)
+                log(f"  RACE entity_index dopo il cleanup: file NON "
+                    f"checkpointato (fail_count={fail_count}), abort del run")
+                raise
+
             # Un batch per chiamata: il gate va verificato prima di OGNI upsert,
             # non una volta per file.
             processed = errors = 0
@@ -664,7 +730,7 @@ def execute(limit_files: int | None) -> int:
                 # CHECKPOINT solo DOPO un save_registry riuscito: se il registry
                 # non e' su disco, il file non e' fatto — e al resume deve
                 # essere rifatto, non saltato.
-                ckpt.write(f["filepath"] + "\n")
+                ckpt.write(f"{f['filepath']}\t{f['hash']}\n")
                 ckpt.flush()
                 os.fsync(ckpt.fileno())
                 files_ok += 1
