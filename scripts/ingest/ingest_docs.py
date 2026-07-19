@@ -27,9 +27,11 @@ Configuration:
 """
 
 import csv
+import datetime
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 import requests
@@ -44,6 +46,7 @@ from embedding import get_embedding, get_embeddings
 from embedding_contract import embedding_text
 from config import get as cfg
 from ingest_helpers import verified_upsert, make_run_id
+from chunk_sidecar import invalidate_chunk_sidecars
 from ocr_quality import assess_text_quality
 from vlm_extractor import extract_page_via_vlm
 
@@ -674,6 +677,219 @@ def _extract_pdf_legacy(filepath):
     return sections
 
 
+# ---- Excel: header detection + serializzazione ------------------------------
+#
+# Il formato legacy (`a | b | c` per riga) perde l'associazione colonna→valore
+# appena il chunk viene tagliato: una riga a metà chunk non ha più intestazione.
+# Se il foglio ha un header riconoscibile serializziamo per riga
+# ("<prima_cella>: Header2=val; Header3=val") ripetendo l'header su OGNI sezione.
+#
+# La detection è deliberatamente CONSERVATIVA: un falso positivo corrompe la
+# semantica di tutto il foglio, un miss costa solo il formato legacy. Se non
+# rileviamo un header il fallback è byte-identico al comportamento precedente.
+
+_XL_MAX_HEADER_SCAN = 5      # righe iniziali candidate a essere l'header
+_XL_MIN_HEADER_CELLS = 2     # celle testuali minime perché una riga sia header
+_XL_SAMPLE_DATA_ROWS = 20    # righe dati campionate per validare l'header
+_XL_OVERFLOW_TOLERANCE = 0   # colonne dati senza intestazione tollerate (0 = strict)
+
+# "12,50", "1.234,56", "-3%", "€ 1.200", "2024-01-31", "31/12/24"
+_XL_NUMERIC_RE = re.compile(r"^[+\-]?[\d\s.,']+\s*%?$")
+_XL_DATEISH_RE = re.compile(r"^\d{1,4}\s*[-/.]\s*\d{1,2}\s*[-/.]\s*\d{1,4}")
+_XL_CURRENCY = "€$£¥"
+
+
+def _xl_is_empty(value):
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _xl_is_texty(value):
+    """True solo per testo vero. Numeri, date, percentuali, valute e stringhe
+    numeriche NON contano come testo (sono dati, non intestazioni)."""
+    if _xl_is_empty(value):
+        return False
+    if isinstance(value, bool) or isinstance(value, (int, float)):
+        return False
+    if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+        return False
+    if not isinstance(value, str):
+        return False
+
+    s = value.strip()
+    stripped = s.strip(_XL_CURRENCY).strip()
+    if _XL_NUMERIC_RE.match(stripped):
+        return False
+    if _XL_DATEISH_RE.match(s):
+        return False
+    # Serve almeno una lettera: "#1", "---", "(*)" non sono intestazioni.
+    return any(ch.isalpha() for ch in s)
+
+
+def _xl_fmt(value):
+    """Rendering di una cella nel formato header-aware (non usato nel fallback)."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, datetime.datetime):
+        if (value.hour, value.minute, value.second) == (0, 0, 0):
+            return value.date().isoformat()
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(value, datetime.date):
+        return value.isoformat()
+    if isinstance(value, datetime.time):
+        return value.strftime("%H:%M:%S")
+    if isinstance(value, float):
+        # xlrd restituisce ogni numero come float: 3.0 -> "3", non "3.0".
+        if value.is_integer() and abs(value) < 1e15:
+            return str(int(value))
+        return repr(value)
+    return str(value).strip()
+
+
+def _xl_detect_header(rows):
+    """Indice della riga header, o None. `rows`: griglia di valori tipizzati."""
+    limit = min(_XL_MAX_HEADER_SCAN, len(rows))
+    for i in range(limit):
+        row = rows[i]
+        non_empty = [(j, v) for j, v in enumerate(row) if not _xl_is_empty(v)]
+
+        if len(non_empty) < _XL_MIN_HEADER_CELLS:
+            # Riga vuota o riga-titolo (una sola cella): può precedere l'header.
+            if len(non_empty) <= 1:
+                continue
+            return None
+
+        texty = [(j, v) for j, v in non_empty if _xl_is_texty(v)]
+        # Densa ma non testuale (es. dati numerici già da riga 0) -> nessun header.
+        if len(texty) < _XL_MIN_HEADER_CELLS or len(texty) * 2 <= len(non_empty):
+            return None
+
+        hmax = max(j for j, _ in non_empty)
+        data = [r for r in rows[i + 1: i + 1 + _XL_SAMPLE_DATA_ROWS]
+                if any(not _xl_is_empty(v) for v in r)]
+        if not data:
+            return None
+
+        # Larghezza: i dati non devono debordare oltre l'ultima colonna intestata
+        # (oltre la tolleranza), altrimenti quella riga "header" copre solo una
+        # parte del foglio.
+        span = hmax + _XL_OVERFLOW_TOLERANCE
+        for r in data:
+            if any(not _xl_is_empty(v) for v in r[span + 1:]):
+                return None
+
+        # Foglio multi-blocco: se l'header si ripete più in basso (es. un P&L con
+        # sezioni GROSS INCOME / EXPENSES / ASSETS, ognuna con la sua
+        # intestazione) applicare il PRIMO header a tutto il foglio produce
+        # spazzatura ("EXPENSES: Gennaio=Gennaio; ..."). Meglio il legacy.
+        header_labels = {j: _xl_fmt(v).casefold() for j, v in non_empty}
+        for r in rows[i + 1:]:
+            repeats = sum(
+                1 for j, label in header_labels.items()
+                if j < len(r) and not _xl_is_empty(r[j]) and _xl_fmt(r[j]).casefold() == label
+            )
+            if repeats >= 2 and repeats * 2 >= len(header_labels):
+                return None
+
+        # Discriminante forte: almeno una colonna con header testuale e valori in
+        # maggioranza NON testuali (numeri/date). Un foglio di prosa non ce l'ha.
+        for j in range(hmax + 1):
+            vals = [r[j] for r in data if j < len(r) and not _xl_is_empty(r[j])]
+            if len(vals) < 2:
+                continue
+            if sum(1 for v in vals if not _xl_is_texty(v)) * 2 > len(vals):
+                return i
+        return None
+    return None
+
+
+def _xl_legacy_sections(sheet_name, raw_rows, total_sheets):
+    """Formato storico — byte-identico al comportamento pre-header-detection."""
+    rows = []
+    for row in raw_rows:
+        cells = [str(c) if c is not None else "" for c in row]
+        if any(c.strip() for c in cells):
+            rows.append(" | ".join(cells))
+    if not rows:
+        return []
+    return [{
+        "text": f"[Sheet: {sheet_name}]\n" + "\n".join(rows),
+        "metadata": {"sheet": sheet_name, "total_sheets": total_sheets, "row_count": len(rows)},
+    }]
+
+
+def _xl_header_sections(sheet_name, rows, total_sheets, header_idx):
+    """Sezioni pre-chunked: righe intere, header ripetuto su ogni blocco."""
+    header_row = rows[header_idx]
+    hmax = max(j for j, v in enumerate(header_row) if not _xl_is_empty(v))
+    # Colonne dati senza intestazione (tipicamente un totale in coda): entro la
+    # tolleranza vengono emesse con etichetta posizionale invece che perse.
+    base = hmax
+    for r in rows[header_idx + 1:]:
+        for j in range(base + 1, min(len(r), base + 1 + _XL_OVERFLOW_TOLERANCE)):
+            if not _xl_is_empty(r[j]):
+                hmax = max(hmax, j)
+    labels = [
+        _xl_fmt(header_row[j]) if j < len(header_row) and not _xl_is_empty(header_row[j])
+        else f"Col{j + 1}"
+        for j in range(hmax + 1)
+    ]
+    prefix = f"[Sheet: {sheet_name}]\nHeader: " + " | ".join(labels)
+
+    lines = []
+    for row in rows[header_idx + 1:]:
+        if all(_xl_is_empty(v) for v in row):
+            continue
+        first = _xl_fmt(row[0]) if len(row) > 0 else ""
+        parts = [
+            f"{labels[j]}={_xl_fmt(row[j])}"
+            for j in range(1, min(hmax + 1, len(row)))
+            if not _xl_is_empty(row[j])
+        ]
+        if first and parts:
+            lines.append(f"{first}: " + "; ".join(parts))
+        elif first:
+            lines.append(first)
+        elif parts:
+            lines.append("; ".join(parts))
+    if not lines:
+        return []
+
+    # Blocchi di righe INTERE sotto TARGET_CHUNK_CHARS: il chunker generico li
+    # passa as-is (nessuno split a metà riga, nessun overlap).
+    sections = []
+    block, block_len = [], len(prefix)
+    for line in lines:
+        if block and block_len + 1 + len(line) > TARGET_CHUNK_CHARS:
+            sections.append((block, block_len))
+            block, block_len = [], len(prefix)
+        block.append(line)
+        block_len += 1 + len(line)
+    if block:
+        sections.append((block, block_len))
+
+    return [{
+        "text": prefix + "\n" + "\n".join(b),
+        "metadata": {
+            "sheet": sheet_name,
+            "total_sheets": total_sheets,
+            "row_count": len(b),
+            "prechunked": True,
+        },
+    } for b, _ in sections]
+
+
+def _xl_sheet_sections(sheet_name, raw_rows, typed_rows, total_sheets):
+    """Header-aware se rilevabile, altrimenti fallback legacy byte-identico."""
+    header_idx = _xl_detect_header(typed_rows)
+    if header_idx is not None:
+        sections = _xl_header_sections(sheet_name, typed_rows, total_sheets, header_idx)
+        if sections:
+            return sections
+    return _xl_legacy_sections(sheet_name, raw_rows, total_sheets)
+
+
 def extract_excel(filepath):
     """Estrae testo da Excel, una sezione per sheet. Supporta .xlsx e .xls."""
     ext = os.path.splitext(filepath)[1].lower()
@@ -692,18 +908,10 @@ def _extract_xlsx(filepath):
         wb = load_workbook(filepath, read_only=True, data_only=True)
         for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
-            rows = []
-            for row in ws.iter_rows(values_only=True):
-                cells = [str(c) if c is not None else "" for c in row]
-                if any(c.strip() for c in cells):
-                    rows.append(" | ".join(cells))
-
-            if rows:
-                text = f"[Sheet: {sheet_name}]\n" + "\n".join(rows)
-                sections.append({
-                    "text": text,
-                    "metadata": {"sheet": sheet_name, "total_sheets": len(wb.sheetnames), "row_count": len(rows)}
-                })
+            # openpyxl (data_only) restituisce già valori nativi: raw e typed
+            # coincidono, il fallback resta byte-identico.
+            rows = [list(row) for row in ws.iter_rows(values_only=True)]
+            sections.extend(_xl_sheet_sections(sheet_name, rows, rows, len(wb.sheetnames)))
         wb.close()
     except Exception as e:
         print(f"    ERRORE Excel {filepath}: {e}")
@@ -719,21 +927,37 @@ def _extract_xls(filepath):
         wb = xlrd.open_workbook(filepath)
         for sheet_name in wb.sheet_names():
             ws = wb.sheet_by_name(sheet_name)
-            rows = []
+            raw_rows, typed_rows = [], []
             for row_idx in range(ws.nrows):
-                cells = [str(ws.cell_value(row_idx, col_idx)) for col_idx in range(ws.ncols)]
-                if any(c.strip() for c in cells):
-                    rows.append(" | ".join(cells))
-
-            if rows:
-                text = f"[Sheet: {sheet_name}]\n" + "\n".join(rows)
-                sections.append({
-                    "text": text,
-                    "metadata": {"sheet": sheet_name, "total_sheets": wb.nsheets, "row_count": len(rows)}
-                })
+                raw, typed = [], []
+                for col_idx in range(ws.ncols):
+                    cell = ws.cell(row_idx, col_idx)
+                    # raw = valore grezzo xlrd (il fallback fa str() come prima)
+                    raw.append(cell.value)
+                    typed.append(_xls_typed_value(cell, wb.datemode))
+                raw_rows.append(raw)
+                typed_rows.append(typed)
+            sections.extend(_xl_sheet_sections(sheet_name, raw_rows, typed_rows, wb.nsheets))
     except Exception as e:
         print(f"    ERRORE Excel {filepath}: {e}")
     return sections
+
+
+def _xls_typed_value(cell, datemode):
+    """xlrd non tipizza: date e bool arrivano come float. Normalizza per la
+    detection (il path legacy continua a usare il valore grezzo)."""
+    import xlrd
+
+    if cell.ctype in (xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK, xlrd.XL_CELL_ERROR):
+        return None
+    if cell.ctype == xlrd.XL_CELL_BOOLEAN:
+        return bool(cell.value)
+    if cell.ctype == xlrd.XL_CELL_DATE:
+        try:
+            return xlrd.xldate_as_datetime(cell.value, datemode)
+        except Exception:
+            return float(cell.value)
+    return cell.value
 
 
 def extract_csv(filepath):
@@ -1229,11 +1453,18 @@ def chunk_document(sections, file_info):
 
     for section in sections:
         text = section["text"]
-        sec_meta = section["metadata"]
+        sec_meta = dict(section["metadata"])
+
+        # Sezioni già tagliate a monte su confini semantici (fogli Excel
+        # header-aware): passano as-is, senza split generico e senza overlap —
+        # entrambi spezzerebbero righe e duplicherebbero l'header.
+        prechunked = bool(sec_meta.pop("prechunked", False))
 
         # Spezza sezioni lunghe — markdown-aware per i .md (fence/tabelle preservati),
         # splitter condiviso (invariato) per tutti gli altri formati.
-        if is_md:
+        if prechunked:
+            parts = [text]
+        elif is_md:
             parts = split_markdown_at_boundaries(text, TARGET_CHUNK_CHARS)
         else:
             parts = split_text_at_boundaries(text, TARGET_CHUNK_CHARS)
@@ -1242,7 +1473,7 @@ def chunk_document(sections, file_info):
             # Aggiungi overlap — disattivato per .md: lo slice raw di OVERLAP_CHARS
             # introdurrebbe fence sbilanciati o frammenti di riga-tabella nel prefisso.
             overlap_text = ""
-            if prev_chunk_text and OVERLAP_CHARS > 0 and not is_md:
+            if prev_chunk_text and OVERLAP_CHARS > 0 and not is_md and not prechunked:
                 overlap_text = prev_chunk_text[-OVERLAP_CHARS:].strip()
                 space_pos = overlap_text.find(" ")
                 if space_pos > 0:
@@ -1527,6 +1758,13 @@ def main():
             if old_hash:
                 deleted = delete_file_chunks(collection, old_hash)
                 print(f"  Rimossi {deleted} chunk vecchi")
+                # I chunk_id sono deterministici: se il nuovo testo riusa gli
+                # stessi id, extraction_log farebbe da gate di skip e
+                # facts/entity resterebbero agganciati al testo vecchio.
+                invalidate_chunk_sidecars(f"doc_{old_hash}", verbose=True)
+            # Anche a hash invariato il testo può cambiare (nuovo estrattore):
+            # invalida sempre i sidecar dell'hash corrente.
+            invalidate_chunk_sidecars(f"doc_{f['hash'][:12]}", verbose=True)
 
         # Estrai testo (doctype dal filename per gating VLM fallback)
         pre_doctype = infer_doc_type(f["filename"])
