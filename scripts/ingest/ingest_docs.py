@@ -64,6 +64,11 @@ IGNORE_PATTERNS = set(cfg("ingest", "ignore_patterns") or ["~$", ".tmp", "Thumbs
 
 DB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "db")
 REGISTRY_FILE = os.path.join(DB_DIR, "doc_registry.json")
+# Lock single-instance nel repo (non /tmp: multi-user, non encrypted).
+LOCK_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "ingest_docs.lock",
+)
 
 COLLECTION_NAME = cfg("kb", "collection") or "tailor_kb_v2"
 
@@ -316,6 +321,46 @@ def load_registry():
         with open(REGISTRY_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
+
+
+def mark_file_failed(registry, f, reason):
+    """Registra un tentativo fallito senza mai spacciarlo per riuscito.
+
+    L'hash conservato e' quello dell'ultima ingest RIUSCITA (o "" se non ce
+    n'e' mai stata): registrare qui l'hash corrente farebbe classificare il
+    file "unchanged" al giro dopo, quindi mai piu' ritentato.
+    """
+    existing = registry.get(f["filepath"], {})
+    fail_count = existing.get("fail_count", 0) + 1
+    registry[f["filepath"]] = {
+        "hash": existing.get("hash", ""),
+        "filename": f["filename"],
+        "status": "failed",
+        "fail_count": fail_count,
+        "last_error": reason,
+        "date_last_attempt": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    return fail_count
+
+
+def acquire_single_instance_lock(lock_path=None):
+    """flock non bloccante. Ritorna il file object (da tenere aperto) o None.
+
+    Una seconda istanza NON attende: esce. Il lock e' rilasciato dall'OS alla
+    chiusura del FD / uscita del processo, quindi non resta appeso dopo un
+    crash come farebbe un lockfile a presenza.
+    """
+    import fcntl
+
+    fd = open(lock_path or LOCK_FILE, "w")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fd.close()
+        return None
+    fd.write(f"{os.getpid()}\n")
+    fd.flush()
+    return fd
 
 
 def save_registry(registry):
@@ -1526,20 +1571,23 @@ def chunk_document(sections, file_info):
 
 
 
-def ingest_chunks(collection, chunks, run_id: str | None = None):
-    """Scrive chunk in ChromaDB in batch."""
-    total = len(chunks)
-    processed = 0
-    errors = 0
-    run_id = run_id or make_run_id("document")
+def embed_chunks(chunks):
+    """Calcola gli embedding PRIMA che la KB venga toccata.
 
-    for batch_start in range(0, total, BATCH_SIZE):
+    Separata da ingest_chunks per tenere il cleanup il piu' vicino possibile
+    all'upsert: se l'embedding fallisce non abbiamo ancora cancellato nulla e
+    il documento vecchio resta intatto. Ritorna (batches, errors).
+    """
+    batches = []
+    errors = 0
+
+    for batch_start in range(0, len(chunks), BATCH_SIZE):
         batch = chunks[batch_start:batch_start + BATCH_SIZE]
 
         # Testo embeddato == testo salvato: unica fonte via contratto.
         documents = [embedding_text("document", c["metadata"], c["text"]) for c in batch]
 
-        # Batch fallito -> contato in errors, l'ingest prosegue (fail-loud, non muore).
+        # Batch fallito -> contato in errors, gli altri proseguono.
         try:
             embeddings = get_embeddings(documents)
         except Exception as e:
@@ -1547,22 +1595,40 @@ def ingest_chunks(collection, chunks, run_id: str | None = None):
             errors += len(batch)
             continue
 
-        ids = [c["chunk_id"] for c in batch]
-        metadatas = [c["metadata"] for c in batch]
+        batches.append({
+            "ids": [c["chunk_id"] for c in batch],
+            "embeddings": embeddings,
+            "documents": documents,
+            "metadatas": [c["metadata"] for c in batch],
+        })
 
+    return batches, errors
+
+
+def ingest_chunks(collection, batches, run_id: str | None = None):
+    """Scrive in ChromaDB batch gia' embeddati da embed_chunks()."""
+    processed = 0
+    errors = 0
+    run_id = run_id or make_run_id("document")
+
+    for b in batches:
+        size = len(b["ids"])
         try:
             ok = verified_upsert(
-                collection, ids, embeddings, documents, metadatas,
+                collection, b["ids"], b["embeddings"], b["documents"], b["metadatas"],
                 run_id=run_id, source="document",
             )
             if not ok:
-                errors += len(batch)
+                # Non contarlo anche in processed: e' il criterio con cui il
+                # chiamante decide se il registry puo' registrare successo.
+                errors += size
+                continue
         except Exception as e:
             print(f"\n  ChromaDB errore: {e}")
-            errors += len(batch)
+            errors += size
             continue
 
-        processed += len(batch)
+        processed += size
 
     return processed, errors
 
@@ -1719,6 +1785,20 @@ def main():
     list_mode = "--list" in sys.argv
     status_mode = "--status" in sys.argv
 
+    # Single-instance PRIMA di scan e load_registry: due run concorrenti si
+    # sovrascrivono il registry a vicenda (read-modify-write non atomico) e
+    # possono interlacciare delete e upsert sugli stessi chunk_id.
+    # --list/--status non scrivono nulla: restano disponibili durante un run.
+    # NB: lock_fd va tenuto referenziato per tutta la durata di main() — se il
+    # file object viene raccolto, l'OS rilascia il lock. Non "pulire" come
+    # variabile inutilizzata.
+    lock_fd = None
+    if not (list_mode or status_mode):
+        lock_fd = acquire_single_instance_lock()
+        if lock_fd is None:
+            print(f"Un'altra istanza e' gia' in esecuzione ({LOCK_FILE}). Esco.")
+            sys.exit(1)
+
     print(f"TAILOR Document Ingest")
     print(f"Cartelle monitorate: {len(WATCH_FOLDERS)}")
     for folder in WATCH_FOLDERS:
@@ -1787,25 +1867,29 @@ def main():
         sections = extract_text(f["filepath"], doctype=pre_doctype)
         if not sections:
             # Nessun cleanup: i chunk vecchi e i loro sidecar restano intatti.
-            existing = registry.get(f["filepath"], {})
-            fail_count = existing.get("fail_count", 0) + 1
-            registry[f["filepath"]] = {
-                # Si conserva l'hash dell'ultima ingest RIUSCITA (o "" se non
-                # ce n'e' mai stata). Registrare qui l'hash corrente farebbe
-                # classificare il file come "unchanged" al giro dopo: non
-                # verrebbe mai ritentato e i chunk vecchi resterebbero in KB
-                # su un file mai piu' riprocessato.
-                "hash": existing.get("hash", ""),
-                "filename": f["filename"],
-                "status": "failed",
-                "fail_count": fail_count,
-                "date_last_attempt": time.strftime("%Y-%m-%d %H:%M:%S"),
-            }
+            fail_count = mark_file_failed(registry, f, "no_text_extracted")
             print(f"  No text extracted, skip (fail_count={fail_count})")
             continue
 
         total_chars = sum(len(s["text"]) for s in sections)
         print(f"  Estratte {len(sections)} sezioni ({total_chars:,} chars)")
+
+        # Chunk
+        chunks = chunk_document(sections, f)
+        print(f"  Generati {len(chunks)} chunk")
+
+        # Embedding PRIMA del cleanup: e' la fase lunga e quella che fallisce
+        # piu' spesso (rete, provider). Facendola qui la finestra in cui il
+        # documento e' assente dalla KB si riduce alla sola coppia
+        # delete+upsert. In RAM sta un file alla volta: dimensioni banali.
+        batches, embed_errors = embed_chunks(chunks)
+        if embed_errors or not batches:
+            # KB non ancora toccata: il documento vecchio resta al suo posto.
+            total_errors += embed_errors or 1
+            fail_count = mark_file_failed(registry, f, "embedding_failed")
+            print(f"  Embedding fallito, KB intatta, file SALTATO "
+                  f"(fail_count={fail_count})")
+            continue
 
         # Da qui la sequenza e' atomica per-file: la delete deve comunque
         # precedere l'upsert, altrimenti si scriverebbe sopra chunk vecchi
@@ -1815,27 +1899,33 @@ def main():
         except Exception as e:
             print(f"  ERRORE cleanup pre-upsert, file SALTATO: {e}")
             total_errors += 1
+            mark_file_failed(registry, f, f"cleanup_failed: {e}")
             continue
 
-        # Chunk
-        chunks = chunk_document(sections, f)
-        print(f"  Generati {len(chunks)} chunk")
-
         # Ingest
-        processed, errors = ingest_chunks(collection, chunks, run_id=run_id)
+        processed, errors = ingest_chunks(collection, batches, run_id=run_id)
         total_chunks_added += processed
         total_errors += errors
         print(f"  Ingestati {processed} chunk" + (f" ({errors} errori)" if errors else ""))
 
-        # Aggiorna registry
-        registry[f["filepath"]] = {
-            "hash": f["hash"],
-            "filename": f["filename"],
-            "date_ingested": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "chunks": len(chunks),
-            "chars": total_chars,
-            "sections": len(sections),
-        }
+        # Registry: successo SOLO se il documento e' integro. Un upsert
+        # parziale registrato come riuscito renderebbe il file "unchanged" al
+        # giro dopo, cristallizzando in KB un documento monco.
+        if errors == 0 and processed == len(chunks):
+            registry[f["filepath"]] = {
+                "hash": f["hash"],
+                "filename": f["filename"],
+                "date_ingested": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "chunks": len(chunks),
+                "chars": total_chars,
+                "sections": len(sections),
+            }
+        else:
+            fail_count = mark_file_failed(
+                registry, f, f"partial_upsert: {processed}/{len(chunks)} chunk")
+            print(f"  ATTENZIONE upsert parziale ({processed}/{len(chunks)}): "
+                  f"registrato come FALLITO, retry al giro dopo "
+                  f"(fail_count={fail_count})")
 
     # Salva registry
     save_registry(registry)

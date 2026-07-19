@@ -81,6 +81,7 @@ def env(tmp_path, monkeypatch):
         "/docs/x.pdf": {"hash": HASH_OLD, "filename": "x.pdf", "chunks": 2},
     }), encoding="utf-8")
     monkeypatch.setattr(ingest_docs, "REGISTRY_FILE", str(registry_file))
+    monkeypatch.setattr(ingest_docs, "LOCK_FILE", str(tmp_path / "ingest.lock"))
 
     collection = FakeCollection({CONV_OLD: [f"{CONV_OLD}_chunk_0000", f"{CONV_OLD}_chunk_0001"]})
 
@@ -167,6 +168,88 @@ def test_failed_file_is_retried_next_run(env, monkeypatch):
     assert len(new) + len(modified) == 1
 
 
+def test_partial_upsert_is_registered_as_failed(env, monkeypatch):
+    """Upsert parziale: il registry NON deve registrare successo, altrimenti
+    il file risulta 'unchanged' e il documento monco si cristallizza in KB."""
+    monkeypatch.setattr(ingest_docs, "extract_text", lambda path, doctype=None: [
+        {"text": "sezione uno", "metadata": {"page": 1}},
+        {"text": "sezione due", "metadata": {"page": 2}},
+    ])
+    monkeypatch.setattr(ingest_docs, "embed_chunks", lambda chunks: ([{
+        "ids": [c["chunk_id"] for c in chunks],
+        "embeddings": [[0.0]] * len(chunks),
+        "documents": [c["text"] for c in chunks],
+        "metadatas": [c["metadata"] for c in chunks],
+    }], 0))
+    # Un chunk su due passa.
+    monkeypatch.setattr(ingest_docs, "ingest_chunks", lambda c, b, run_id=None: (1, 1))
+
+    with pytest.raises(SystemExit):  # total_errors > 0 -> exit non-zero
+        ingest_docs.main()
+
+    reg = json.loads(env["registry_file"].read_text(encoding="utf-8"))["/docs/x.pdf"]
+    assert reg["status"] == "failed"
+    assert reg["hash"] == HASH_OLD          # hash dell'ultima ingest riuscita
+    assert reg["fail_count"] == 1
+    assert "partial_upsert" in reg["last_error"]
+
+    # E al giro dopo il file torna processabile.
+    files = ingest_docs.scan_folders()
+    _, modified, unchanged = ingest_docs.classify_files(
+        files, json.loads(env["registry_file"].read_text(encoding="utf-8")))
+    assert unchanged == []
+    assert len(modified) == 1
+
+
+def test_embedding_failure_leaves_kb_intact(env, monkeypatch):
+    """Embedding prima del cleanup: se fallisce, la KB non e' stata toccata."""
+    monkeypatch.setattr(ingest_docs, "extract_text", lambda path, doctype=None: [
+        {"text": "contenuto", "metadata": {"page": 1}}])
+    monkeypatch.setattr(ingest_docs, "embed_chunks", lambda chunks: ([], len(chunks)))
+    monkeypatch.setattr(ingest_docs, "ingest_chunks",
+                        lambda *a, **k: pytest.fail("upsert non deve avvenire"))
+
+    with pytest.raises(SystemExit):
+        ingest_docs.main()
+
+    _assert_old_state_intact(env)
+    reg = json.loads(env["registry_file"].read_text(encoding="utf-8"))["/docs/x.pdf"]
+    assert reg["status"] == "failed"
+    assert reg["hash"] == HASH_OLD
+
+
+def test_single_instance_lock(tmp_path):
+    """Seconda istanza: esce, non attende."""
+    lock = str(tmp_path / "ingest.lock")
+
+    first = ingest_docs.acquire_single_instance_lock(lock)
+    assert first is not None
+
+    second = ingest_docs.acquire_single_instance_lock(lock)
+    assert second is None, "la seconda istanza deve fallire l'acquisizione"
+
+    # Rilasciato il primo, una nuova istanza puo' partire.
+    first.close()
+    third = ingest_docs.acquire_single_instance_lock(lock)
+    assert third is not None
+    third.close()
+
+
+def test_main_exits_when_lock_held(env, monkeypatch, capsys):
+    """main() con lock gia' preso: exit non-zero, niente scan ne' scrittura."""
+    held = ingest_docs.acquire_single_instance_lock(ingest_docs.LOCK_FILE)
+    assert held is not None
+    monkeypatch.setattr(ingest_docs, "scan_folders",
+                        lambda: pytest.fail("non deve nemmeno scansionare"))
+
+    with pytest.raises(SystemExit) as exc:
+        ingest_docs.main()
+
+    assert exc.value.code == 1
+    assert "gia' in esecuzione" in capsys.readouterr().out
+    held.close()
+
+
 def test_successful_extraction_replaces_document(env, monkeypatch):
     """Il contraltare: con estrazione valida il vecchio SPARISCE davvero."""
     monkeypatch.setattr(ingest_docs, "extract_text", lambda path, doctype=None: [
@@ -174,13 +257,20 @@ def test_successful_extraction_replaces_document(env, monkeypatch):
 
     seen = {}
 
-    def fake_ingest(collection, chunks, run_id=None):
+    def fake_ingest(collection, batches, run_id=None):
         # Al momento dell'upsert i chunk vecchi devono essere GIA' spariti.
         seen["old_ids_at_upsert"] = list(collection.ids_by_conv.get(CONV_OLD, []))
-        collection.upserted.extend(c["chunk_id"] for c in chunks)
-        return len(chunks), 0
+        ids = [i for b in batches for i in b["ids"]]
+        collection.upserted.extend(ids)
+        return len(ids), 0
 
     monkeypatch.setattr(ingest_docs, "ingest_chunks", fake_ingest)
+    monkeypatch.setattr(ingest_docs, "embed_chunks", lambda chunks: ([{
+        "ids": [c["chunk_id"] for c in chunks],
+        "embeddings": [[0.0]] * len(chunks),
+        "documents": [c["text"] for c in chunks],
+        "metadatas": [c["metadata"] for c in chunks],
+    }], 0))
 
     ingest_docs.main()
 
