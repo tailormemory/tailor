@@ -1781,25 +1781,21 @@ def main():
     for idx, f in enumerate(to_process):
         print(f"\n[{idx+1}/{len(to_process)}] {f['filename']} ({f['size_kb']:.0f} KB)")
 
-        # Pulizia KB + sidecar prima dell'upsert — per nuovi E modificati.
-        # Se fallisce si salta il file: mai upsert dopo una delete non
-        # verificata, e mai lasciare extraction_log agganciato a testo vecchio.
-        try:
-            _pre_upsert_cleanup(collection, f, registry)
-        except Exception as e:
-            print(f"  ERRORE cleanup pre-upsert, file SALTATO: {e}")
-            total_errors += 1
-            continue
-
-        # Estrai testo (doctype dal filename per gating VLM fallback)
+        # Estrazione PRIMA di toccare la KB: un documento sparisce solo se
+        # sostituito, mai perche' l'estrazione e' fallita.
         pre_doctype = infer_doc_type(f["filename"])
         sections = extract_text(f["filepath"], doctype=pre_doctype)
         if not sections:
-            # Track extraction failure in registry
+            # Nessun cleanup: i chunk vecchi e i loro sidecar restano intatti.
             existing = registry.get(f["filepath"], {})
             fail_count = existing.get("fail_count", 0) + 1
             registry[f["filepath"]] = {
-                "hash": f["hash"],
+                # Si conserva l'hash dell'ultima ingest RIUSCITA (o "" se non
+                # ce n'e' mai stata). Registrare qui l'hash corrente farebbe
+                # classificare il file come "unchanged" al giro dopo: non
+                # verrebbe mai ritentato e i chunk vecchi resterebbero in KB
+                # su un file mai piu' riprocessato.
+                "hash": existing.get("hash", ""),
                 "filename": f["filename"],
                 "status": "failed",
                 "fail_count": fail_count,
@@ -1810,6 +1806,16 @@ def main():
 
         total_chars = sum(len(s["text"]) for s in sections)
         print(f"  Estratte {len(sections)} sezioni ({total_chars:,} chars)")
+
+        # Da qui la sequenza e' atomica per-file: la delete deve comunque
+        # precedere l'upsert, altrimenti si scriverebbe sopra chunk vecchi
+        # ancora presenti. Se il cleanup fallisce il file viene saltato.
+        try:
+            _pre_upsert_cleanup(collection, f, registry)
+        except Exception as e:
+            print(f"  ERRORE cleanup pre-upsert, file SALTATO: {e}")
+            total_errors += 1
+            continue
 
         # Chunk
         chunks = chunk_document(sections, f)
