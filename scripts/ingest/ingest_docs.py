@@ -1568,18 +1568,47 @@ def ingest_chunks(collection, chunks, run_id: str | None = None):
 
 
 def delete_file_chunks(collection, file_hash_short):
-    """Cancella i chunk di un file specifico dalla collection."""
-    try:
-        results = collection.get(
-            where={"conv_id": f"doc_{file_hash_short}"},
-            include=[]
-        )
-        if results["ids"]:
-            collection.delete(ids=results["ids"])
-            return len(results["ids"])
-    except Exception:
-        pass
+    """Cancella i chunk di un file specifico dalla collection.
+
+    FAIL-LOUD di proposito: l'eccezione propaga. Chi chiama deve saltare il
+    file, perche' fare upsert dopo una delete non verificata lascia in KB un
+    mix di chunk vecchi e nuovi con gli stessi id.
+    """
+    results = collection.get(
+        where={"conv_id": f"doc_{file_hash_short}"},
+        include=[]
+    )
+    if results["ids"]:
+        collection.delete(ids=results["ids"])
+        return len(results["ids"])
     return 0
+
+
+def _pre_upsert_cleanup(collection, f, registry):
+    """Ripulisce KB e sidecar prima di (ri)scrivere i chunk di un file.
+
+    Vale per OGNI file processato, non solo i modificati: i chunk_id sono
+    deterministici sull'hash del contenuto, quindi con `--full` un file a
+    contenuto invariato riusa gli stessi id. Se nel frattempo cambiano i
+    boundary di chunking (estrattore nuovo) il testo sotto quegli id cambia
+    senza che nulla se ne accorga: extraction_log farebbe da gate di skip e il
+    chunk non verrebbe mai piu' ri-estratto dal nightly.
+
+    Solleva se la delete Chroma o l'invalidazione sidecar fallisce: il file va
+    saltato, mai upsertato a meta'.
+    """
+    current = f["hash"][:12]
+    hashes = [current]
+
+    old_hash = (registry.get(f["filepath"], {}).get("hash", "") or "")[:12]
+    if old_hash and old_hash != current:
+        hashes.append(old_hash)
+
+    for h in hashes:
+        deleted = delete_file_chunks(collection, h)
+        if deleted:
+            print(f"  Rimossi {deleted} chunk vecchi (doc_{h})")
+        invalidate_chunk_sidecars(f"doc_{h}", verbose=True)
 
 
 # ============================================================
@@ -1752,19 +1781,15 @@ def main():
     for idx, f in enumerate(to_process):
         print(f"\n[{idx+1}/{len(to_process)}] {f['filename']} ({f['size_kb']:.0f} KB)")
 
-        # If file was modified, delete old chunks
-        if f in modified_files:
-            old_hash = registry.get(f["filepath"], {}).get("hash", "")[:12]
-            if old_hash:
-                deleted = delete_file_chunks(collection, old_hash)
-                print(f"  Rimossi {deleted} chunk vecchi")
-                # I chunk_id sono deterministici: se il nuovo testo riusa gli
-                # stessi id, extraction_log farebbe da gate di skip e
-                # facts/entity resterebbero agganciati al testo vecchio.
-                invalidate_chunk_sidecars(f"doc_{old_hash}", verbose=True)
-            # Anche a hash invariato il testo può cambiare (nuovo estrattore):
-            # invalida sempre i sidecar dell'hash corrente.
-            invalidate_chunk_sidecars(f"doc_{f['hash'][:12]}", verbose=True)
+        # Pulizia KB + sidecar prima dell'upsert — per nuovi E modificati.
+        # Se fallisce si salta il file: mai upsert dopo una delete non
+        # verificata, e mai lasciare extraction_log agganciato a testo vecchio.
+        try:
+            _pre_upsert_cleanup(collection, f, registry)
+        except Exception as e:
+            print(f"  ERRORE cleanup pre-upsert, file SALTATO: {e}")
+            total_errors += 1
+            continue
 
         # Estrai testo (doctype dal filename per gating VLM fallback)
         pre_doctype = infer_doc_type(f["filename"])

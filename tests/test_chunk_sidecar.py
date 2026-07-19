@@ -156,6 +156,16 @@ def test_missing_table_is_skipped(tmp_path):
     assert "facts" not in deleted
 
 
+def test_sqlite_error_propagates(tmp_path):
+    """FAIL-LOUD: un errore sqlite NON e' recuperabile al giro dopo — una riga
+    extraction_log non cancellata blocca per sempre la ri-estrazione."""
+    corrupt = tmp_path / "corrupt.sqlite3"
+    corrupt.write_bytes(b"non e' un database sqlite" * 20)
+
+    with pytest.raises(sqlite3.DatabaseError):
+        invalidate_chunk_sidecars(TARGET, facts_db=str(corrupt), entity_db=str(corrupt))
+
+
 def test_no_matching_rows(dbs):
     facts_db, entity_db = dbs
     deleted = invalidate_chunk_sidecars("doc_cccccccccccc", facts_db=facts_db, entity_db=entity_db)

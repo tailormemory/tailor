@@ -77,28 +77,28 @@ def invalidate_chunk_sidecars(chunk_id_prefix, facts_db=None, entity_db=None, ve
         if not db_path or not os.path.exists(db_path):
             continue
         targets = [t for t in _SIDECAR_TARGETS if t[0] == db_key]
+        # FAIL-LOUD: l'errore propaga al caller, che deve saltare il file.
+        # Non e' recuperabile "al prossimo giro": extraction_log ha chunk_id
+        # come PRIMARY KEY ed e' il gate di skip del nightly, quindi una riga
+        # non cancellata significa che quel chunk non verra' MAI piu'
+        # ri-estratto — il nightly la vede come lavoro gia' fatto.
+        conn = sqlite3.connect(db_path, timeout=30)
         try:
-            conn = sqlite3.connect(db_path, timeout=30)
-            try:
-                # NIENTE journal_mode=WAL: e' un cambio PERSISTENTE del db.
-                # entity_index.sqlite3 e' in journal_mode=delete e migrarlo non
-                # e' mandato di questo helper (backup gzip del file principale
-                # senza -wal, writer esistenti). facts e' gia' WAL -> no-op.
-                conn.execute("PRAGMA busy_timeout=30000")
-                for _, table, col in targets:
-                    if not _table_exists(conn, table):
-                        continue
-                    cur = conn.execute(
-                        f"DELETE FROM {table} WHERE {col} LIKE ? ESCAPE '\\'", (pattern,)
-                    )
-                    deleted[table] = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
-                conn.commit()
-            finally:
-                conn.close()
-        except sqlite3.Error as e:
-            # Non-fatale: l'ingest deve proseguire, i sidecar si riallineano al
-            # prossimo giro notturno.
-            print(f"    WARNING sidecar invalidation ({db_key}): {e}")
+            # NIENTE journal_mode=WAL: e' un cambio PERSISTENTE del db.
+            # entity_index.sqlite3 e' in journal_mode=delete e migrarlo non
+            # e' mandato di questo helper (backup gzip del file principale
+            # senza -wal, writer esistenti). facts e' gia' WAL -> no-op.
+            conn.execute("PRAGMA busy_timeout=30000")
+            for _, table, col in targets:
+                if not _table_exists(conn, table):
+                    continue
+                cur = conn.execute(
+                    f"DELETE FROM {table} WHERE {col} LIKE ? ESCAPE '\\'", (pattern,)
+                )
+                deleted[table] = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            conn.commit()
+        finally:
+            conn.close()
 
     if verbose and deleted:
         summary = ", ".join(f"{k}={v}" for k, v in deleted.items() if v)
