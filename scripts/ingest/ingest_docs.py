@@ -64,6 +64,36 @@ IGNORE_PATTERNS = set(cfg("ingest", "ignore_patterns") or ["~$", ".tmp", "Thumbs
 
 DB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "db")
 REGISTRY_FILE = os.path.join(DB_DIR, "doc_registry.json")
+
+# Denylist di ingest: path ASSOLUTI ed ESATTI mai indicizzati.
+DENYLIST_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "config", "ingest_denylist.txt",
+)
+
+
+def load_denylist(path=None):
+    """Set di path assoluti esclusi dall'ingest. Vuoto se il file non c'e'.
+
+    Confronto ESATTO (normalizzato), non substring e non glob: una regola
+    substring cresce da sola e prima o poi mangia un file che serviva. Un
+    documento nuovo simile a uno denylistato va aggiunto qui a mano, con una
+    decisione esplicita — e' il comportamento voluto, non una limitazione.
+    """
+    src = path or DENYLIST_FILE
+    if not os.path.exists(src):
+        return set()
+    entries = set()
+    with open(src, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            entries.add(os.path.normpath(line))
+    return entries
+
+
+DENYLIST = load_denylist()
 # Lock single-instance nel repo (non /tmp: multi-user, non encrypted).
 LOCK_FILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
@@ -1714,6 +1744,7 @@ def _pre_upsert_cleanup(collection, f, registry):
 def scan_folders():
     """Scansiona le cartelle configurate e restituisce i file supportati."""
     files = []
+    denied = 0
     for folder in WATCH_FOLDERS:
         if not os.path.exists(folder):
             print(f"  WARNING: folder not found: {folder}")
@@ -1733,6 +1764,15 @@ def scan_folders():
                     continue
 
                 filepath = os.path.join(root, fname)
+
+                # Denylist: esclusione esplicita per path esatto. Sta DOPO il
+                # filtro estensione (stesso universo di file su cui e' stata
+                # decisa) e PRIMA di os.stat: un file denylistato non viene
+                # nemmeno guardato.
+                if os.path.normpath(filepath) in DENYLIST:
+                    denied += 1
+                    continue
+
                 rel_path = os.path.relpath(filepath, os.path.commonpath(WATCH_FOLDERS + [filepath]))
 
                 # Category from first subfolder
@@ -1759,6 +1799,9 @@ def scan_folders():
                     "modified_date": mod_date,
                     "size_kb": size_kb,
                 })
+
+    if denied:
+        print(f"  Denylist: {denied} file esclusi ({DENYLIST_FILE})")
 
     return files
 

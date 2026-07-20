@@ -1,0 +1,70 @@
+# TAILOR — denylist di ingest: path ESATTI mai indicizzati.
+#
+# Creata 2026-07-20 con scripts/maintenance/purge_lowvalue_docs.py.
+# Motivo: documenti contabili riga-per-riga (intercompany, invoicing,
+# journal/ledger, fatturato storico). ~51k chunk = 21% della KB per un
+# valore di retrieval nullo: sono righe di partita doppia, non contenuto.
+# I file RESTANO su disco e su OneDrive: esce solo l'indicizzazione.
+#
+# CONFRONTO ESATTO su path assoluto, non substring e non glob: un file
+# nuovo con nome simile NON e' escluso automaticamente: va aggiunto qui
+# con una decisione esplicita. E' voluto — una regola substring che
+# cresce da sola e' il modo in cui un giorno sparisce un file che serve.
+#
+# Righe vuote e righe che iniziano con # sono ignorate.
+
+# --- 21 file gia' indicizzati, rimossi dalla KB dal purge ---
+# 20 chunk
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/BP/2011/Invoicing-Report_2011.xlsx
+# 54 chunk
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/BP/2012/Invoicing-Report_2012.xlsx
+# 2,483 chunk
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/BP/2015/intracompany--2015-12-31.xlsx
+# 9,863 chunk
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/BP/2016/Intercompany/IC - February 2016.xlsx
+# 7,041 chunk
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/BP/2016/Intercompany/IC - January 2016.xlsx
+# 13,113 chunk
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/BP/2016/Intercompany/IC - Marzo 2016.xlsx
+# 914 chunk
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/BP/2017/Forecast/2014-2017_FATTURATO_10022017.xlsx
+# 568 chunk
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/BP/2017/Forecast/2014-2017_FATTURATO_26012017.xlsx
+# 1,249 chunk
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/BP/2017/Intercompany/IC - Aprile 2017.xlsx
+# 1,065 chunk
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/BP/2017/Intercompany/IC - Marzo 2017.xlsx
+# 2,198 chunk
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/IC/IC - December 2018.xlsx
+# 2,024 chunk
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/IC/IC - November 2018.xlsx
+# 54 chunk
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/YOUniversal Next/Italian Tax Police Check/2016-2021/2018/YOUniversal_Next_Ltd_-_General_Ledger_Detail 2018.pdf
+# 500 chunk
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/YOUniversal Next/Italian Tax Police Check/2016-2021/2018/YOUniversal_Next_Ltd_-_Journal_Report 2018.pdf
+# 1,141 chunk
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/YOUniversal Next/Italian Tax Police Check/2016-2021/2019/YOUniversal_Next_Ltd_-_General_Ledger_Detail 2019.pdf
+# 2,634 chunk
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/YOUniversal Next/Italian Tax Police Check/2016-2021/2019/YOUniversal_Next_Ltd_-_Journal_Report 2019.pdf
+# 838 chunk
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/YOUniversal Next/Italian Tax Police Check/2016-2021/2020/YOUniversal_Next_Ltd_-_General_Ledger_Detail 2020.pdf
+# 1,751 chunk
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/YOUniversal Next/Italian Tax Police Check/2016-2021/2020/YOUniversal_Next_Ltd_-_Journal_Report 2020.pdf
+# 839 chunk
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/YOUniversal Next/Italian Tax Police Check/2016-2021/2021/YOUniversal_Next_Ltd_-_General_Ledger_Detail 2021.pdf
+# 1,508 chunk
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/YOUniversal Next/Italian Tax Police Check/2016-2021/2021/YOUniversal_Next_Ltd_-_Journal_Report 2021.pdf
+# 1,233 chunk
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/YOUniversal Next/Italian Tax Police Check/Documenti alla GdF 08.06.23/2016-2021/2018/YOUniversal Next - All nominal activity.pdf
+
+# --- 8 copie mai indicizzate (deduplicate per hash ---
+# all'ingest: il gemello era in registry). Senza denylist, tolta l'entry
+# del gemello queste diventano 'nuove' al prossimo giro e rientrano. ---
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/YOUniversal Next/Italian Tax Police Check/Documenti alla GdF 08.06.23/2016-2021/2018/YOUniversal_Next_Ltd_-_General_Ledger_Detail 2018.pdf
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/YOUniversal Next/Italian Tax Police Check/Documenti alla GdF 08.06.23/2016-2021/2018/YOUniversal_Next_Ltd_-_Journal_Report 2018.pdf
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/YOUniversal Next/Italian Tax Police Check/Documenti alla GdF 08.06.23/2016-2021/2019/YOUniversal_Next_Ltd_-_General_Ledger_Detail 2019.pdf
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/YOUniversal Next/Italian Tax Police Check/Documenti alla GdF 08.06.23/2016-2021/2019/YOUniversal_Next_Ltd_-_Journal_Report 2019.pdf
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/YOUniversal Next/Italian Tax Police Check/Documenti alla GdF 08.06.23/2016-2021/2020/YOUniversal_Next_Ltd_-_General_Ledger_Detail 2020.pdf
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/YOUniversal Next/Italian Tax Police Check/Documenti alla GdF 08.06.23/2016-2021/2020/YOUniversal_Next_Ltd_-_Journal_Report 2020.pdf
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/YOUniversal Next/Italian Tax Police Check/Documenti alla GdF 08.06.23/2016-2021/2021/YOUniversal_Next_Ltd_-_General_Ledger_Detail 2021.pdf
+/Users/jarvis/OneDrive/Personale/Companies/YOUniversal Group/YOUniversal Next/Italian Tax Police Check/Documenti alla GdF 08.06.23/2016-2021/2021/YOUniversal_Next_Ltd_-_Journal_Report 2021.pdf

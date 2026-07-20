@@ -1,0 +1,750 @@
+#!/usr/bin/env python3
+"""Purge dei documenti contabili riga-per-riga dalla KB (+ quarantena derivati).
+
+================================================================================
+CONTESTO
+================================================================================
+21 documenti contabili (intercompany, invoicing report, journal/general ledger,
+fatturato storico) occupano 51.090 chunk = il 21% della KB. Sono righe di
+partita doppia: come contenuto recuperabile valgono zero, ma dominano il
+retrieval per massa. Escono dall'indice.
+
+I FILE RESTANO SU DISCO E SU ONEDRIVE. Esce solo l'indicizzazione, ed e'
+reversibile: togliere i path dalla denylist e lanciare un ingest --full li
+riporta dentro.
+
+Perimetro deciso da Emiliano, incluse le copie sotto "Italian Tax Police
+Check" / "Documenti alla GdF": scelta esplicita, non ereditata dal pattern.
+
+================================================================================
+DENYLIST — PATH ESATTI, NON PATTERN
+================================================================================
+config/ingest_denylist.txt elenca 29 path ASSOLUTI: i 21 gia' in registry piu'
+8 copie mai indicizzate (deduplicate per hash all'ingest, perche' il gemello
+era gia' in registry).
+
+Gli 8 fuori registry sono il motivo per cui la denylist e' load-bearing e non
+housekeeping: tolta l'entry del gemello, al primo giro successivo quelle copie
+diventano "nuove" e rientrano in KB, annullando il purge in silenzio.
+
+Il confronto e' ESATTO (path normalizzato), non substring e non glob. Una
+regola substring in IGNORE_PATTERNS (che e' `any(p in fname)`) cresce da sola e
+prima o poi mangia un file che serviva; qui un documento nuovo con nome simile
+NON e' escluso automaticamente e va aggiunto a mano. E' il comportamento
+voluto. Il caricamento vive in ingest_docs.load_denylist() e il filtro in
+scan_folders(), che stampa il contatore dei file esclusi.
+
+================================================================================
+COSA VIENE CANCELLATO — TRE LIVELLI
+================================================================================
+1. CHUNK Chroma, per `conv_id = doc_<hash12>`, SENZA limit e con verifica del
+   count post-delete. Il pattern di garbage_collect.py NON e' riusato: quello
+   fa `limit=100` (su "IC - Marzo 2016.xlsx", 13.113 chunk, ne cancellerebbe
+   100) dentro un `except Exception: pass` (e tacerebbe). Di quel file si
+   riusa SOLO la forma del `where` per i doc_summary (riga 92).
+
+2. SIDECAR, via invalidate_chunk_sidecars: facts, extraction_log, entity_index
+   dei chunk cancellati. extraction_log e' il gate di skip del nightly: una
+   riga non cancellata significa un chunk mai piu' ri-estratto.
+
+3. DOC_SUMMARY, per `title + folder + category='doc_summary'`. Il loro
+   `conv_id` e' `doc_summary_<data-batch>`, NON `doc_<hash>`: la delete per
+   conv_id non li prenderebbe. Il campo `extends` sarebbe il link preciso ma
+   ce l'ha solo un terzo dei summary e NESSUNO dei 22 in perimetro, quindi
+   l'aggancio e' per titolo. Verificato sui dati: 22 summary, folder combacia
+   22/22 con infer_folder() del doc, zero collisioni di basename in registry.
+   (`intracompany--2015-12-31.xlsx` ne ha 2: 22 summary per 21 doc.)
+
+================================================================================
+LAYER DERIVATO — QUARANTENA, NON CANCELLAZIONE
+================================================================================
+I derived facts hanno `chunk_id = "derived_<ts>_<n>"`, che NON matcha mai
+`doc_<hash>_chunk_%`: invalidate_chunk_sidecars non li tocca. E non sono
+inerti — mcp_server.py:1742 li serve come "Inferenze derivate" filtrando su
+`relation_type='derived' AND entity_tags LIKE ?`, cioe' per ENTITA', senza
+passare da chunk_id. Lasciati stare, continuerebbero a essere serviti
+all'utente con l'evidenza cancellata da sotto.
+
+Sono pero' la distillazione proprio dei dati che stiamo buttando: cancellarli
+butterebbe l'unica sintesi rimasta. Quindi QUARANTENA, reversibile:
+
+  * `relation_type`: 'derived' -> 'derived_purged_source'. Basta questo a
+    toglierli dal retrieval (la query filtra `= 'derived'`), e una singola
+    UPDATE inversa li riabilita.
+  * `derived_from` riscritto con un marker onesto invece che con id morti:
+    {"purged": "<data>", "docs": [<hash12>...], "kept_refs": [<id vivi>]}.
+    La provenienza diventa "derivato da documenti poi rimossi" — vera —
+    invece di puntatori a righe che non esistono piu'.
+
+Inoltre `superseded_by` = NULL per i facts il cui superseder viene cancellato:
+il retrieval esclude `superseded_by IS NOT NULL`, quindi resterebbero
+invisibili per sempre, superati da qualcosa che non c'e' piu'.
+
+`judged_pairs` orfani: LASCIATI. Sono un memo cache di fact_supersession e
+`facts.id` e' AUTOINCREMENT, quindi gli id non vengono riusati e una riga
+orfana non puo' produrre un match sbagliato, solo morto. Cleanup futuro.
+
+ORDINE OBBLIGATO: il piano sui derivati si calcola PRIMA di cancellare i
+facts (il join parte da derived_from -> id dei facts vittima). Il piano viene
+persistito su disco prima della prima delete e riusato al resume: ricalcolarlo
+a meta' purge, con parte dei facts gia' spariti, darebbe una lista di
+contaminati piu' corta e lascerebbe derivati sporchi in circolazione.
+
+================================================================================
+SEQUENZA OPERATIVA (di Emiliano — lo script non tocca daemon/launchctl)
+================================================================================
+    1. maintenance ON:  kill -USR1 <mcp_pid>
+       (freeze implicito: il nightly e' fuori finestra e l'auto-flush e'
+        gated dal lock)
+    2. backup COMPLETO: bash scripts/maintenance/backup_db.sh
+       verificare che copra chroma.sqlite3 + hnsw, doc_registry.json,
+       facts.sqlite3, entity_index.sqlite3, indice lessicale
+    3. dry-run:         ./.venv/bin/python scripts/maintenance/purge_lowvalue_docs.py
+       -> conferma UMANA del perimetro a video
+    4. execute:         ./.venv/bin/python scripts/maintenance/purge_lowvalue_docs.py --execute
+    5. reconciler:      ./.venv/bin/python scripts/maintenance/reconcile_lexical_index.py \\
+                          --max-churn 1.0
+       churn atteso 20,87% (51.112 / 244.939): sopra la soglia di default del
+       20%, quindi il run supervisionato con soglia alzata e' NECESSARIO, non
+       prudenziale. Il denominatore e' max(KB_dopo, indice_prima) = l'indice
+       pre-purge.
+    6. maintenance OFF: kill -USR2 <mcp_pid>
+    7. persist durevole: sudo launchctl kickstart system/com.tailor.mcp
+       (graceful, senza -k: e' lo shutdown pulito a persistere l'HNSW e a
+        drenare embeddings_queue dopo 51k delete)
+
+================================================================================
+VINCOLI
+================================================================================
+  * --dry-run (default): READ-ONLY, MAI un PersistentClient. Legge Chroma via
+    sqlite mode=ro e facts.sqlite3 mode=ro.
+  * --execute: gate maintenance PID-validato (avvio, pre-client,
+    pre-get_collection, prima di OGNI delete) + guardia entity_index
+    (pgrep build_entity_index.py + inode), entrambi importati e non
+    duplicati. Lock condiviso ingest_docs.lock: si tocca il registry.
+  * CHECKPOINT `path\\thash` per-doc, scritto solo dopo un save_registry
+    riuscito. Le fasi summary e derivati hanno i propri marker sentinella.
+  * AUDIT finale con i conteggi attesi hardcodati: divergenza = exit non-zero.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import time
+from datetime import datetime
+
+# --- path setup ---
+_HERE = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.dirname(_HERE))            # repo root
+sys.path.insert(0, os.path.join(BASE_DIR, "scripts", "ingest"))
+sys.path.insert(0, os.path.join(BASE_DIR, "scripts", "lib"))
+sys.path.insert(0, os.path.join(BASE_DIR, "scripts", "maintenance"))
+
+import ingest_docs as ing                                          # noqa: E402
+from chunk_sidecar import invalidate_chunk_sidecars                # noqa: E402
+
+# Gate maintenance PID-validato: unica fonte, mai duplicata.
+from backfill_email_youniversal import (                           # noqa: E402
+    MAINTENANCE_LOCK,
+    MaintenanceLost,
+    maintenance_state,
+)
+# Guardia entity_index: stessa ragione, gia' scritta e testata.
+from reingest_xlsx import (                                        # noqa: E402
+    EntityIndexBusy,
+    _assert_entity_index_stable,
+    _build_entity_index_running,
+    _entity_index_fingerprint,
+)
+
+LOGS_DIR = os.path.join(BASE_DIR, "logs")
+CHECKPOINT_PATH = os.path.join(LOGS_DIR, "purge_lowvalue_docs.done")
+DERIVED_PLAN_PATH = os.path.join(LOGS_DIR, "purge_lowvalue_derived_plan.json")
+FACTS_DB = os.path.join(ing.DB_DIR, "facts.sqlite3")
+CHROMA_SQLITE = os.path.join(ing.DB_DIR, "chroma.sqlite3")
+
+# Marker di provenienza scritto nei derivati messi in quarantena. Costante e
+# non datetime.now(): il valore deve restare identico tra il primo run e un
+# eventuale resume, altrimenti lo stesso purge lascia marker con date diverse.
+PURGE_DATE = "2026-07-20"
+QUARANTINE_RELATION = "derived_purged_source"
+
+# Sentinelle di fase nel checkpoint (le fasi 2 e 3 non sono per-documento).
+SENTINEL_SUMMARIES = "__SUMMARIES__"
+SENTINEL_DERIVED = "__DERIVED__"
+
+# ATTESI — misurati sulla KB del 2026-07-20 a maintenance ferma. Servono da
+# audit: una divergenza significa che la KB si e' mossa sotto i piedi (nightly
+# entrato in finestra, ingest concorrente) e il risultato va guardato a mano.
+EXPECTED = {
+    "docs": 21,
+    "doc_chunks": 51_090,
+    "summaries": 22,
+    "total_deleted": 51_112,
+    "kb_before": 244_939,
+    "kb_after": 193_827,
+    "derived_quarantined": 19_856,
+    "superseded_reset": 924,
+}
+
+
+# ============================================================================
+# PERIMETRO
+# ============================================================================
+def resolve_perimeter(registry: dict):
+    """(in_registry, off_registry) dalla denylist. Nessun pattern: path esatti.
+
+    in_registry: [(filepath, hash12)] — i doc da purgare dalla KB.
+    off_registry: path denylistati non presenti in registry (le copie mai
+    indicizzate). Non c'e' niente da cancellare per loro: esistono nella
+    denylist per non rientrare domani.
+    """
+    denylist = ing.load_denylist()
+    reg_norm = {os.path.normpath(p): p for p in registry}
+    in_reg, off_reg = [], []
+    for path in sorted(denylist):
+        real = reg_norm.get(path)
+        if real is None:
+            off_reg.append(path)
+            continue
+        h = (registry[real].get("hash") or "")[:12]
+        in_reg.append((real, h))
+    return in_reg, off_reg
+
+
+def _ro(db_path: str) -> sqlite3.Connection:
+    """Sola lettura coordinata coi writer: mode=ro (mai immutable=1)."""
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    con.execute("PRAGMA busy_timeout=30000")
+    return con
+
+
+def kb_count() -> int:
+    """Chunk totali in Chroma. Connessione APERTA E CHIUSA subito.
+
+    Tenerla aperta per la durata del run significherebbe un lettore sqlite
+    sullo stesso file su cui il PersistentClient sta cancellando 51k righe:
+    lock condivisi che si incrociano con le sue transazioni, per un numero che
+    serve due volte in tutto.
+    """
+    con = _ro(CHROMA_SQLITE)
+    try:
+        return con.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+    finally:
+        con.close()
+
+
+def count_chunks_ro(con: sqlite3.Connection, h12: str) -> int:
+    return con.execute(
+        "SELECT COUNT(*) FROM embeddings WHERE embedding_id LIKE ? ESCAPE '\\'",
+        (f"doc\\_{h12}\\_chunk\\_%",),
+    ).fetchone()[0]
+
+
+def find_summaries_ro(con: sqlite3.Connection, titles: set[str]) -> list[dict]:
+    """doc_summary il cui title e' in `titles`. Ritorna [{id,title,folder}]."""
+    meta: dict[str, dict] = {}
+    for eid, k, v in con.execute(
+        """SELECT e.embedding_id, m.key,
+                  COALESCE(m.string_value, m.int_value, m.float_value)
+           FROM embeddings e JOIN embedding_metadata m ON m.id = e.id
+           WHERE e.embedding_id LIKE 'doc\\_summary\\_%' ESCAPE '\\'"""
+    ):
+        meta.setdefault(eid, {})[k] = v
+    out = []
+    for eid, m in meta.items():
+        if m.get("title") in titles:
+            out.append({"id": eid, "title": m.get("title"),
+                        "folder": m.get("folder") or ""})
+    return sorted(out, key=lambda d: (d["title"], d["id"]))
+
+
+# ============================================================================
+# PIANO SUL LAYER DERIVATO — calcolato PRIMA di ogni delete
+# ============================================================================
+def build_derived_plan(hashes: list[str]) -> dict:
+    """Chi va in quarantena e quali superseded_by vanno resettati.
+
+    Il join parte dagli id dei facts vittima, quindi DEVE girare prima che
+    invalidate_chunk_sidecars li cancelli. Vedi docstring del modulo.
+    """
+    con = _ro(FACTS_DB)
+    try:
+        victim: dict[int, str] = {}          # fact_id -> hash12 del doc
+        for h in hashes:
+            for (fid,) in con.execute(
+                "SELECT id FROM facts WHERE chunk_id LIKE ? ESCAPE '\\'",
+                (f"doc\\_{h}\\_chunk\\_%",),
+            ):
+                victim[fid] = h
+
+        quarantine = []
+        for fid, df in con.execute(
+            """SELECT id, derived_from FROM facts
+               WHERE relation_type = 'derived'
+                 AND derived_from IS NOT NULL AND derived_from NOT IN ('', '[]')"""
+        ):
+            try:
+                refs = json.loads(df)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(refs, list):
+                continue
+            hit = [x for x in refs if isinstance(x, int) and x in victim]
+            if not hit:
+                continue
+            quarantine.append({
+                "id": fid,
+                "docs": sorted({victim[x] for x in hit}),
+                "kept_refs": [x for x in refs
+                              if isinstance(x, int) and x not in victim],
+                "lost": len(hit),
+            })
+
+        superseded = [fid for (fid, sb) in con.execute(
+            "SELECT id, superseded_by FROM facts WHERE superseded_by IS NOT NULL")
+            if sb in victim]
+    finally:
+        con.close()
+
+    return {
+        "purge_date": PURGE_DATE,
+        "hashes": sorted(hashes),
+        "victim_facts": len(victim),
+        "quarantine": quarantine,
+        "superseded_reset": sorted(superseded),
+    }
+
+
+def load_or_build_derived_plan(hashes: list[str], log=print) -> dict:
+    """Il piano persistito vince sempre sul ricalcolo. Vedi docstring."""
+    if os.path.exists(DERIVED_PLAN_PATH):
+        with open(DERIVED_PLAN_PATH) as fh:
+            plan = json.load(fh)
+        log(f"[derived] piano PERSISTITO riusato ({DERIVED_PLAN_PATH}): "
+            f"{len(plan['quarantine']):,} da quarantinare, "
+            f"{len(plan['superseded_reset']):,} superseded_by da resettare")
+        return plan
+    plan = build_derived_plan(hashes)
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    tmp = DERIVED_PLAN_PATH + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(plan, fh)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, DERIVED_PLAN_PATH)
+    log(f"[derived] piano CALCOLATO e persistito ({DERIVED_PLAN_PATH})")
+    return plan
+
+
+def apply_derived_plan(plan: dict, log=print) -> tuple[int, int]:
+    """Quarantena + reset superseded_by. Idempotente (UPDATE per id)."""
+    con = sqlite3.connect(FACTS_DB, timeout=30)
+    try:
+        con.execute("PRAGMA busy_timeout=30000")
+        quarantined = 0
+        for item in plan["quarantine"]:
+            marker = json.dumps({
+                "purged": plan.get("purge_date", PURGE_DATE),
+                "docs": item["docs"],
+                "kept_refs": item["kept_refs"],
+            })
+            cur = con.execute(
+                "UPDATE facts SET relation_type = ?, derived_from = ? WHERE id = ?",
+                (QUARANTINE_RELATION, marker, item["id"]))
+            quarantined += cur.rowcount or 0
+        reset = 0
+        for fid in plan["superseded_reset"]:
+            cur = con.execute(
+                "UPDATE facts SET superseded_by = NULL, superseded_at = '' "
+                "WHERE id = ?", (fid,))
+            reset += cur.rowcount or 0
+        con.commit()
+    finally:
+        con.close()
+    log(f"[derived] quarantena applicata: relation_type -> "
+        f"{QUARANTINE_RELATION} su {quarantined:,} facts")
+    log(f"[derived] superseded_by resettati: {reset:,}")
+    return quarantined, reset
+
+
+# ============================================================================
+# CHECKPOINT
+# ============================================================================
+def load_checkpoint() -> dict[str, str]:
+    """path -> hash. Stesso formato del runner reingest_xlsx."""
+    if not os.path.exists(CHECKPOINT_PATH):
+        return {}
+    done: dict[str, str] = {}
+    with open(CHECKPOINT_PATH) as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line.strip():
+                continue
+            path, _, h = line.partition("\t")
+            done[path.strip()] = h.strip()
+    return done
+
+
+def _assert_maintenance(stage: str) -> None:
+    ok, why = maintenance_state()
+    if not ok:
+        raise MaintenanceLost(f"{stage}: {why}")
+
+
+# ============================================================================
+# DRY-RUN
+# ============================================================================
+def dry_run(show: int) -> int:
+    print("=" * 78)
+    print("PURGE DOCUMENTI CONTABILI — DRY-RUN (READ-ONLY, zero scritture)")
+    print("=" * 78)
+    print(f"[denylist] {ing.DENYLIST_FILE}")
+    registry = ing.load_registry()
+    in_reg, off_reg = resolve_perimeter(registry)
+    print(f"[denylist] {len(in_reg) + len(off_reg)} path "
+          f"({len(in_reg)} in registry, {len(off_reg)} copie mai indicizzate)")
+
+    done = load_checkpoint()
+    if done:
+        print(f"[ckpt]     {len(done)} voci a checkpoint ({CHECKPOINT_PATH})")
+
+    kb_before = kb_count()
+    con = _ro(CHROMA_SQLITE)
+    try:
+        rows = []
+        total = 0
+        for path, h in in_reg:
+            n = count_chunks_ro(con, h)
+            total += n
+            rows.append((path, h, n, registry[path].get("chunks", 0)))
+        titles = {os.path.basename(p) for p, _ in in_reg}
+        summaries = find_summaries_ro(con, titles)
+    finally:
+        con.close()
+
+    print("\n" + "=" * 78)
+    print(f"DOCUMENTI DA PURGARE ({len(rows)}) — chunk REALI da Chroma")
+    print("=" * 78)
+    for path, h, n, reg_n in rows:
+        flag = "" if n == reg_n else f"   [registry dice {reg_n:,}]"
+        print(f"  {n:>7,} ch  doc_{h}  {os.path.basename(path)}{flag}")
+        print(f"              {os.path.dirname(path)}")
+
+    print(f"\n{'=' * 78}\nDOC_SUMMARY DA PURGARE ({len(summaries)})\n{'=' * 78}")
+    for s in summaries:
+        print(f"  {s['id']}  title={s['title']!r}  folder={s['folder']!r}")
+
+    print(f"\n{'=' * 78}\nCOPIE MAI INDICIZZATE ({len(off_reg)}) — "
+          f"niente da cancellare\n{'=' * 78}")
+    print("  (in denylist per non rientrare al prossimo ingest)")
+    for p in off_reg[:show]:
+        print(f"  {os.path.basename(p)}")
+        print(f"      {os.path.dirname(p)}")
+    if len(off_reg) > show:
+        print(f"  ... e altri {len(off_reg) - show}")
+
+    print(f"\n{'=' * 78}\nLAYER DERIVATO\n{'=' * 78}")
+    plan = build_derived_plan([h for _, h in in_reg])
+    print(f"facts cancellati dai sidecar     : {plan['victim_facts']:,}")
+    print(f"derived da mettere in quarantena : {len(plan['quarantine']):,}"
+          f"  (relation_type -> {QUARANTINE_RELATION})")
+    print(f"riferimenti derived_from rotti   : "
+          f"{sum(q['lost'] for q in plan['quarantine']):,}")
+    print(f"superseded_by da resettare       : "
+          f"{len(plan['superseded_reset']):,}")
+    if plan["quarantine"]:
+        print("\n  esempio di marker che verrebbe scritto:")
+        q = plan["quarantine"][0]
+        print(f"    fact id={q['id']} -> " + json.dumps({
+            "purged": PURGE_DATE, "docs": q["docs"],
+            "kept_refs": q["kept_refs"][:5]}))
+
+    deleted = total + len(summaries)
+    kb_after = kb_before - deleted
+    churn = deleted / max(kb_after, kb_before)
+    print(f"\n{'=' * 78}\nTOTALI\n{'=' * 78}")
+    print(f"KB prima          : {kb_before:,}")
+    print(f"chunk documenti   : {total:,}")
+    print(f"doc_summary       : {len(summaries):,}")
+    print(f"TOTALE DELETE     : {deleted:,}")
+    print(f"KB dopo           : {kb_after:,}")
+    print(f"registry: -{len(in_reg)} entry  ({len(registry):,} -> "
+          f"{len(registry) - len(in_reg):,})")
+    print(f"\nchurn reconciler  : {deleted:,}/max({kb_after:,}, {kb_before:,}) "
+          f"= {churn:.2%}")
+    if churn > 0.20:
+        print(f"  -> SOPRA la soglia di default (20%): il run dopo il purge "
+              f"richiede --max-churn 1.0 supervisionato")
+
+    _audit(deleted, total, len(summaries), kb_after, len(in_reg),
+           len(plan["quarantine"]), len(plan["superseded_reset"]),
+           kb_before, label="ATTESI (confronto dry-run)")
+
+    ok, why = maintenance_state()
+    print(f"\n[gate]  maintenance mode adesso: {'OK' if ok else 'NO'} — {why}")
+    busy, bwhy = _build_entity_index_running()
+    print(f"[gate]  build_entity_index: {'BUSY — ' + bwhy if busy else 'fermo'}")
+    print("[dry-run] nessuna scrittura. Fine.")
+    return 0
+
+
+def _audit(deleted, doc_chunks, summaries, kb_after, docs,
+           quarantined, superseded, kb_before, label="AUDIT") -> int:
+    """Confronto coi conteggi attesi. Ritorna il numero di divergenze."""
+    got = {
+        "docs": docs, "doc_chunks": doc_chunks, "summaries": summaries,
+        "total_deleted": deleted, "kb_before": kb_before, "kb_after": kb_after,
+        "derived_quarantined": quarantined, "superseded_reset": superseded,
+    }
+    print(f"\n{'=' * 78}\n{label}\n{'=' * 78}")
+    diverged = 0
+    for k, exp in EXPECTED.items():
+        v = got[k]
+        mark = "OK" if v == exp else f"DIVERGENZA (atteso {exp:,})"
+        if v != exp:
+            diverged += 1
+        print(f"  {k:<22} {v:>10,}   {mark}")
+    if diverged:
+        print(f"\n  {diverged} divergenze: la KB si e' mossa rispetto alla "
+              f"misura del {PURGE_DATE}.\n  Guardare a mano prima di "
+              f"proseguire (nightly in finestra? ingest concorrente?).")
+    return diverged
+
+
+# ============================================================================
+# EXECUTE
+# ============================================================================
+def execute(limit_docs: int | None) -> int:
+    ok, why = maintenance_state()
+    if not ok:
+        sys.stderr.write(
+            f"\nRIFIUTO --execute: MCP NON in maintenance mode ({why}).\n"
+            f"  Entra in maintenance: kill -USR1 <mcp_pid>\n"
+            f"  (il lock da solo non basta: serve che il MCP abbia RILASCIATO\n"
+            f"   il client ChromaDB, cosa che fa solo nel handler SIGUSR1)\n"
+            f"  Poi backup COMPLETO: bash scripts/maintenance/backup_db.sh\n")
+        return 2
+    print(f"[gate]  {why}")
+
+    busy, bwhy = _build_entity_index_running()
+    if busy:
+        sys.stderr.write(f"\nRIFIUTO --execute: {bwhy}.\n")
+        return 2
+    entity_baseline = _entity_index_fingerprint()
+
+    lock_fd = ing.acquire_single_instance_lock()
+    if lock_fd is None:
+        sys.stderr.write(
+            f"\nRIFIUTO --execute: un altro ingest e' in esecuzione "
+            f"({ing.LOCK_FILE}).\n")
+        return 2
+
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(LOGS_DIR, f"purge_lowvalue_docs_{ts}.log")
+    logf = open(log_path, "a")
+
+    def log(msg: str) -> None:
+        print(msg, flush=True)
+        logf.write(msg + "\n")
+        logf.flush()
+
+    log(f"[execute] start {ts}  log={log_path}")
+    log(f"[lock]    {ing.LOCK_FILE} acquisito (pid {os.getpid()})")
+
+    registry = ing.load_registry()
+    in_reg, off_reg = resolve_perimeter(registry)
+    done = load_checkpoint()
+    log(f"[denylist] {len(in_reg)} doc in registry, {len(off_reg)} copie "
+        f"mai indicizzate (nulla da cancellare)")
+    log(f"[ckpt]    {len(done)} voci a checkpoint -> resume")
+
+    # PIANO DERIVATI PRIMA DI QUALSIASI DELETE. Persistito: al resume si riusa
+    # quello, mai un ricalcolo su facts gia' potati.
+    derived_plan = load_or_build_derived_plan([h for _, h in in_reg], log)
+
+    kb_before = kb_count()
+    log(f"[kb]      chunk prima del purge: {kb_before:,}")
+
+    todo = [(p, h) for p, h in in_reg if p not in done]
+    if limit_docs:
+        todo = todo[:limit_docs]
+    log(f"[plan]    {len(todo)} documenti da purgare in questo run")
+
+    try:
+        _assert_maintenance("prima di PersistentClient")
+        _assert_entity_index_stable(entity_baseline, "prima di PersistentClient")
+        import chromadb
+        client = chromadb.PersistentClient(path=ing.DB_DIR)
+        _assert_maintenance("prima di get_collection")
+        collection = client.get_collection(name=ing.COLLECTION_NAME)
+    except (MaintenanceLost, EntityIndexBusy) as e:
+        sys.stderr.write(f"\nABORT: {e}\n  NESSUNA scrittura (client mai "
+                         f"aperto).\n")
+        log(f"[ABORT] {e}")
+        logf.close()
+        return 3
+
+    ckpt = open(CHECKPOINT_PATH, "a")
+    docs_ok = chunks_deleted = summaries_deleted = 0
+    quarantined = superseded_reset = 0
+    errors = 0
+
+    try:
+        # ---------- FASE 1: chunk + sidecar + registry, per documento -------
+        for idx, (path, h) in enumerate(todo):
+            log(f"\n[{idx + 1}/{len(todo)}] {os.path.basename(path)}  doc_{h}")
+            _assert_maintenance(f"prima della delete di doc_{h}")
+            _assert_entity_index_stable(entity_baseline,
+                                        f"prima della delete di doc_{h}")
+
+            # get SENZA limit: e' l'errore di garbage_collect.py, e su un file
+            # da 13k chunk lascerebbe indietro tutto tranne i primi 100.
+            res = collection.get(where={"conv_id": f"doc_{h}"}, include=[])
+            ids = res.get("ids") or []
+            if ids:
+                collection.delete(ids=ids)
+
+            # VERIFICA post-delete: che la delete sia avvenuta lo deve dire
+            # una rilettura, non l'assenza di eccezioni.
+            left = collection.get(where={"conv_id": f"doc_{h}"}, include=[])
+            n_left = len(left.get("ids") or [])
+            if n_left:
+                errors += 1
+                log(f"  ERRORE: {n_left} chunk ancora presenti dopo la delete "
+                    f"— documento SALTATO, registry intatto")
+                continue
+            log(f"  cancellati {len(ids):,} chunk (residui: 0)")
+            chunks_deleted += len(ids)
+
+            # Sidecar: fail-loud, propaga e ferma il run.
+            sc = invalidate_chunk_sidecars(f"doc_{h}", verbose=False)
+            detail = ", ".join(f"{k}={v}" for k, v in sc.items()) or "nessuna riga"
+            log(f"  sidecar invalidati: {detail}")
+
+            _assert_entity_index_stable(entity_baseline, "dopo il cleanup")
+
+            registry.pop(path, None)
+            ing.save_registry(registry)
+            ckpt.write(f"{path}\t{h}\n")
+            ckpt.flush()
+            os.fsync(ckpt.fileno())
+            docs_ok += 1
+
+        # ---------- FASE 2: doc_summary ------------------------------------
+        if SENTINEL_SUMMARIES in done:
+            log("\n[summary] gia' fatta (sentinella a checkpoint), salto")
+        elif limit_docs:
+            log("\n[summary] SALTATA: --limit-docs e' uno smoke, i summary si "
+                "cancellano solo nel run completo")
+        else:
+            log("\n[summary] cancellazione doc_summary per title+folder+category")
+            _assert_maintenance("prima della delete dei summary")
+            titles = {os.path.basename(p) for p, _ in in_reg}
+            folders = {os.path.basename(p): ing.infer_folder(p)
+                       for p, _ in in_reg}
+            for t in sorted(titles):
+                res = collection.get(where={"$and": [
+                    {"title": t},
+                    {"folder": folders[t]},
+                    {"category": "doc_summary"},
+                ]}, include=[])
+                sids = res.get("ids") or []
+                if not sids:
+                    continue
+                collection.delete(ids=sids)
+                left = collection.get(where={"$and": [
+                    {"title": t},
+                    {"folder": folders[t]},
+                    {"category": "doc_summary"},
+                ]}, include=[])
+                if left.get("ids"):
+                    errors += 1
+                    log(f"  ERRORE: summary di {t!r} ancora presenti dopo la "
+                        f"delete")
+                    continue
+                summaries_deleted += len(sids)
+                log(f"  {len(sids)} summary  title={t!r}")
+            ckpt.write(f"{SENTINEL_SUMMARIES}\tdone\n")
+            ckpt.flush()
+            os.fsync(ckpt.fileno())
+
+        # ---------- FASE 3: quarantena derivati ----------------------------
+        if SENTINEL_DERIVED in done:
+            log("\n[derived] gia' fatta (sentinella a checkpoint), salto")
+        elif limit_docs:
+            log("\n[derived] SALTATA: con --limit-docs i facts vittima sono "
+                "solo una parte, la quarantena andrebbe incompleta")
+        else:
+            log("\n[derived] applico la quarantena")
+            quarantined, superseded_reset = apply_derived_plan(derived_plan, log)
+            ckpt.write(f"{SENTINEL_DERIVED}\tdone\n")
+            ckpt.flush()
+            os.fsync(ckpt.fileno())
+
+    except (MaintenanceLost, EntityIndexBusy) as e:
+        sys.stderr.write(
+            f"\nABORT: {e}\n"
+            f"  lock maintenance atteso in {MAINTENANCE_LOCK}\n"
+            f"  fatti fin qui: doc={docs_ok} chunk={chunks_deleted:,}\n"
+            f"  checkpoint: {CHECKPOINT_PATH}\n"
+            f"  piano derivati: {DERIVED_PLAN_PATH} (NON cancellarlo: il "
+            f"resume lo riusa)\n"
+            f"  risolvi la causa e rilancia lo stesso comando.\n")
+        log(f"[ABORT] {e} — doc={docs_ok} chunk={chunks_deleted}")
+        return 3
+    finally:
+        ckpt.close()
+
+    kb_after = kb_count()
+    deleted = chunks_deleted + summaries_deleted
+    log(f"\n[execute] SUMMARY doc={docs_ok} chunk={chunks_deleted:,} "
+        f"summary={summaries_deleted} quarantena={quarantined:,} "
+        f"superseded_reset={superseded_reset:,} errori={errors}")
+    log(f"[kb]      {kb_before:,} -> {kb_after:,}")
+    log(f"[execute] log: {log_path}")
+
+    diverged = 0
+    if limit_docs:
+        log("[audit]   saltato: run parziale (--limit-docs)")
+    else:
+        diverged = _audit(deleted, chunks_deleted, summaries_deleted, kb_after,
+                          docs_ok, quarantined, superseded_reset, kb_before)
+
+    logf.close()
+    print("\n[next] reconciler:  ./.venv/bin/python "
+          "scripts/maintenance/reconcile_lexical_index.py --max-churn 1.0")
+    print("[next] maintenance OFF: kill -USR2 <mcp_pid>")
+    print("[next] persist:     sudo launchctl kickstart system/com.tailor.mcp"
+          "   (graceful, senza -k)")
+    return 1 if (errors or diverged) else 0
+
+
+# ============================================================================
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--dry-run", action="store_true", default=True,
+                   help="censimento READ-ONLY (default)")
+    g.add_argument("--execute", action="store_true",
+                   help="purge (richiede maintenance mode)")
+    ap.add_argument("--limit-docs", type=int, default=None,
+                    help="smoke: purga al massimo N documenti. Salta le fasi "
+                         "summary e derivati, che hanno senso solo complete")
+    ap.add_argument("--show", type=int, default=10, metavar="N",
+                    help="dry-run: quanti path elencare per lista (default 10)")
+    args = ap.parse_args()
+
+    if args.execute:
+        return execute(args.limit_docs)
+    return dry_run(args.show)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
