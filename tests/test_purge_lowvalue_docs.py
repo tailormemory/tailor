@@ -154,9 +154,10 @@ def test_piano_persistito_vince_sul_ricalcolo(facts_db):
 # ============================================================================
 def test_quarantena_toglie_dal_retrieval_senza_cancellare(facts_db):
     plan = purge.build_derived_plan([VICTIM_HASH])
-    quarantined, reset = purge.apply_derived_plan(plan, log=lambda m: None)
+    quarantined, reset, pendenti = purge.apply_derived_plan(
+        plan, log=lambda m: None)
 
-    assert (quarantined, reset) == (1, 1)
+    assert (quarantined, reset, pendenti) == (1, 1, 0)
     con = sqlite3.connect(facts_db["db"])
 
     # il fatto ESISTE ancora (quarantena, non cancellazione)
@@ -556,3 +557,67 @@ def test_dry_run_gira_su_stato_post_resume_parziale(facts_db, tmp_path,
     assert "fatto.xlsx" in out and "damfare.xlsx" in out
     assert "gia' purgato" in out, "va detto perche' non e' piu' in registry"
     assert "2 indicizzati" in out, "il perimetro resta di 2, non si accorcia"
+
+
+# ============================================================================
+# SUPERSEDED — il piano interseca le vittime della delete facts
+# ============================================================================
+def test_fase_derived_completa_se_i_superseded_mancanti_erano_vittime(
+        exec_env, facts_db, monkeypatch):
+    """Un id del piano cancellato dalla fase sidecar non e' lavoro pendente.
+
+    Riproduce il purge del 2026-07-21: 1.328 dei 1.353 superseded erano facts
+    dei chunk purgati. Col criterio rowcount==len(piano) la fase restava
+    eternamente "incompleta" e la sentinella non veniva mai scritta.
+    """
+    # l'hash di registry deve troncare a VICTIM_HASH, altrimenti il perimetro
+    # non corrisponde al piano e validate_plan aborta (giustamente).
+    monkeypatch.setattr(ing, "load_registry",
+                        lambda: {exec_env.path: {"hash": VICTIM_HASH + "0" * 52}})
+    plan = purge.build_derived_plan([VICTIM_HASH], kb_before=1,
+                                    expected_deleted=0)
+    assert plan["superseded_reset"] == [facts_db["sup_victim"]]
+    with open(purge.DERIVED_PLAN_PATH, "w") as fh:
+        json.dump(plan, fh)
+
+    # la fase sidecar ha gia' cancellato quell'id (era un fact di chunk purgato)
+    con = sqlite3.connect(facts_db["db"])
+    con.execute("DELETE FROM facts WHERE id=?", (facts_db["sup_victim"],))
+    con.commit(); con.close()
+
+    purge.execute(limit_docs=None)
+
+    assert purge.SENTINEL_DERIVED in purge.load_checkpoint(), \
+        "niente da resettare != fase incompleta"
+    # La tolleranza dell'audit sullo stesso caso e' verificata da
+    # test_audit_resta_rosso_se_manca_un_derivato_della_quarantena, che parte
+    # da uno stato post-purge pulito: qui la fixture exec_env lascia di
+    # proposito chunk e registry sporchi, e l'audit direbbe rosso per quelli.
+
+
+def test_audit_resta_rosso_se_manca_un_derivato_della_quarantena(
+        facts_db, tmp_path, monkeypatch):
+    """L'asimmetria non deve indebolire il lato quarantena.
+
+    I derived hanno chunk_id 'derived_*': non possono essere vittime della
+    delete per chunk doc, quindi uno sparito resta una perdita di dati.
+    """
+    in_reg = [("/w/a.xlsx", VICTIM_HASH)]
+    monkeypatch.setattr(purge, "CHROMA_SQLITE",
+                        _fake_chroma(tmp_path, [], extra_rows=7))
+    monkeypatch.setattr(ing, "load_registry", lambda: {})
+    plan = purge.build_derived_plan([VICTIM_HASH], kb_before=11,
+                                    expected_deleted=4)
+    purge.apply_derived_plan(plan, log=lambda m: None)
+
+    # superseded sparito -> tollerato
+    con = sqlite3.connect(facts_db["db"])
+    con.execute("DELETE FROM facts WHERE id=?", (facts_db["sup_victim"],))
+    con.commit(); con.close()
+    assert purge.audit_state(in_reg, plan, log=lambda m: None) == 0
+
+    # derivato sparito -> NON tollerato
+    con = sqlite3.connect(facts_db["db"])
+    con.execute("DELETE FROM facts WHERE id=?", (plan["quarantine"][0]["id"],))
+    con.commit(); con.close()
+    assert purge.audit_state(in_reg, plan, log=lambda m: None) == 1

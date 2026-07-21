@@ -426,8 +426,17 @@ def load_or_build_derived_plan(hashes: list[str], log=print, kb_before: int = 0,
     return plan
 
 
-def apply_derived_plan(plan: dict, log=print) -> tuple[int, int]:
-    """Quarantena + reset superseded_by. Idempotente (UPDATE per id)."""
+def apply_derived_plan(plan: dict, log=print) -> tuple[int, int, int]:
+    """Quarantena + reset superseded_by. Idempotente (UPDATE per id).
+
+    Ritorna (quarantinati, resettati, superseded_pendenti). Il terzo valore e'
+    il criterio di completezza della parte superseded: quanti id del piano
+    ESISTONO ancora con superseded_by valorizzato. Non si puo' usare il
+    rowcount, perche' la maggior parte di quegli id sono facts dei chunk
+    purgati e la fase sidecar li ha gia' cancellati: una riga che non c'e' piu'
+    non ha puntatori pendenti, e pretendere rowcount == len(piano)
+    significherebbe aspettare per sempre un lavoro che non esiste.
+    """
     con = sqlite3.connect(FACTS_DB, timeout=30)
     try:
         con.execute("PRAGMA busy_timeout=30000")
@@ -449,12 +458,29 @@ def apply_derived_plan(plan: dict, log=print) -> tuple[int, int]:
                 "WHERE id = ?", (fid,))
             reset += cur.rowcount or 0
         con.commit()
+
+        # Quanti degli id del piano esistono ancora, e quanti restano da
+        # sistemare. Serve a spiegare il numero: `reset` da solo sembra un
+        # fallimento (25 su 1.353) quando invece e' il risultato giusto.
+        s_ids = plan["superseded_reset"]
+        esistenti = pendenti = 0
+        for i in range(0, len(s_ids), 500):
+            batch = s_ids[i:i + 500]
+            ph = ",".join("?" * len(batch))
+            esistenti += con.execute(
+                f"SELECT COUNT(*) FROM facts WHERE id IN ({ph})",
+                batch).fetchone()[0]
+            pendenti += con.execute(
+                f"SELECT COUNT(*) FROM facts WHERE id IN ({ph}) "
+                f"AND superseded_by IS NOT NULL", batch).fetchone()[0]
     finally:
         con.close()
     log(f"[derived] quarantena applicata: relation_type -> "
         f"{QUARANTINE_RELATION} su {quarantined:,} facts")
-    log(f"[derived] superseded_by resettati: {reset:,}")
-    return quarantined, reset
+    log(f"[derived] superseded_by resettati: {reset:,} su {esistenti:,} "
+        f"esistenti ({len(s_ids) - esistenti:,} del piano gia' eliminati come "
+        f"vittime della delete facts)")
+    return quarantined, reset, pendenti
 
 
 # ============================================================================
@@ -651,12 +677,21 @@ def audit_state(in_reg, plan, log=print) -> int:
           sum(1 for p in paths if p in registry), 0)
 
     # --- facts: TUTTI gli id del piano, non "quanti ne ho toccati io" ---
-    # Due controlli per set, non uno. "Nessuna riga in stato sbagliato" e'
-    # soddisfatto anche da zero righe: un fatto del piano CANCELLATO passerebbe
-    # il test proprio perche' non c'e' piu'. Ma il contratto qui e' quarantena,
-    # non delete — un derivato sparito e' una perdita di dati silenziosa, e va
-    # visto. Quindi si verifica prima che ci siano TUTTI, poi che siano nello
-    # stato giusto.
+    # I due set del piano hanno controlli ASIMMETRICI, e non e' una svista.
+    #
+    # QUARANTENA — si verifica anche l'ESISTENZA. I derivati hanno chunk_id
+    # "derived_<ts>_<n>", che non matcha mai "doc_<hash>_chunk_%": la delete
+    # dei sidecar non puo' toccarli. Se uno di loro sparisce e' una perdita di
+    # dati vera, e senza il check passerebbe inosservata — "nessuna riga in
+    # stato sbagliato" e' soddisfatto anche da zero righe. Il contratto qui e'
+    # quarantena, non delete.
+    #
+    # SUPERSEDED — l'esistenza NON si verifica. Quegli id sono facts di chunk
+    # qualunque, e in larga maggioranza dei chunk purgati: la fase sidecar li
+    # cancella per costruzione (nel purge del 2026-07-21: 1.328 su 1.353).
+    # Pretenderli tutti presenti vorrebbe dire dichiarare fallito un purge
+    # riuscito. Quel che conta e' che nessuno dei sopravvissuti resti appeso a
+    # un superseder cancellato, ed e' esattamente il controllo qui sotto.
     con = _ro(FACTS_DB)
     try:
         def _count(ids: list, extra_sql: str = "", extra_args: list = None):
@@ -676,8 +711,9 @@ def audit_state(in_reg, plan, log=print) -> int:
               _count(q_ids, " AND relation_type != ?", [QUARANTINE_RELATION]), 0)
 
         s_ids = plan["superseded_reset"]
-        check("facts superseded del piano esistenti",
-              _count(s_ids), len(s_ids))
+        vivi = _count(s_ids)
+        log(f"  {'superseded del piano ancora esistenti':<38} {vivi:>10,}   "
+            f"(informativo: {len(s_ids) - vivi:,} eliminati come vittime)")
         check("superseded_by del piano non resettati",
               _count(s_ids, " AND superseded_by IS NOT NULL"), 0)
     finally:
@@ -943,20 +979,26 @@ def execute(limit_docs: int | None) -> int:
                 "solo una parte, la quarantena andrebbe incompleta")
         else:
             log("\n[derived] applico la quarantena")
-            quarantined, superseded_reset = apply_derived_plan(derived_plan, log)
-            # Stesso sigillo della fase summary: una UPDATE che non trova la
-            # riga ritorna rowcount 0, quindi un conteggio piu' basso del
-            # piano significa che dei fatti del piano non ci sono piu'. Non e'
-            # una fase completa e non va sigillata: meglio riprovarla ogni run
-            # (le UPDATE per id sono idempotenti) e tenere l'audit rosso, che
-            # dichiararla fatta e non poterla piu' riparare.
+            quarantined, superseded_reset, sup_pendenti = apply_derived_plan(
+                derived_plan, log)
+            # Sigillo = fase completa. I due rami hanno criteri DIVERSI perche'
+            # sono asimmetrici rispetto alla delete facts:
+            #   * quarantena: i derivati hanno chunk_id "derived_*", che non
+            #     matcha mai "doc_<hash>_chunk_%". Non possono essere vittime,
+            #     quindi devono esserci tutti e rowcount == len(piano) e' il
+            #     criterio giusto.
+            #   * superseded: quegli id sono facts di chunk qualsiasi, spesso
+            #     dei chunk purgati stessi, e la fase sidecar li ha cancellati
+            #     prima che arrivassimo qui. Il criterio e' "nessun id del
+            #     piano ANCORA ESISTENTE ha superseded_by valorizzato": un id
+            #     sparito non ha niente da resettare.
             attesi_q = len(derived_plan["quarantine"])
-            attesi_s = len(derived_plan["superseded_reset"])
-            if quarantined != attesi_q or superseded_reset != attesi_s:
+            if quarantined != attesi_q or sup_pendenti:
                 errors += 1
                 log(f"  [derived] INCOMPLETA: quarantena {quarantined:,}/"
-                    f"{attesi_q:,}, superseded {superseded_reset:,}/{attesi_s:,}"
-                    f" — sentinella NON scritta, la fase verra' rieseguita")
+                    f"{attesi_q:,}, superseded ancora pendenti "
+                    f"{sup_pendenti:,} — sentinella NON scritta, la fase "
+                    f"verra' rieseguita")
             else:
                 ckpt.write(f"{SENTINEL_DERIVED}\tdone\n")
                 ckpt.flush()
