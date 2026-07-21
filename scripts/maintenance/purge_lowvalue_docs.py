@@ -172,6 +172,11 @@ CHROMA_SQLITE = os.path.join(ing.DB_DIR, "chroma.sqlite3")
 PURGE_DATE = "2026-07-20"
 QUARANTINE_RELATION = "derived_purged_source"
 
+# Versione del formato del piano derivati. Da alzare a ogni cambio di campi:
+# un piano scritto da un'altra versione viene rifiutato invece di essere
+# interpretato con lo schema sbagliato.
+PLAN_SCHEMA_VERSION = 1
+
 # Sentinelle di fase nel checkpoint (le fasi 2 e 3 non sono per-documento).
 SENTINEL_SUMMARIES = "__SUMMARIES__"
 SENTINEL_DERIVED = "__DERIVED__"
@@ -194,25 +199,41 @@ EXPECTED = {
 # ============================================================================
 # PERIMETRO
 # ============================================================================
-def resolve_perimeter(registry: dict):
-    """(in_registry, off_registry) dalla denylist. Nessun pattern: path esatti.
+def resolve_perimeter(registry: dict, done: dict[str, str] | None = None):
+    """(perimetro, off_registry) dalla denylist. Nessun pattern: path esatti.
 
-    in_registry: [(filepath, hash12)] — i doc da purgare dalla KB.
-    off_registry: path denylistati non presenti in registry (le copie mai
-    indicizzate). Non c'e' niente da cancellare per loro: esistono nella
-    denylist per non rientrare domani.
+    perimetro: [(filepath, hash12)] dei documenti INDICIZZATI — quelli ancora
+    in registry PIU' quelli gia' purgati, che dal registry sono spariti ma
+    restano nel checkpoint col loro hash.
+
+    Includere i gia'-purgati non e' un dettaglio: il purge CANCELLA l'entry di
+    registry, quindi un perimetro ricavato dal solo registry si accorcia a
+    ogni documento fatto. Il piano derivati verrebbe rifiutato dalla
+    validazione al primo resume (21 hash nel piano, 18 adesso) e l'audit
+    finale guarderebbe solo i documenti rimasti, dichiarando verde un purge
+    incompleto. Il checkpoint e' cio' che rende il perimetro stabile.
+
+    off_registry: path denylistati mai indicizzati (le copie deduplicate per
+    hash all'ingest). Niente da cancellare: stanno in denylist per non
+    rientrare domani. Un path gia' purgato NON finisce qui — lo distingue la
+    presenza nel checkpoint.
     """
+    done = done or {}
     denylist = ing.load_denylist()
     reg_norm = {os.path.normpath(p): p for p in registry}
-    in_reg, off_reg = [], []
+    done_norm = {os.path.normpath(p): (p, h) for p, h in done.items()}
+    perimeter, off_reg = [], []
     for path in sorted(denylist):
         real = reg_norm.get(path)
-        if real is None:
-            off_reg.append(path)
+        if real is not None:
+            perimeter.append((real, (registry[real].get("hash") or "")[:12]))
             continue
-        h = (registry[real].get("hash") or "")[:12]
-        in_reg.append((real, h))
-    return in_reg, off_reg
+        purged = done_norm.get(path)
+        if purged is not None:                # gia' fatto in un run precedente
+            perimeter.append(purged)
+            continue
+        off_reg.append(path)
+    return perimeter, off_reg
 
 
 def _ro(db_path: str) -> sqlite3.Connection:
@@ -265,7 +286,8 @@ def find_summaries_ro(con: sqlite3.Connection, titles: set[str]) -> list[dict]:
 # ============================================================================
 # PIANO SUL LAYER DERIVATO — calcolato PRIMA di ogni delete
 # ============================================================================
-def build_derived_plan(hashes: list[str]) -> dict:
+def build_derived_plan(hashes: list[str], kb_before: int = 0,
+                       expected_deleted: int = 0) -> dict:
     """Chi va in quarantena e quali superseded_by vanno resettati.
 
     Il join parte dagli id dei facts vittima, quindi DEVE girare prima che
@@ -311,7 +333,15 @@ def build_derived_plan(hashes: list[str]) -> dict:
         con.close()
 
     return {
+        "schema_version": PLAN_SCHEMA_VERSION,
         "purge_date": PURGE_DATE,
+        # Misurati all'istante del piano, cioe' prima di qualsiasi delete.
+        # L'audit finale confronta la KB con QUESTI, non con una costante
+        # scritta a mano: le costanti EXPECTED invecchiano a ogni nightly
+        # (i derivati crescono), e un audit ancorato a loro dichiarerebbe
+        # fallito un purge riuscito solo perche' e' passata una notte.
+        "kb_before": kb_before,
+        "expected_deleted": expected_deleted,
         "hashes": sorted(hashes),
         "victim_facts": len(victim),
         "quarantine": quarantine,
@@ -319,16 +349,72 @@ def build_derived_plan(hashes: list[str]) -> dict:
     }
 
 
-def load_or_build_derived_plan(hashes: list[str], log=print) -> dict:
+class PlanMismatch(RuntimeError):
+    """Il piano su disco non appartiene a QUESTO purge -> stop, mai indovinare."""
+
+
+def validate_plan(plan: dict, hashes: list[str]) -> None:
+    """Il piano persistito descrive lo stesso purge che stiamo eseguendo?
+
+    Il piano vince sul ricalcolo (e' il suo scopo), quindi se appartiene a un
+    altro purge lo applicheremmo alla cieca: quarantena su fatti sbagliati,
+    superseded_by resettati a caso, e nessuno se ne accorge perche' il file
+    "c'era". Tre controlli, tutti su cose che cambiano se il purge e' un altro:
+    schema, perimetro, data.
+    """
+    problems = []
+    got_v = plan.get("schema_version")
+    if got_v != PLAN_SCHEMA_VERSION:
+        problems.append(
+            f"schema_version={got_v!r}, atteso {PLAN_SCHEMA_VERSION!r} "
+            f"(piano scritto da un'altra versione dello script)")
+    got_h = set(plan.get("hashes") or [])
+    want_h = set(hashes)
+    if got_h != want_h:
+        only_plan = sorted(got_h - want_h)
+        only_now = sorted(want_h - got_h)
+        problems.append(
+            f"perimetro diverso: {len(got_h)} hash nel piano vs {len(want_h)} "
+            f"adesso"
+            + (f"; solo nel piano: {only_plan[:5]}" if only_plan else "")
+            + (f"; solo adesso: {only_now[:5]}" if only_now else ""))
+    got_d = plan.get("purge_date")
+    if got_d != PURGE_DATE:
+        problems.append(f"purge_date={got_d!r}, atteso {PURGE_DATE!r}")
+    if problems:
+        raise PlanMismatch(
+            "il piano derivati su disco NON corrisponde a questo purge:\n"
+            + "".join(f"    - {p}\n" for p in problems)
+            + f"\n  file: {DERIVED_PLAN_PATH}\n"
+            f"  Cosa verificare, in ordine:\n"
+            f"    1. e' il residuo di un purge PRECEDENTE gia' chiuso?\n"
+            f"       -> confronta `purge_date` nel file con {PURGE_DATE}\n"
+            f"    2. la denylist e' cambiata dopo che il piano e' stato\n"
+            f"       scritto? -> il perimetro non e' piu' quello, e i\n"
+            f"       documenti aggiunti/tolti non sono nella quarantena\n"
+            f"    3. c'e' un purge interrotto a meta' da riprendere?\n"
+            f"       -> allora NON toccare il file: rimetti la denylist come\n"
+            f"          era e rilancia lo stesso comando\n"
+            f"  Solo se hai stabilito che e' un residuo da buttare:\n"
+            f"    rm {DERIVED_PLAN_PATH}\n"
+            f"  Cancellarlo durante un purge interrotto significa perdere la\n"
+            f"  lista dei derivati contaminati: il ricalcolo su facts gia'\n"
+            f"  potati ne troverebbe zero.")
+
+
+def load_or_build_derived_plan(hashes: list[str], log=print, kb_before: int = 0,
+                               expected_deleted: int = 0) -> dict:
     """Il piano persistito vince sempre sul ricalcolo. Vedi docstring."""
     if os.path.exists(DERIVED_PLAN_PATH):
         with open(DERIVED_PLAN_PATH) as fh:
             plan = json.load(fh)
+        validate_plan(plan, hashes)          # fail-loud PRIMA di riusarlo
         log(f"[derived] piano PERSISTITO riusato ({DERIVED_PLAN_PATH}): "
             f"{len(plan['quarantine']):,} da quarantinare, "
-            f"{len(plan['superseded_reset']):,} superseded_by da resettare")
+            f"{len(plan['superseded_reset']):,} superseded_by da resettare "
+            f"(schema v{plan.get('schema_version')}, perimetro e data OK)")
         return plan
-    plan = build_derived_plan(hashes)
+    plan = build_derived_plan(hashes, kb_before, expected_deleted)
     os.makedirs(LOGS_DIR, exist_ok=True)
     tmp = DERIVED_PLAN_PATH + ".tmp"
     with open(tmp, "w") as fh:
@@ -404,11 +490,11 @@ def dry_run(show: int) -> int:
     print("=" * 78)
     print(f"[denylist] {ing.DENYLIST_FILE}")
     registry = ing.load_registry()
-    in_reg, off_reg = resolve_perimeter(registry)
-    print(f"[denylist] {len(in_reg) + len(off_reg)} path "
-          f"({len(in_reg)} in registry, {len(off_reg)} copie mai indicizzate)")
-
     done = load_checkpoint()
+    in_reg, off_reg = resolve_perimeter(registry, done)
+    print(f"[denylist] {len(in_reg) + len(off_reg)} path "
+          f"({len(in_reg)} indicizzati, {len(off_reg)} copie mai indicizzate)")
+
     if done:
         print(f"[ckpt]     {len(done)} voci a checkpoint ({CHECKPOINT_PATH})")
 
@@ -480,9 +566,9 @@ def dry_run(show: int) -> int:
         print(f"  -> SOPRA la soglia di default (20%): il run dopo il purge "
               f"richiede --max-churn 1.0 supervisionato")
 
-    _audit(deleted, total, len(summaries), kb_after, len(in_reg),
-           len(plan["quarantine"]), len(plan["superseded_reset"]),
-           kb_before, label="ATTESI (confronto dry-run)")
+    _audit_expected(deleted, total, len(summaries), kb_after, len(in_reg),
+                    len(plan["quarantine"]), len(plan["superseded_reset"]),
+                    kb_before, label="ATTESI (confronto dry-run)")
 
     ok, why = maintenance_state()
     print(f"\n[gate]  maintenance mode adesso: {'OK' if ok else 'NO'} — {why}")
@@ -492,9 +578,110 @@ def dry_run(show: int) -> int:
     return 0
 
 
-def _audit(deleted, doc_chunks, summaries, kb_after, docs,
-           quarantined, superseded, kb_before, label="AUDIT") -> int:
-    """Confronto coi conteggi attesi. Ritorna il numero di divergenze."""
+def audit_state(in_reg, plan, log=print) -> int:
+    """AUDIT DI STATO: interroga i DB, non i contatori del processo.
+
+    I contatori (docs_ok, chunks_deleted, quarantined...) dicono cosa ha fatto
+    QUESTO processo. Non e' la domanda giusta: dopo un abort e un resume il
+    lavoro e' spalmato su due o piu' run, e ognuno vede solo la propria fetta —
+    un audit a contatori griderebbe "divergenza" su un purge perfettamente
+    riuscito, oppure (peggio) direbbe "tutto ok" perche' i suoi 3 documenti
+    sono andati bene mentre gli altri 18 non li ha nemmeno guardati.
+
+    Qui si chiede allo STATO: i chunk ci sono ancora? il registry e' pulito?
+    i derivati del piano sono tutti in quarantena? La risposta e' la stessa
+    indipendentemente da chi ha fatto cosa e in quanti run.
+
+    Ritorna il numero di controlli falliti.
+    """
+    log(f"\n{'=' * 78}\nAUDIT DI STATO (interroga i DB, non i contatori)\n"
+        f"{'=' * 78}")
+    failed = 0
+
+    def check(nome: str, got, want) -> None:
+        nonlocal failed
+        ok = got == want
+        if not ok:
+            failed += 1
+        got_s = f"{got:,}" if isinstance(got, int) else str(got)
+        want_s = f"{want:,}" if isinstance(want, int) else str(want)
+        log(f"  {nome:<38} {got_s:>10}   "
+            + ("OK" if ok else f"FALLITO (atteso {want_s})"))
+
+    hashes = [h for _, h in in_reg]
+    paths = [p for p, _ in in_reg]
+
+    # --- Chroma: chunk e summary residui ---
+    con = _ro(CHROMA_SQLITE)
+    try:
+        residui = sum(count_chunks_ro(con, h) for h in hashes)
+        check("chunk residui dei doc purgati", residui, 0)
+        titles = {os.path.basename(p) for p in paths}
+        check("doc_summary residui del perimetro",
+              len(find_summaries_ro(con, titles)), 0)
+        kb = con.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+    finally:
+        con.close()
+    # Atteso ricavato dal PIANO (misurato pre-delete in questo purge), non da
+    # EXPECTED: quelle costanti sono la baseline del giorno della decisione e
+    # invecchiano a ogni nightly.
+    want_kb = plan.get("kb_before", 0) - plan.get("expected_deleted", 0)
+    if want_kb > 0:
+        check("chunk totali in KB", kb, want_kb)
+    else:
+        log(f"  {'chunk totali in KB':<38} {kb:>10,}   "
+            f"(piano senza baseline: controllo saltato)")
+
+    # --- Registry: nessuna delle 21 entry deve essere sopravvissuta ---
+    registry = ing.load_registry()
+    check("entry registry dei doc purgati",
+          sum(1 for p in paths if p in registry), 0)
+
+    # --- facts: TUTTI gli id del piano, non "quanti ne ho toccati io" ---
+    con = _ro(FACTS_DB)
+    try:
+        q_ids = [q["id"] for q in plan["quarantine"]]
+        not_quarantined = 0
+        for i in range(0, len(q_ids), 500):
+            batch = q_ids[i:i + 500]
+            ph = ",".join("?" * len(batch))
+            not_quarantined += con.execute(
+                f"SELECT COUNT(*) FROM facts WHERE id IN ({ph}) "
+                f"AND relation_type != ?", batch + [QUARANTINE_RELATION]
+            ).fetchone()[0]
+        check("derivati del piano NON in quarantena", not_quarantined, 0)
+
+        s_ids = plan["superseded_reset"]
+        still_set = 0
+        for i in range(0, len(s_ids), 500):
+            batch = s_ids[i:i + 500]
+            ph = ",".join("?" * len(batch))
+            still_set += con.execute(
+                f"SELECT COUNT(*) FROM facts WHERE id IN ({ph}) "
+                f"AND superseded_by IS NOT NULL", batch).fetchone()[0]
+        check("superseded_by del piano non resettati", still_set, 0)
+    finally:
+        con.close()
+
+    if failed:
+        log(f"\n  {failed} controlli FALLITI: il purge NON e' completo.\n"
+            f"  Rilanciare lo stesso comando (e' resumable) e ri-guardare\n"
+            f"  l'audit. Se un controllo resta rosso dopo un rilancio pulito,\n"
+            f"  fermarsi: NON lanciare il reconciler e NON riaprire il MCP.")
+    else:
+        log("\n  tutti i controlli di stato verdi: il purge e' completo.")
+    return failed
+
+
+def _audit_expected(deleted, doc_chunks, summaries, kb_after, docs,
+                    quarantined, superseded, kb_before,
+                    label="ATTESI") -> int:
+    """Confronto coi conteggi misurati il giorno del piano (solo dry-run).
+
+    Serve a far vedere all'operatore che la KB e' ancora quella su cui il
+    perimetro e' stato deciso. NON e' l'audit post-purge: quello e'
+    audit_state(), che non dipende da quanti run sono serviti.
+    """
     got = {
         "docs": docs, "doc_chunks": doc_chunks, "summaries": summaries,
         "total_deleted": deleted, "kb_before": kb_before, "kb_after": kb_after,
@@ -557,20 +744,65 @@ def execute(limit_docs: int | None) -> int:
     log(f"[lock]    {ing.LOCK_FILE} acquisito (pid {os.getpid()})")
 
     registry = ing.load_registry()
-    in_reg, off_reg = resolve_perimeter(registry)
     done = load_checkpoint()
-    log(f"[denylist] {len(in_reg)} doc in registry, {len(off_reg)} copie "
+    in_reg, off_reg = resolve_perimeter(registry, done)
+    log(f"[denylist] perimetro {len(in_reg)} doc, {len(off_reg)} copie "
         f"mai indicizzate (nulla da cancellare)")
     log(f"[ckpt]    {len(done)} voci a checkpoint -> resume")
 
+    # Fotografia PRE-delete: quanti chunk ci sono adesso e quanti ne devono
+    # sparire. Va presa prima del piano perche' e' il piano a conservarla, ed
+    # e' contro questa — non contro una costante — che l'audit finale misura.
+    kb_before = kb_count()
+    con = _ro(CHROMA_SQLITE)
+    try:
+        expected_deleted = sum(count_chunks_ro(con, h) for _, h in in_reg)
+        expected_deleted += len(find_summaries_ro(
+            con, {os.path.basename(p) for p, _ in in_reg}))
+    finally:
+        con.close()
+    log(f"[kb]      chunk prima del purge: {kb_before:,}  "
+        f"(attesi in uscita: {expected_deleted:,})")
+
     # PIANO DERIVATI PRIMA DI QUALSIASI DELETE. Persistito: al resume si riusa
     # quello, mai un ricalcolo su facts gia' potati.
-    derived_plan = load_or_build_derived_plan([h for _, h in in_reg], log)
+    try:
+        derived_plan = load_or_build_derived_plan(
+            [h for _, h in in_reg], log, kb_before, expected_deleted)
+    except PlanMismatch as e:
+        sys.stderr.write(f"\nABORT: {e}\n")
+        log(f"[ABORT] piano derivati non valido: {e}")
+        logf.close()
+        return 4
 
-    kb_before = kb_count()
-    log(f"[kb]      chunk prima del purge: {kb_before:,}")
+    # CHECKPOINT: l'hash e' un vincolo, non un promemoria. Un path gia' a
+    # checkpoint con hash DIVERSO significa che il file su disco non e' quello
+    # che avevamo purgato — in un'operazione distruttiva quel caso non si
+    # salta in silenzio (si perderebbe la delete del contenuto nuovo) e non si
+    # purga alla cieca: si ferma tutto e lo guarda una persona.
+    todo = []
+    for path, h in in_reg:
+        if path not in done:
+            todo.append((path, h))
+            continue
+        if done[path] == h:
+            continue                          # gia' fatto, stesso contenuto
+        sys.stderr.write(
+            f"\nABORT: checkpoint incoerente per\n  {path}\n"
+            f"  checkpoint: {done[path] or '(vuoto)'}\n"
+            f"  adesso    : {h}\n"
+            f"  Il file risulta gia' purgato ma con un contenuto diverso da\n"
+            f"  quello attuale. Le possibilita':\n"
+            f"    - il file e' stato modificato/sostituito dopo il purge\n"
+            f"      -> i chunk del contenuto NUOVO sono in KB e vanno tolti\n"
+            f"    - il checkpoint e' di un purge precedente ({CHECKPOINT_PATH})\n"
+            f"  In nessuno dei due casi ha senso saltarlo o rifarlo in\n"
+            f"  automatico: decidere a mano.\n")
+        log(f"[ABORT] checkpoint incoerente su {path}: "
+            f"ckpt={done[path]!r} adesso={h!r}")
+        logf.close()
+        return 4
 
-    todo = [(p, h) for p, h in in_reg if p not in done]
     if limit_docs:
         todo = todo[:limit_docs]
     log(f"[plan]    {len(todo)} documenti da purgare in questo run")
@@ -701,27 +933,52 @@ def execute(limit_docs: int | None) -> int:
         ckpt.close()
 
     kb_after = kb_count()
-    deleted = chunks_deleted + summaries_deleted
-    log(f"\n[execute] SUMMARY doc={docs_ok} chunk={chunks_deleted:,} "
+    # Contatori di PROCESSO: cosa ha fatto questo run. Informativi — il
+    # giudizio sul purge lo da' audit_state(), che guarda i DB.
+    log(f"\n[progress] questo run: doc={docs_ok} chunk={chunks_deleted:,} "
         f"summary={summaries_deleted} quarantena={quarantined:,} "
         f"superseded_reset={superseded_reset:,} errori={errors}")
     log(f"[kb]      {kb_before:,} -> {kb_after:,}")
     log(f"[execute] log: {log_path}")
 
-    diverged = 0
     if limit_docs:
+        # Uno smoke lascia la KB a META': summary non cancellati, derivati non
+        # quarantinati, gran parte dei documenti ancora dentro. Far vedere qui
+        # la sequenza di chiusura sarebbe un invito a eseguirla, e il
+        # reconciler su uno stato parziale riscriverebbe l'indice lessicale
+        # allineandolo a una KB che non e' quella finale.
         log("[audit]   saltato: run parziale (--limit-docs)")
-    else:
-        diverged = _audit(deleted, chunks_deleted, summaries_deleted, kb_after,
-                          docs_ok, quarantined, superseded_reset, kb_before)
+        logf.close()
+        print(f"\n{'=' * 78}")
+        print("RUN PARZIALE (smoke) — LA KB E' IN UNO STATO INTERMEDIO")
+        print("=" * 78)
+        print("  NON lanciare il reconciler.")
+        print("  NON riaprire il MCP (niente kill -USR2, niente kickstart).")
+        print("  NON seguire i next step di chiusura: qui non sono stampati")
+        print("  apposta.")
+        print("\n  Rilanciare senza --limit-docs per completare il purge:")
+        print("    ./.venv/bin/python scripts/maintenance/purge_lowvalue_docs.py"
+              " --execute")
+        return 1 if errors else 0
 
+    failed = audit_state(in_reg, derived_plan, log)
     logf.close()
+
+    if failed or errors:
+        print(f"\n{'=' * 78}")
+        print("PURGE INCOMPLETO — NON PROSEGUIRE")
+        print("=" * 78)
+        print("  NON lanciare il reconciler, NON riaprire il MCP.")
+        print("  Rilanciare lo stesso comando (e' resumable) e ri-guardare"
+              " l'audit.")
+        return 1
+
     print("\n[next] reconciler:  ./.venv/bin/python "
           "scripts/maintenance/reconcile_lexical_index.py --max-churn 1.0")
     print("[next] maintenance OFF: kill -USR2 <mcp_pid>")
     print("[next] persist:     sudo launchctl kickstart system/com.tailor.mcp"
           "   (graceful, senza -k)")
-    return 1 if (errors or diverged) else 0
+    return 0
 
 
 # ============================================================================
