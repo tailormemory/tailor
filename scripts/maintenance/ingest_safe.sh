@@ -23,6 +23,7 @@
 #   5. Audit post-ingest (count delta + repair_hnsw_index.py --audit)
 #   6. Restart MCP (sudo launchctl bootstrap)
 #   7. Smoke test (HTTP 200 on /api/dashboard/stats)
+#   7b. Snapshot retention (keep last KEEP_SNAPSHOTS, only on success, skipped with --no-backup)
 #   8. Telegram summary
 #   9. Log to logs/ingest_safe_TIMESTAMP.log
 #
@@ -53,7 +54,14 @@ MCP_PLIST="/Library/LaunchDaemons/com.tailor.mcp.plist"
 MCP_SERVICE="system/com.tailor.mcp"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_FILE="$TAILOR_DIR/logs/ingest_safe_${TIMESTAMP}.log"
-BACKUP_DIR="$TAILOR_DIR/backups/db_pre_ingest_safe_${TIMESTAMP}"
+BACKUP_ROOT="$TAILOR_DIR/backups"
+BACKUP_DIR="$BACKUP_ROOT/db_pre_ingest_safe_${TIMESTAMP}"
+
+# Snapshot da conservare dopo un run RIUSCITO. La retention (step 7b) prune
+# i più vecchi tenendo gli ultimi KEEP_SNAPSHOTS. Girata SOLO su successo:
+# se l'ingest è andato male gli snapshot vecchi sono il path di recovery,
+# non spazzatura. Con --no-backup non crea né cancella nulla.
+KEEP_SNAPSHOTS=2
 
 # Load env (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, API keys for ingest)
 if [ -r /etc/tailor/env ]; then
@@ -159,6 +167,54 @@ mcp_count_running() {
 
 sql_count() {
     sqlite3 "$DB" "$1" 2>/dev/null
+}
+
+prune_snapshots() {
+    # Retention per le dir di backup db_pre_ingest_safe_*.
+    # Args: $1 = backups root (path ASSOLUTO), $2 = quante tenere.
+    #
+    # Ordinamento per timestamp nel NOME (glob → ordine lessicografico, e con
+    # naming a larghezza fissa YYYYmmdd_HHMMSS lessicografico = cronologico),
+    # NON per mtime — l'mtime può essere riscritto da rsync/touch/restore e
+    # mentire sull'ordine di creazione.
+    #
+    # Guardia: glob assoluto costruito da $root, mai cd + glob relativo; e
+    # ogni candidato è ri-filtrato sul basename esatto db_pre_ingest_safe_*
+    # così una root sbagliata non può far cancellare altro. nullglob → se non
+    # matcha nulla il loop non gira (niente pattern literal).
+    local root="$1" keep="$2"
+    local snaps=() d
+    shopt -s nullglob
+    for d in "$root"/db_pre_ingest_safe_*/; do
+        d="${d%/}"
+        [ -d "$d" ] || continue
+        case "$(basename "$d")" in
+            db_pre_ingest_safe_*) snaps+=("$d") ;;
+        esac
+    done
+    shopt -u nullglob
+
+    local total=${#snaps[@]}
+    if [ "$total" -le "$keep" ]; then
+        log "  retention: $total snapshot ≤ keep=$keep, niente da rimuovere"
+        return 0
+    fi
+
+    # snaps è già in ordine lessicografico (glob) = cronologico: i primi
+    # (total-keep) sono i più vecchi da rimuovere.
+    local remove=$(( total - keep ))
+    log "  retention: $total snapshot, keep=$keep → rimuovo i $remove più vecchi"
+    local i freed
+    for (( i = 0; i < remove; i++ )); do
+        d="${snaps[$i]}"
+        freed=$(du -sh "$d" 2>/dev/null | cut -f1)
+        if rm -rf "$d" 2>>"$LOG_FILE"; then
+            log "  retention: rimosso $(basename "$d") (liberati ${freed:-?})"
+        else
+            log "  retention: WARNING rm fallito su $d"
+        fi
+    done
+    return 0
 }
 
 # ── 0. INIT ──
@@ -428,6 +484,20 @@ fi
 # Final SQL coherence check
 COUNT_FINAL=$(sql_count "SELECT COUNT(*) FROM embeddings;")
 log "  final embeddings count: $COUNT_FINAL"
+
+# ── 7b. SNAPSHOT RETENTION ──
+# Solo su run RIUSCITO: se l'ingest è fallito (SIGSEGV) gli snapshot vecchi
+# sono il path di recovery. bail() e i critical-exit precedenti non arrivano
+# fin qui, quindi non prunano mai. Uno smoke-fail (exit 2) non è un fallimento
+# d'ingest: i dati sono integri, la retention è sicura.
+if [ "$NO_BACKUP" = "1" ]; then
+    log "── STEP 7b: retention SKIPPED (--no-backup: non ha creato nulla) ──"
+elif [ "$INGEST_FAILED" = "1" ] || [ "$ENTITIES_FAILED" = "1" ] || [ "$SUMMARIES_FAILED" = "1" ]; then
+    log "── STEP 7b: retention SKIPPED (run fallito, snapshot vecchi preservati) ──"
+else
+    log "── STEP 7b: snapshot retention (keep last $KEEP_SNAPSHOTS) ──"
+    prune_snapshots "$BACKUP_ROOT" "$KEEP_SNAPSHOTS"
+fi
 
 # ── 8. TELEGRAM SUMMARY ──
 END_TIME=$(date +%s)
