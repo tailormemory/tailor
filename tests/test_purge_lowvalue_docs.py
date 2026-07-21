@@ -440,3 +440,119 @@ def test_smoke_non_stampa_i_next_step_di_chiusura(exec_env, monkeypatch, capsys)
                     "kill -USR2 <mcp_pid>"):
         assert vietato not in out, f"lo smoke non deve suggerire {vietato!r}"
     assert "niente kickstart" in out, "deve dire esplicitamente di NON farlo"
+
+
+# ============================================================================
+# SENTINELLE — sigillano una fase COMPLETA, mai una tentata
+# ============================================================================
+class _CollResiduo:
+    """Collection che NON riesce a cancellare i summary: la delete e' un no-op.
+
+    Simula il caso che conta: la fase gira, tenta, e lascia residui.
+    """
+
+    def __init__(self, residuo_ids):
+        self.residuo = list(residuo_ids)
+        self.delete_calls = 0
+
+    def get(self, where=None, include=None, **kw):
+        w = json.dumps(where or {})
+        if "doc_summary" in w:
+            return {"ids": list(self.residuo)}
+        return {"ids": []}
+
+    def delete(self, ids=None):
+        self.delete_calls += 1          # "cancella" ma i residui restano
+
+
+def test_sentinella_summary_non_scritta_se_restano_residui(exec_env, monkeypatch):
+    """Sigillare una fase con residui la rende irreparabile a ogni resume."""
+    coll = _CollResiduo(["doc_summary_1"])
+    fake = types.ModuleType("chromadb")
+    fake.PersistentClient = lambda path: types.SimpleNamespace(
+        get_collection=lambda name: coll)
+    monkeypatch.setitem(sys.modules, "chromadb", fake)
+    monkeypatch.setattr(ing, "load_registry",
+                        lambda: {exec_env.path: {"hash": "n" * 64}})
+
+    rc = purge.execute(limit_docs=None)
+
+    assert rc == 1, "residui = purge incompleto"
+    assert coll.delete_calls > 0, "la fase deve aver PROVATO"
+    done = purge.load_checkpoint()
+    assert purge.SENTINEL_SUMMARIES not in done, \
+        "con residui la sentinella non va scritta: il resume deve riprovare"
+
+
+def test_sentinella_derived_non_scritta_se_un_fact_del_piano_e_sparito(
+        exec_env, facts_db, monkeypatch):
+    """UPDATE su id inesistente -> rowcount 0 -> fase incompleta, niente sigillo."""
+    monkeypatch.setattr(ing, "load_registry",
+                        lambda: {exec_env.path: {"hash": "n" * 64}})
+    # il piano viene calcolato al primo run: lo pre-costruisco e poi cancello
+    # il fatto che cita, come farebbe una delete andata oltre il previsto.
+    plan = purge.build_derived_plan([VICTIM_HASH], kb_before=1,
+                                    expected_deleted=0)
+    assert len(plan["quarantine"]) == 1
+    with open(purge.DERIVED_PLAN_PATH, "w") as fh:
+        json.dump(plan, fh)
+    con = sqlite3.connect(facts_db["db"])
+    con.execute("DELETE FROM facts WHERE id=?", (facts_db["d_hit"],))
+    con.commit(); con.close()
+
+    purge.execute(limit_docs=None)
+
+    assert purge.SENTINEL_DERIVED not in purge.load_checkpoint()
+
+
+def test_audit_rosso_se_un_fact_del_piano_e_stato_cancellato(facts_db, tmp_path,
+                                                             monkeypatch):
+    """Il contratto e' quarantena, non delete: un id sparito deve fare rosso.
+
+    Senza il controllo di ESISTENZA passerebbe: "nessuna riga in stato
+    sbagliato" e' vero anche quando di righe non ce n'e' nessuna.
+    """
+    in_reg = [("/w/a.xlsx", VICTIM_HASH)]
+    monkeypatch.setattr(purge, "CHROMA_SQLITE",
+                        _fake_chroma(tmp_path, [], extra_rows=7))
+    monkeypatch.setattr(ing, "load_registry", lambda: {})
+
+    plan = purge.build_derived_plan([VICTIM_HASH], kb_before=11,
+                                    expected_deleted=4)
+    purge.apply_derived_plan(plan, log=lambda m: None)
+    assert purge.audit_state(in_reg, plan, log=lambda m: None) == 0
+
+    con = sqlite3.connect(facts_db["db"])
+    con.execute("DELETE FROM facts WHERE id=?", (plan["quarantine"][0]["id"],))
+    con.commit(); con.close()
+
+    assert purge.audit_state(in_reg, plan, log=lambda m: None) == 1
+
+
+# ============================================================================
+# DRY-RUN RESUMABILE
+# ============================================================================
+def test_dry_run_gira_su_stato_post_resume_parziale(facts_db, tmp_path,
+                                                    monkeypatch, capsys):
+    """A purge interrotto il doc e' fuori registry ma nel checkpoint.
+
+    E' lo stato in cui il dry-run serve di piu': deve girare, non esplodere.
+    """
+    purgato, rimasto = "/w/fatto.xlsx", "/w/damfare.xlsx"
+    monkeypatch.setattr(purge, "CHECKPOINT_PATH", str(tmp_path / "ck.done"))
+    monkeypatch.setattr(purge, "CHROMA_SQLITE",
+                        _fake_chroma(tmp_path, [OTHER_HASH], extra_rows=4))
+    monkeypatch.setattr(ing, "load_denylist", lambda: {purgato, rimasto})
+    monkeypatch.setattr(ing, "load_registry",
+                        lambda: {rimasto: {"hash": OTHER_HASH + "0" * 52,
+                                           "chunks": 2}})
+    with open(purge.CHECKPOINT_PATH, "w") as fh:
+        fh.write(f"{purgato}\t{VICTIM_HASH}\n")
+
+    rc = purge.dry_run(show=5)
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "fatto.xlsx" in out and "damfare.xlsx" in out
+    assert "gia' purgato" in out, "va detto perche' non e' piu' in registry"
+    assert "2 indicizzati" in out, "il perimetro resta di 2, non si accorcia"

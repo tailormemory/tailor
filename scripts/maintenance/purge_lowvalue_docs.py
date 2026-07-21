@@ -506,7 +506,15 @@ def dry_run(show: int) -> int:
         for path, h in in_reg:
             n = count_chunks_ro(con, h)
             total += n
-            rows.append((path, h, n, registry[path].get("chunks", 0)))
+            # `registry[path]` diretto era un KeyError su ogni doc gia' purgato:
+            # il perimetro li include (dal checkpoint) ma dal registry sono
+            # spariti — cioe' il dry-run esplodeva esattamente nello stato in
+            # cui serve di piu', a purge interrotto a meta'. L'hash lo porta
+            # gia' il perimetro; dal registry si prende solo il conteggio, che
+            # e' informativo e puo' non esserci.
+            reg_entry = registry.get(path)
+            rows.append((path, h, n,
+                         reg_entry.get("chunks", 0) if reg_entry else None))
         titles = {os.path.basename(p) for p, _ in in_reg}
         summaries = find_summaries_ro(con, titles)
     finally:
@@ -516,7 +524,12 @@ def dry_run(show: int) -> int:
     print(f"DOCUMENTI DA PURGARE ({len(rows)}) — chunk REALI da Chroma")
     print("=" * 78)
     for path, h, n, reg_n in rows:
-        flag = "" if n == reg_n else f"   [registry dice {reg_n:,}]"
+        if reg_n is None:
+            flag = "   [gia' purgato: fuori registry, da checkpoint]"
+        elif n != reg_n:
+            flag = f"   [registry dice {reg_n:,}]"
+        else:
+            flag = ""
         print(f"  {n:>7,} ch  doc_{h}  {os.path.basename(path)}{flag}")
         print(f"              {os.path.dirname(path)}")
 
@@ -638,28 +651,35 @@ def audit_state(in_reg, plan, log=print) -> int:
           sum(1 for p in paths if p in registry), 0)
 
     # --- facts: TUTTI gli id del piano, non "quanti ne ho toccati io" ---
+    # Due controlli per set, non uno. "Nessuna riga in stato sbagliato" e'
+    # soddisfatto anche da zero righe: un fatto del piano CANCELLATO passerebbe
+    # il test proprio perche' non c'e' piu'. Ma il contratto qui e' quarantena,
+    # non delete — un derivato sparito e' una perdita di dati silenziosa, e va
+    # visto. Quindi si verifica prima che ci siano TUTTI, poi che siano nello
+    # stato giusto.
     con = _ro(FACTS_DB)
     try:
+        def _count(ids: list, extra_sql: str = "", extra_args: list = None):
+            tot = 0
+            for i in range(0, len(ids), 500):
+                batch = ids[i:i + 500]
+                ph = ",".join("?" * len(batch))
+                tot += con.execute(
+                    f"SELECT COUNT(*) FROM facts WHERE id IN ({ph}){extra_sql}",
+                    batch + (extra_args or [])).fetchone()[0]
+            return tot
+
         q_ids = [q["id"] for q in plan["quarantine"]]
-        not_quarantined = 0
-        for i in range(0, len(q_ids), 500):
-            batch = q_ids[i:i + 500]
-            ph = ",".join("?" * len(batch))
-            not_quarantined += con.execute(
-                f"SELECT COUNT(*) FROM facts WHERE id IN ({ph}) "
-                f"AND relation_type != ?", batch + [QUARANTINE_RELATION]
-            ).fetchone()[0]
-        check("derivati del piano NON in quarantena", not_quarantined, 0)
+        check("derivati del piano ancora esistenti",
+              _count(q_ids), len(q_ids))
+        check("derivati del piano NON in quarantena",
+              _count(q_ids, " AND relation_type != ?", [QUARANTINE_RELATION]), 0)
 
         s_ids = plan["superseded_reset"]
-        still_set = 0
-        for i in range(0, len(s_ids), 500):
-            batch = s_ids[i:i + 500]
-            ph = ",".join("?" * len(batch))
-            still_set += con.execute(
-                f"SELECT COUNT(*) FROM facts WHERE id IN ({ph}) "
-                f"AND superseded_by IS NOT NULL", batch).fetchone()[0]
-        check("superseded_by del piano non resettati", still_set, 0)
+        check("facts superseded del piano esistenti",
+              _count(s_ids), len(s_ids))
+        check("superseded_by del piano non resettati",
+              _count(s_ids, " AND superseded_by IS NOT NULL"), 0)
     finally:
         con.close()
 
@@ -879,6 +899,7 @@ def execute(limit_docs: int | None) -> int:
             titles = {os.path.basename(p) for p, _ in in_reg}
             folders = {os.path.basename(p): ing.infer_folder(p)
                        for p, _ in in_reg}
+            summary_residui = 0
             for t in sorted(titles):
                 res = collection.get(where={"$and": [
                     {"title": t},
@@ -896,14 +917,23 @@ def execute(limit_docs: int | None) -> int:
                 ]}, include=[])
                 if left.get("ids"):
                     errors += 1
+                    summary_residui += len(left["ids"])
                     log(f"  ERRORE: summary di {t!r} ancora presenti dopo la "
                         f"delete")
                     continue
                 summaries_deleted += len(sids)
                 log(f"  {len(sids)} summary  title={t!r}")
-            ckpt.write(f"{SENTINEL_SUMMARIES}\tdone\n")
-            ckpt.flush()
-            os.fsync(ckpt.fileno())
+            # La sentinella sigilla una fase COMPLETA, mai una TENTATA: e' un
+            # "non rifarlo", e scriverla con dei residui vuol dire che ogni
+            # resume salta l'unica fase che potrebbe ripararli — audit rosso
+            # per sempre, senza che nessun rilancio possa cambiarlo.
+            if summary_residui:
+                log(f"  [summary] {summary_residui} residui: sentinella NON "
+                    f"scritta, la fase verra' rieseguita al prossimo run")
+            else:
+                ckpt.write(f"{SENTINEL_SUMMARIES}\tdone\n")
+                ckpt.flush()
+                os.fsync(ckpt.fileno())
 
         # ---------- FASE 3: quarantena derivati ----------------------------
         if SENTINEL_DERIVED in done:
@@ -914,9 +944,23 @@ def execute(limit_docs: int | None) -> int:
         else:
             log("\n[derived] applico la quarantena")
             quarantined, superseded_reset = apply_derived_plan(derived_plan, log)
-            ckpt.write(f"{SENTINEL_DERIVED}\tdone\n")
-            ckpt.flush()
-            os.fsync(ckpt.fileno())
+            # Stesso sigillo della fase summary: una UPDATE che non trova la
+            # riga ritorna rowcount 0, quindi un conteggio piu' basso del
+            # piano significa che dei fatti del piano non ci sono piu'. Non e'
+            # una fase completa e non va sigillata: meglio riprovarla ogni run
+            # (le UPDATE per id sono idempotenti) e tenere l'audit rosso, che
+            # dichiararla fatta e non poterla piu' riparare.
+            attesi_q = len(derived_plan["quarantine"])
+            attesi_s = len(derived_plan["superseded_reset"])
+            if quarantined != attesi_q or superseded_reset != attesi_s:
+                errors += 1
+                log(f"  [derived] INCOMPLETA: quarantena {quarantined:,}/"
+                    f"{attesi_q:,}, superseded {superseded_reset:,}/{attesi_s:,}"
+                    f" — sentinella NON scritta, la fase verra' rieseguita")
+            else:
+                ckpt.write(f"{SENTINEL_DERIVED}\tdone\n")
+                ckpt.flush()
+                os.fsync(ckpt.fileno())
 
     except (MaintenanceLost, EntityIndexBusy) as e:
         sys.stderr.write(
