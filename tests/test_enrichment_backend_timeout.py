@@ -14,6 +14,7 @@ esattamente come farebbe aiohttp: se il chiamante non passa `timeout`,
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import time
@@ -253,3 +254,91 @@ def test_extract_facts_guarded_backend_timeout(monkeypatch):
 
     assert result == "TIMEOUT"
     assert elapsed < 1.0
+
+
+# ------------------------------------------------------------------
+# Regressioni parse 200 -> None (review commit e351fe7)
+# ------------------------------------------------------------------
+
+def test_truncated_array_is_not_partial_success():
+    """max_tokens che taglia dentro il 2o oggetto non deve promuovere il
+    1o fatto a successo: rfind('}') isolerebbe {f1} e il chunk verrebbe
+    marcato OK in extraction_log, perdendo gli altri fatti senza retry."""
+    assert efn._parse_facts_json(
+        '[{"fact":"f1","category":"a"},{"fact":"f2","cat'
+    ) is None
+    # il singolo fact object legittimo resta supportato
+    assert efn._parse_facts_json('{"fact":"f1","category":"a"}') == [
+        {"fact": "f1", "category": "a"}
+    ]
+
+
+def test_content_blocks_join_without_separator():
+    """I content block si concatenano senza separatore: un '\\n' inserito
+    dentro una stringa JSON spezzata a meta' e' un control character
+    illegale e fa fallire il parse."""
+    data = {"content": [
+        {"type": "text", "text": '[{"fact":"prima parte '},
+        {"type": "text", "text": 'seconda parte"}]'},
+    ]}
+    content = efn._anthropic_text(data)
+    assert "\n" not in content
+    assert efn._parse_facts_json(content) == [{"fact": "prima parte seconda parte"}]
+
+    gem = {"candidates": [{"content": {"parts": [
+        {"text": '[{"fact":"prima '}, {"text": 'seconda"}]'},
+    ]}}]}
+    assert efn._parse_facts_json(efn._gemini_text(gem)) == [{"fact": "prima seconda"}]
+
+
+@pytest.mark.parametrize("provider,extractor,body", [
+    ("google", "_gemini_text",
+     '{"candidates":[{"finishReason":"SAFETY"}],"promptFeedback":{"blockReason":"OTHER"}}'),
+    ("openai", "_openai_text",
+     '{"choices":[{"message":{"role":"assistant","content":null},"finish_reason":"content_filter"}]}'),
+    ("anthropic", "_anthropic_text",
+     '{"content":[],"stop_reason":"max_tokens"}'),
+    ("ollama", "_ollama_text", '{"message":{"role":"assistant"}}'),
+])
+def test_shape_mismatch_on_200_is_logged_not_silent(provider, extractor, body, capsys):
+    """Safety block / refusal / content vuoto su HTTP 200: prima
+    sollevavano dentro `except Exception` del caller e tornavano None
+    senza una riga di log."""
+    result = efn._extract_and_parse(provider, 200, body, getattr(efn, extractor))
+    out = capsys.readouterr().out
+
+    assert result is None
+    assert f"{provider} HTTP 200 produced None" in out
+    assert "content_len=0" in out
+
+
+def test_non_json_body_on_200_is_logged(capsys):
+    result = efn._extract_and_parse("openai", 200, "<html>502 upstream</html>", efn._openai_text)
+    out = capsys.readouterr().out
+
+    assert result is None
+    assert "body non-JSON" in out
+
+
+def test_log_reports_finish_reason_and_content_tail(capsys):
+    """stop_reason sta dopo il content nel body reale: il preview a 200
+    char non lo raggiunge mai, va loggato esplicito. E su un JSON
+    troncato e' la coda a dire dove ha tagliato."""
+    content = '[{"fact":"' + "x" * 300 + '"},{"fact":"tagliato qui'
+    body = json.dumps({
+        "id": "msg_01ABC", "type": "message", "role": "assistant",
+        "model": "claude-haiku-4-5",
+        "content": [{"type": "text", "text": content}],
+        "stop_reason": "max_tokens",
+        "usage": {"input_tokens": 900, "output_tokens": 1500},
+    })
+
+    result = efn._extract_and_parse("anthropic", 200, body, efn._anthropic_text)
+    out = capsys.readouterr().out
+
+    assert result is None
+    assert "finish=max_tokens" in out
+    assert f"content_len={len(content)}" in out
+    assert "tagliato qui" in out          # coda visibile
+    assert "x-api-key" not in out
+    assert "sk-ant" not in out

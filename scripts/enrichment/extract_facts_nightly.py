@@ -113,6 +113,19 @@ def _clean_expires(val):
     return val if _EXPIRES_RE.match(val) else ""
 
 
+def _has_unclosed_array(content):
+    """True se il content contiene un array JSON aperto e mai chiuso.
+
+    Euristica per distinguere una risposta troncata a max_tokens
+    (`[{f1},{f2` ) da un singolo fact object legittimo (`{f1}`). Senza
+    questa guardia il fallback graffe isolerebbe il 1° oggetto via
+    rfind("}") e lo promuoverebbe a successo parziale: gli altri fatti
+    verrebbero persi senza retry, con il chunk marcato OK in
+    extraction_log. Conta anche le parentesi dentro le stringhe, ma il
+    path è raggiunto solo dopo che il parse completo è già fallito."""
+    return "[" in content and content.count("[") > content.count("]")
+
+
 def _parse_facts_json(content):
     content = content.replace("```json", "").replace("```", "").strip()
     try:
@@ -140,7 +153,8 @@ def _parse_facts_json(content):
         parsed = json.loads(content[start:end])
         if isinstance(parsed, dict) and isinstance(parsed.get("facts"), list):
             return parsed["facts"]
-        if isinstance(parsed, dict) and isinstance(parsed.get("fact"), str):
+        if (isinstance(parsed, dict) and isinstance(parsed.get("fact"), str)
+                and not _has_unclosed_array(content)):
             return [parsed]
     return None
 
@@ -150,39 +164,131 @@ def _preview(text, limit=200):
     return text[:limit]
 
 
-def _log_parse_none(provider, status, body_text, content_text="", reason="parse returned None"):
+def _preview_tail(text, limit=200):
+    """Coda del content. Su un JSON troncato è la coda che dice dove ha
+    tagliato; la testa mostra solo che l'array era ben formato."""
+    text = " ".join(str(text).split())
+    return text[-limit:]
+
+
+def _finish_reason(data):
+    """stop_reason (anthropic) / finish_reason (openai) / finishReason
+    (gemini) / done_reason (ollama).
+
+    Nei body reali sta DOPO il content: un preview a 200 char non lo
+    raggiunge mai, ed è la causa più probabile di un 200 -> None
+    (max_tokens, safety block). Va loggato esplicitamente."""
+    if not isinstance(data, dict):
+        return ""
+    for key in ("stop_reason", "done_reason"):
+        val = data.get(key)
+        if isinstance(val, str):
+            return val
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        val = choices[0].get("finish_reason")
+        if isinstance(val, str):
+            return val
+    candidates = data.get("candidates")
+    if isinstance(candidates, list) and candidates and isinstance(candidates[0], dict):
+        val = candidates[0].get("finishReason")
+        if isinstance(val, str):
+            return val
+    return ""
+
+
+# SICUREZZA — invariante: questo logger è raggiungibile SOLO dopo
+# resp.status == 200. È ciò che tiene fuori dai log il body 401 di OpenAI,
+# che echeggia la key mascherata ("Incorrect API key provided: sk-proj-***").
+# Gli header (x-api-key, Authorization) restano locali ai caller e non
+# arrivano mai qui. Se in futuro si vuole loggare anche i 4xx, va prima
+# redatto il body: NON spostare la chiamata nel ramo non-200 così com'è.
+def _log_parse_none(provider, status, body_text, content_text="", reason="parse returned None", data=None):
+    content_text = "" if content_text is None else str(content_text)
     print(
         f"  ⚠️  {provider} HTTP {status} produced None ({reason}); "
-        f"body[0:200]={_preview(body_text)!r}; content[0:200]={_preview(content_text)!r}",
+        f"finish={_finish_reason(data) or '?'}; content_len={len(content_text)}; "
+        f"body[0:200]={_preview(body_text)!r}; "
+        f"content[0:200]={_preview(content_text)!r}; "
+        f"content[-200:]={_preview_tail(content_text)!r}",
         flush=True,
     )
 
 
+# I content block di Anthropic/Gemini si concatenano SENZA separatore per
+# contratto API. Un "\n".join spezza le stringhe JSON divise a metà fra due
+# blocchi ("prima parte \nseconda parte" = control character illegale).
 def _anthropic_text(data):
-    blocks = data.get("content", [])
+    blocks = data.get("content", []) if isinstance(data, dict) else []
     if not isinstance(blocks, list):
         return ""
-    texts = []
-    for block in blocks:
-        if isinstance(block, dict) and isinstance(block.get("text"), str):
-            texts.append(block["text"])
-    return "\n".join(texts).strip()
+    texts = [b["text"] for b in blocks
+             if isinstance(b, dict) and isinstance(b.get("text"), str)]
+    return "".join(texts).strip()
 
 
 def _gemini_text(data):
-    parts = data["candidates"][0]["content"]["parts"]
-    texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
-    return "\n".join(t for t in texts if t).strip()
+    candidates = data.get("candidates") if isinstance(data, dict) else None
+    if not isinstance(candidates, list) or not candidates:
+        return ""
+    content = candidates[0].get("content") if isinstance(candidates[0], dict) else None
+    parts = content.get("parts") if isinstance(content, dict) else None
+    if not isinstance(parts, list):
+        return ""
+    texts = [p["text"] for p in parts
+             if isinstance(p, dict) and isinstance(p.get("text"), str)]
+    return "".join(texts).strip()
 
 
-def _parse_provider_content(provider, status, body_text, content_text):
+def _openai_text(data):
+    choices = data.get("choices") if isinstance(data, dict) else None
+    if not isinstance(choices, list) or not choices:
+        return ""
+    message = choices[0].get("message") if isinstance(choices[0], dict) else None
+    content = message.get("content") if isinstance(message, dict) else None
+    return content.strip() if isinstance(content, str) else ""
+
+
+def _ollama_text(data):
+    message = data.get("message") if isinstance(data, dict) else None
+    content = message.get("content") if isinstance(message, dict) else None
+    return content.strip() if isinstance(content, str) else ""
+
+
+def _extract_and_parse(provider, status, body_text, extractor):
+    """Body -> content -> facts, con log su OGNI ramo che produce None.
+
+    Prima di questo wrapper, json.loads(body) e l'estrazione del content
+    stavano fuori dal path strumentato: un body non-JSON su 200, un safety
+    block Gemini (candidates senza content) o un refusal OpenAI
+    (content=null) sollevavano dentro il generico `except Exception` del
+    caller e tornavano None senza una riga di log — esattamente la classe
+    "200 -> None" che l'instrumentazione deve coprire."""
+    try:
+        data = json.loads(body_text)
+    except (ValueError, TypeError) as e:
+        _log_parse_none(provider, status, body_text, "", f"body non-JSON: {e}")
+        return None
+    try:
+        content = extractor(data)
+    except Exception as e:
+        _log_parse_none(provider, status, body_text, "",
+                        f"content extraction: {type(e).__name__}: {e}", data=data)
+        return None
+    if not content:
+        _log_parse_none(provider, status, body_text, content, "content vuoto", data=data)
+        return None
+    return _parse_provider_content(provider, status, body_text, content, data=data)
+
+
+def _parse_provider_content(provider, status, body_text, content_text, data=None):
     try:
         parsed = _parse_facts_json(content_text)
-    except json.JSONDecodeError as e:
-        _log_parse_none(provider, status, body_text, content_text, f"json decode: {e}")
+    except (ValueError, TypeError) as e:
+        _log_parse_none(provider, status, body_text, content_text, f"json decode: {e}", data=data)
         return None
     if parsed is None:
-        _log_parse_none(provider, status, body_text, content_text)
+        _log_parse_none(provider, status, body_text, content_text, data=data)
     return parsed
 
 
@@ -339,9 +445,10 @@ async def call_gemini(session, semaphore, prompt, model, api_key):
                     if resp.status != 200:
                         return None
                     body_text = await resp.text()
-                    data = json.loads(body_text)
-                    content = _gemini_text(data)
-                    return _parse_provider_content("google", resp.status, body_text, content)
+                    # Nessun retry sul safety block / shape inattesa: prima
+                    # sollevava KeyError dentro `except Exception` e bruciava
+                    # 3 tentativi con backoff su una risposta non recuperabile.
+                    return _extract_and_parse("google", resp.status, body_text, _gemini_text)
             except _TIMEOUT_EXC:
                 # No same-backend retry: 3 × 60s would rebuild the very
                 # stall the timeout exists to cap. Rotate instead.
@@ -369,9 +476,7 @@ async def call_openai(session, semaphore, prompt, model, api_key):
                 if resp.status != 200:
                     return None
                 body_text = await resp.text()
-                data = json.loads(body_text)
-                content = data["choices"][0]["message"]["content"].strip()
-                return _parse_provider_content("openai", resp.status, body_text, content)
+                return _extract_and_parse("openai", resp.status, body_text, _openai_text)
         except _TIMEOUT_EXC:
             return "TIMEOUT"
         except Exception:
@@ -398,9 +503,7 @@ async def call_anthropic(session, semaphore, prompt, model, api_key):
                 if resp.status != 200:
                     return None
                 body_text = await resp.text()
-                data = json.loads(body_text)
-                content = _anthropic_text(data)
-                return _parse_provider_content("anthropic", resp.status, body_text, content)
+                return _extract_and_parse("anthropic", resp.status, body_text, _anthropic_text)
         except _TIMEOUT_EXC:
             return "TIMEOUT"
         except Exception:
@@ -579,9 +682,7 @@ async def call_ollama(session, semaphore, prompt, model):
                 if resp.status != 200:
                     return None
                 body_text = await resp.text()
-                data = json.loads(body_text)
-                content = data.get("message", {}).get("content", "").strip()
-                return _parse_provider_content("ollama", resp.status, body_text, content)
+                return _extract_and_parse("ollama", resp.status, body_text, _ollama_text)
         except _TIMEOUT_EXC:
             return "TIMEOUT"
         except Exception:
