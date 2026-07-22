@@ -205,3 +205,51 @@ def test_extract_facts_manager_rotates_on_timeout(monkeypatch, capsys):
         manager.current_idx = 0
         manager.mark_timeout()
     assert manager.backends[0]["exhausted"] is True
+
+
+def test_extract_facts_parse_accepts_single_fact_object():
+    parsed = efn._parse_facts_json(
+        '{"fact": "User prefers concise status updates.", '
+        '"category": "preference", "entity_tags": ["User"]}'
+    )
+
+    assert parsed == [{
+        "fact": "User prefers concise status updates.",
+        "category": "preference",
+        "entity_tags": ["User"],
+    }]
+
+
+def test_extract_facts_logs_200_parse_none(capsys):
+    result = efn._parse_provider_content(
+        "anthropic",
+        200,
+        '{"content":[{"type":"text","text":"No extractable facts."}]}',
+        "No extractable facts.",
+    )
+
+    out = capsys.readouterr().out
+    assert result is None
+    assert "anthropic HTTP 200 produced None" in out
+    assert "body[0:200]" in out
+    assert "x-api-key" not in out
+
+
+def test_extract_facts_guarded_backend_timeout(monkeypatch):
+    async def never_returns(*args, **kwargs):
+        await asyncio.Future()
+
+    monkeypatch.setattr(efn, "BACKEND_CALL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(efn, "call_backend", never_returns)
+
+    started = time.monotonic()
+    result = asyncio.run(efn.call_backend_guarded(
+        object(),
+        asyncio.Semaphore(1),
+        "prompt",
+        {"name": "anthropic", "model": "m"},
+    ))
+    elapsed = time.monotonic() - started
+
+    assert result == "TIMEOUT"
+    assert elapsed < 1.0

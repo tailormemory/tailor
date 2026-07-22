@@ -115,6 +115,19 @@ def _clean_expires(val):
 
 def _parse_facts_json(content):
     content = content.replace("```json", "").replace("```", "").strip()
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict):
+        facts = parsed.get("facts")
+        if isinstance(facts, list):
+            return facts
+        if isinstance(parsed.get("fact"), str):
+            return [parsed]
+
     start = content.find("[")
     end = content.rfind("]") + 1
     if start >= 0 and end > start:
@@ -125,9 +138,52 @@ def _parse_facts_json(content):
     end = content.rfind("}") + 1
     if start >= 0 and end > start:
         parsed = json.loads(content[start:end])
-        if isinstance(parsed, dict) and "facts" in parsed:
+        if isinstance(parsed, dict) and isinstance(parsed.get("facts"), list):
             return parsed["facts"]
+        if isinstance(parsed, dict) and isinstance(parsed.get("fact"), str):
+            return [parsed]
     return None
+
+
+def _preview(text, limit=200):
+    text = " ".join(str(text).split())
+    return text[:limit]
+
+
+def _log_parse_none(provider, status, body_text, content_text="", reason="parse returned None"):
+    print(
+        f"  ⚠️  {provider} HTTP {status} produced None ({reason}); "
+        f"body[0:200]={_preview(body_text)!r}; content[0:200]={_preview(content_text)!r}",
+        flush=True,
+    )
+
+
+def _anthropic_text(data):
+    blocks = data.get("content", [])
+    if not isinstance(blocks, list):
+        return ""
+    texts = []
+    for block in blocks:
+        if isinstance(block, dict) and isinstance(block.get("text"), str):
+            texts.append(block["text"])
+    return "\n".join(texts).strip()
+
+
+def _gemini_text(data):
+    parts = data["candidates"][0]["content"]["parts"]
+    texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
+    return "\n".join(t for t in texts if t).strip()
+
+
+def _parse_provider_content(provider, status, body_text, content_text):
+    try:
+        parsed = _parse_facts_json(content_text)
+    except json.JSONDecodeError as e:
+        _log_parse_none(provider, status, body_text, content_text, f"json decode: {e}")
+        return None
+    if parsed is None:
+        _log_parse_none(provider, status, body_text, content_text)
+    return parsed
 
 
 # ============================================================
@@ -151,6 +207,8 @@ TIMEOUT_CONSECUTIVE_THRESHOLD = 3  # exhaust backend after this many consecutive
 HTTP_TIMEOUT_SECONDS = 60
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS)
 OLLAMA_TIMEOUT = aiohttp.ClientTimeout(total=120)
+BACKEND_CALL_TIMEOUT_SECONDS = HTTP_TIMEOUT_SECONDS + 10
+OLLAMA_CALL_TIMEOUT_SECONDS = int(OLLAMA_TIMEOUT.total or 120) + 10
 
 _TIMEOUT_EXC = (asyncio.TimeoutError, aiohttp.ServerTimeoutError)
 
@@ -280,9 +338,10 @@ async def call_gemini(session, semaphore, prompt, model, api_key):
                         continue
                     if resp.status != 200:
                         return None
-                    data = await resp.json()
-                    content = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                    return _parse_facts_json(content)
+                    body_text = await resp.text()
+                    data = json.loads(body_text)
+                    content = _gemini_text(data)
+                    return _parse_provider_content("google", resp.status, body_text, content)
             except _TIMEOUT_EXC:
                 # No same-backend retry: 3 × 60s would rebuild the very
                 # stall the timeout exists to cap. Rotate instead.
@@ -309,9 +368,10 @@ async def call_openai(session, semaphore, prompt, model, api_key):
                     return "RATE_LIMITED"
                 if resp.status != 200:
                     return None
-                data = await resp.json()
+                body_text = await resp.text()
+                data = json.loads(body_text)
                 content = data["choices"][0]["message"]["content"].strip()
-                return _parse_facts_json(content)
+                return _parse_provider_content("openai", resp.status, body_text, content)
         except _TIMEOUT_EXC:
             return "TIMEOUT"
         except Exception:
@@ -337,9 +397,10 @@ async def call_anthropic(session, semaphore, prompt, model, api_key):
                     return "RATE_LIMITED"
                 if resp.status != 200:
                     return None
-                data = await resp.json()
-                content = data["content"][0]["text"].strip()
-                return _parse_facts_json(content)
+                body_text = await resp.text()
+                data = json.loads(body_text)
+                content = _anthropic_text(data)
+                return _parse_provider_content("anthropic", resp.status, body_text, content)
         except _TIMEOUT_EXC:
             return "TIMEOUT"
         except Exception:
@@ -476,6 +537,33 @@ async def call_backend(session, semaphore, prompt, backend):
         return None
 
 
+async def call_backend_guarded(session, semaphore, prompt, backend):
+    """Dispatch with an outer watchdog.
+
+    The provider functions pass aiohttp timeouts, but the watchdog also
+    covers any await outside the socket read path (connector/DNS/pool bugs,
+    future code drift, or local Ollama oddities). This is the guard that keeps
+    an idle event loop from sleeping forever after a None/error path.
+    """
+    timeout = (
+        OLLAMA_CALL_TIMEOUT_SECONDS
+        if backend["name"] == "ollama"
+        else BACKEND_CALL_TIMEOUT_SECONDS
+    )
+    try:
+        return await asyncio.wait_for(
+            call_backend(session, semaphore, prompt, backend),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        print(
+            f"  ⚠️  WARN {backend['name']} backend await exceeded {timeout}s — "
+            "treating as TIMEOUT",
+            flush=True,
+        )
+        return "TIMEOUT"
+
+
 async def call_ollama(session, semaphore, prompt, model):
     """Call Ollama local API."""
     ollama_url = os.environ.get("OLLAMA_URL", cfg("ollama", "base_url") or "http://localhost:11434") + "/api/chat"
@@ -490,9 +578,10 @@ async def call_ollama(session, semaphore, prompt, model):
             async with session.post(ollama_url, json=payload, timeout=OLLAMA_TIMEOUT) as resp:
                 if resp.status != 200:
                     return None
-                data = await resp.json()
+                body_text = await resp.text()
+                data = json.loads(body_text)
                 content = data.get("message", {}).get("content", "").strip()
-                return _parse_facts_json(content)
+                return _parse_provider_content("ollama", resp.status, body_text, content)
         except _TIMEOUT_EXC:
             return "TIMEOUT"
         except Exception:
@@ -559,7 +648,7 @@ async def main():
             # Call al backend corrente
             if processed == 0:
                 print(f'  First call: {backend["name"]}/{backend["model"]}...', flush=True)
-            result = await call_backend(session, semaphore, prompt, backend)
+            result = await call_backend_guarded(session, semaphore, prompt, backend)
             if processed == 0:
                 print(f'  First result: {type(result).__name__} = {str(result)[:80] if result else "None"}', flush=True)
 
@@ -585,7 +674,7 @@ async def main():
                         semaphore = asyncio.Semaphore(nw)
                         current_worker_count = nw
                         print(f"  Workers: {nw} (auto-tuned for {backend['name']})")
-                result = await call_backend(session, semaphore, prompt, backend)
+                result = await call_backend_guarded(session, semaphore, prompt, backend)
                 if result == "RATE_LIMITED":
                     manager.mark_rate_limited()
                     break
