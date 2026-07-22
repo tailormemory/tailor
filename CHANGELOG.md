@@ -97,6 +97,23 @@ Template for upcoming changes. Move entries under a new version heading on relea
 
 ### Fixed
 
+- **Timeout HTTP esplicito sui backend enrichment (hang del worker anthropic).**
+  Le chiamate provider in `fact_supersession.py` (anthropic, openai, gemini)
+  giravano senza `timeout`: con il default aiohttp (300s) moltiplicato per il
+  retry loop a 3 tentativi dell'anthropic, una connessione TCP stallata teneva il
+  worker appeso ~15 minuti a zero CPU invece di errore + switch backend. Ora tutti
+  e tre passano `ClientTimeout(total=60)` — stesso budget già in forza in
+  `extract_facts_nightly.py` — e la `ClientSession` lo eredita come difesa in
+  profondità. Un timeout non viene più inghiottito come `None` (che lo faceva
+  contare come "chunk illeggibile", riga `failed_N`): nuovo sentinel `TIMEOUT` con
+  lo stesso trattamento del 429 — log WARN, switch al backend successivo, item di
+  nuovo in coda, nessun retry sullo stesso backend. Il backend viene esaurito solo
+  dopo 3 timeout consecutivi (`BackendManager.mark_timeout`), così un blip di rete
+  non brucia un provider per l'intera run notturna. File:
+  [`scripts/enrichment/fact_supersession.py`](scripts/enrichment/fact_supersession.py),
+  [`scripts/enrichment/extract_facts_nightly.py`](scripts/enrichment/extract_facts_nightly.py),
+  [`scripts/lib/backend_manager.py`](scripts/lib/backend_manager.py).
+
 - **Fix silent-drop delle scritture post-maintenance.** Durante la finestra di
   maintenance dell'auto-flush (SIGUSR1→SIGUSR2, ChromaDB rilasciato), le scritture
   (`kb_add`, `kb_update_session`, `/api/ingest-live`) risolvevano l'handle collection

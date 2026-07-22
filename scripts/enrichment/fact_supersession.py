@@ -58,6 +58,13 @@ ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 GEMINI_URL_TMPL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 
+# Explicit HTTP timeout, uniform across providers (same 60s budget as
+# extract_facts_nightly). Without it aiohttp falls back to its 300s
+# default, and the anthropic retry loop turned a stalled TCP connection
+# into a ~15-minute hang with zero CPU (osservato 2026-07-22).
+HTTP_TIMEOUT_SECONDS = 60
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS)
+
 COMPARISON_PROMPT = """Do these two facts describe the same thing? If yes, does the NEW fact make the OLD fact outdated or wrong?
 
 NEW fact (date: {new_date}): {new_fact}
@@ -248,8 +255,12 @@ def find_candidate_pairs(max_pairs=MAX_COMPARISONS, memo=None):
 
 # ============================================================
 # PROVIDER CALLS — async
-# Each returns one of: parsed JSON dict, "RATE_LIMITED", or None on error.
+# Each returns one of: parsed JSON dict, "RATE_LIMITED", "TIMEOUT", or
+# None on error. "TIMEOUT" is never retried on the same backend: the
+# caller rotates and re-queues the item on the next provider.
 # ============================================================
+
+_TIMEOUT_EXC = (asyncio.TimeoutError, aiohttp.ServerTimeoutError)
 
 async def call_openai(session, semaphore, new_fact, old_fact, new_date, old_date,
                       *, model: str, api_key: str):
@@ -265,7 +276,8 @@ async def call_openai(session, semaphore, new_fact, old_fact, new_date, old_date
     }
     async with semaphore:
         try:
-            async with session.post(OPENAI_URL, json=payload, headers=headers) as resp:
+            async with session.post(OPENAI_URL, json=payload, headers=headers,
+                                    timeout=HTTP_TIMEOUT) as resp:
                 if resp.status == 429:
                     return "RATE_LIMITED"
                 if resp.status != 200:
@@ -273,6 +285,8 @@ async def call_openai(session, semaphore, new_fact, old_fact, new_date, old_date
                 data = await resp.json()
                 content = data["choices"][0]["message"]["content"].strip()
                 return json.loads(content)
+        except _TIMEOUT_EXC:
+            return "TIMEOUT"
         except Exception:
             return None
 
@@ -291,7 +305,8 @@ async def call_gemini(session, semaphore, new_fact, old_fact, new_date, old_date
     }
     async with semaphore:
         try:
-            async with session.post(url, json=payload, headers={"Content-Type": "application/json"}) as resp:
+            async with session.post(url, json=payload, headers={"Content-Type": "application/json"},
+                                    timeout=HTTP_TIMEOUT) as resp:
                 if resp.status == 429:
                     return "RATE_LIMITED"
                 if resp.status != 200:
@@ -304,6 +319,8 @@ async def call_gemini(session, semaphore, new_fact, old_fact, new_date, old_date
                 if start >= 0 and end > start:
                     return json.loads(content[start:end])
                 return None
+        except _TIMEOUT_EXC:
+            return "TIMEOUT"
         except Exception:
             return None
 
@@ -320,7 +337,8 @@ async def call_anthropic(session, semaphore, new_fact, old_fact, new_date, old_d
     async with semaphore:
         for attempt in range(3):
             try:
-                async with session.post(ANTHROPIC_API_URL, json=payload, headers=headers) as resp:
+                async with session.post(ANTHROPIC_API_URL, json=payload, headers=headers,
+                                        timeout=HTTP_TIMEOUT) as resp:
                     if resp.status == 429:
                         retry_after = int(resp.headers.get("retry-after", 3))
                         await asyncio.sleep(retry_after)
@@ -340,6 +358,11 @@ async def call_anthropic(session, semaphore, new_fact, old_fact, new_date, old_d
                     return None
             except (json.JSONDecodeError, KeyError, IndexError):
                 return None
+            except _TIMEOUT_EXC:
+                # Do NOT retry on the same backend: 3 attempts × 60s would
+                # re-create the multi-minute stall this timeout exists to
+                # prevent. Rotate instead — the caller re-queues the pair.
+                return "TIMEOUT"
             except Exception:
                 if attempt < 2:
                     await asyncio.sleep(2 ** attempt)
@@ -374,13 +397,17 @@ async def run_batch(session, semaphore, manager, batch, max_retry: int = 1):
     """Run a batch of pair-tuples against `manager.current()`, then rotate
     and retry failed pairs up to `max_retry` times against the next
     backend. Returns a list of results aligned with `batch` (each entry
-    is a parsed dict, "RATE_LIMITED", or None).
+    is a parsed dict, "RATE_LIMITED", "TIMEOUT", or None).
 
     Backend rotation rules:
     - On any pair returning RATE_LIMITED: manager.mark_rate_limited()
       (exhaust + advance current_idx). Subsequent attempt uses next backend.
-    - On any pair returning None / Exception (and no rate-limit): manager.mark_error()
-      (advance current_idx without exhausting).
+    - On any pair returning TIMEOUT (and no rate-limit): manager.mark_timeout()
+      — WARN + advance current_idx, exhausting only after N consecutive
+      timeouts. Same as a 429 from the caller's side: the pair stays pending
+      and is retried on the next backend, the worker never blocks.
+    - On any pair returning None / Exception (and no rate-limit / timeout):
+      manager.mark_error() (advance current_idx without exhausting).
     - Successes recorded once per attempt via mark_success(n).
     """
     results: list = [None] * len(batch)
@@ -407,12 +434,17 @@ async def run_batch(session, semaphore, manager, batch, max_retry: int = 1):
         new_pending: list[int] = []
         n_success = 0
         n_rate = 0
+        n_timeout = 0
         n_err = 0
         for idx, r in zip(pending, attempt_results):
             if r == "RATE_LIMITED":
                 results[idx] = "RATE_LIMITED"
                 new_pending.append(idx)
                 n_rate += 1
+            elif r == "TIMEOUT":
+                results[idx] = "TIMEOUT"
+                new_pending.append(idx)
+                n_timeout += 1
             elif r is None or isinstance(r, Exception):
                 results[idx] = None
                 new_pending.append(idx)
@@ -432,6 +464,8 @@ async def run_batch(session, semaphore, manager, batch, max_retry: int = 1):
         if backend_after is backend_at_dispatch:
             if n_rate > 0:
                 manager.mark_rate_limited()
+            elif n_timeout > 0:
+                manager.mark_timeout()
             elif n_err > 0:
                 manager.mark_error()
 
@@ -568,7 +602,9 @@ async def main():
     # confrontabile lessicograficamente con facts.created_at nella memo.
     run_judged_at = datetime.now().isoformat()
 
-    async with aiohttp.ClientSession() as session:
+    # Session-level timeout as defence in depth: every call_* passes its
+    # own HTTP_TIMEOUT, this covers any future call site that forgets to.
+    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
         BATCH_SIZE = 20
         for batch_start in range(0, total, BATCH_SIZE):
             if manager.all_exhausted():
@@ -581,7 +617,8 @@ async def main():
             for (new_f, old_f, sim), result in zip(batch, results):
                 processed += 1
 
-                if isinstance(result, Exception) or result is None or result == "RATE_LIMITED":
+                if (isinstance(result, Exception) or result is None
+                        or result in ("RATE_LIMITED", "TIMEOUT")):
                     errors += 1
                     continue
 

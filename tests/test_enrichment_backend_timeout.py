@@ -1,0 +1,207 @@
+"""Tests: HTTP timeout esplicito sui backend enrichment + rotazione.
+
+Regressione coperta (2026-07-22): la chiamata anthropic in
+fact_supersession.py girava senza timeout, il default aiohttp (300s) per
+il retry loop a 3 tentativi teneva il worker appeso ~15 minuti su una
+connessione TCP stallata, zero CPU, senza mai passare al backend
+successivo.
+
+Il session mock qui non risponde mai e onora il ClientTimeout che riceve,
+esattamente come farebbe aiohttp: se il chiamante non passa `timeout`,
+`session.post` solleva KeyError e il test fallisce.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import sys
+import time
+
+import aiohttp
+import pytest
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, ROOT)
+
+from scripts.lib import backend_manager as bm  # noqa: E402
+from scripts.enrichment import fact_supersession as fs  # noqa: E402
+from scripts.enrichment import extract_facts_nightly as efn  # noqa: E402
+
+
+FAKE_TIMEOUT = aiohttp.ClientTimeout(total=0.2)
+
+
+class _HangingPost:
+    """Context manager che simula un server che non risponde mai: aspetta
+    il budget di timeout e poi solleva, come aiohttp a `total` scaduto."""
+
+    def __init__(self, total: float):
+        self.total = total
+
+    async def __aenter__(self):
+        await asyncio.sleep(self.total)
+        raise asyncio.TimeoutError
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class HangingSession:
+    """session.post che non risponde. Registra i timeout ricevuti: se il
+    call site non ne passa uno, `kw["timeout"]` esplode (= il bug)."""
+
+    def __init__(self):
+        self.timeouts: list[float] = []
+        self.urls: list[str] = []
+
+    def post(self, url, **kw):
+        self.urls.append(url)
+        self.timeouts.append(kw["timeout"].total)
+        return _HangingPost(kw["timeout"].total)
+
+
+def _patch_cfg(monkeypatch, backends, limit=100):
+    monkeypatch.setattr(bm, "get_enrichment_backends", lambda role: list(backends))
+    monkeypatch.setattr(bm, "get_enrichment_daily_limit", lambda role: limit)
+
+
+def _pair():
+    return (
+        {"id": 1, "fact": "new fact", "event_date": "2026-07-01", "category": "x"},
+        {"id": 2, "fact": "old fact", "event_date": "2026-01-01", "category": "x"},
+        0.6,
+    )
+
+
+# ============================================================
+# 1. Ogni provider passa un timeout esplicito e ritorna "TIMEOUT"
+# ============================================================
+
+
+@pytest.mark.parametrize("call_name", ["call_anthropic", "call_openai", "call_gemini"])
+def test_supersession_backends_pass_timeout_and_return_sentinel(monkeypatch, call_name):
+    monkeypatch.setattr(fs, "HTTP_TIMEOUT", FAKE_TIMEOUT)
+    session = HangingSession()
+    fn = getattr(fs, call_name)
+
+    started = time.monotonic()
+    result = asyncio.run(fn(
+        session, asyncio.Semaphore(2), "new", "old", "2026-07-01", "2026-01-01",
+        model="m", api_key="k",
+    ))
+    elapsed = time.monotonic() - started
+
+    assert session.timeouts == [FAKE_TIMEOUT.total], "timeout esplicito non passato"
+    assert result == "TIMEOUT"
+    # Nessun retry sullo stesso backend: un solo POST, entro il budget.
+    assert len(session.urls) == 1
+    assert elapsed < 2.0
+
+
+@pytest.mark.parametrize("call_name", ["call_anthropic", "call_openai", "call_gemini"])
+def test_extract_facts_backends_pass_timeout_and_return_sentinel(monkeypatch, call_name):
+    monkeypatch.setattr(efn, "HTTP_TIMEOUT", FAKE_TIMEOUT)
+    session = HangingSession()
+    fn = getattr(efn, call_name)
+
+    started = time.monotonic()
+    result = asyncio.run(fn(session, asyncio.Semaphore(2), "prompt", "m", "k"))
+    elapsed = time.monotonic() - started
+
+    assert session.timeouts == [FAKE_TIMEOUT.total], "timeout esplicito non passato"
+    assert result == "TIMEOUT"
+    assert len(session.urls) == 1
+    assert elapsed < 2.0
+
+
+def test_real_default_timeout_is_60s_across_providers():
+    """Il budget è uniforme fra i tre backend cloud e fra i due script."""
+    assert fs.HTTP_TIMEOUT_SECONDS == 60
+    assert efn.HTTP_TIMEOUT_SECONDS == 60
+    assert fs.HTTP_TIMEOUT.total == 60
+    assert efn.HTTP_TIMEOUT.total == 60
+
+
+# ============================================================
+# 2. Su timeout il worker prosegue sul backend successivo
+# ============================================================
+
+
+def test_worker_proceeds_to_next_backend_on_timeout(monkeypatch):
+    """Backend 1 (anthropic) non risponde → run_batch ruota e la coppia
+    viene giudicata dal backend 2 (google) entro il timeout."""
+    _patch_cfg(monkeypatch, [
+        {"provider": "anthropic", "model": "haiku", "workers": 2},
+        {"provider": "google", "model": "flash", "workers": 2},
+    ])
+    monkeypatch.setattr(fs, "HTTP_TIMEOUT", FAKE_TIMEOUT)
+
+    async def fake_gemini(session, semaphore, *args, **kwargs):
+        return {"result": "SUPERSEDES", "reason": "ok"}
+
+    monkeypatch.setattr(fs, "call_gemini", fake_gemini)
+
+    manager = bm.BackendManager("fact_supersession",
+                                api_keys={"anthropic": "k", "google": "k"})
+    session = HangingSession()  # solo anthropic ci arriva davvero
+
+    started = time.monotonic()
+    results = asyncio.run(
+        fs.run_batch(session, asyncio.Semaphore(2), manager, [_pair()])
+    )
+    elapsed = time.monotonic() - started
+
+    assert results[0] == {"result": "SUPERSEDES", "reason": "ok"}
+    assert elapsed < 5.0, "il worker è rimasto appeso invece di ruotare"
+    # anthropic ha ruotato senza essere bruciato per tutta la run
+    assert manager.backends[0]["timeouts_consecutive"] == 1
+    assert manager.backends[0]["exhausted"] is False
+    assert manager.current()["name"] == "google"
+
+
+def test_timeout_streak_exhausts_backend(monkeypatch):
+    """N timeout consecutivi = backend giù per la run; un successo azzera."""
+    _patch_cfg(monkeypatch, [
+        {"provider": "anthropic", "model": "haiku", "workers": 2},
+        {"provider": "google", "model": "flash", "workers": 2},
+    ])
+    manager = bm.BackendManager("fact_supersession",
+                                api_keys={"anthropic": "k", "google": "k"})
+
+    for _ in range(bm.TIMEOUT_CONSECUTIVE_THRESHOLD - 1):
+        manager.current_idx = 0
+        manager.mark_timeout()
+        assert manager.backends[0]["exhausted"] is False
+
+    manager.current_idx = 0
+    manager.mark_timeout()
+    assert manager.backends[0]["exhausted"] is True
+    assert manager.current()["name"] == "google"
+
+    manager.backends[0]["exhausted"] = False
+    manager.current_idx = 0
+    manager.mark_success()
+    assert manager.backends[0]["timeouts_consecutive"] == 0
+
+
+def test_extract_facts_manager_rotates_on_timeout(monkeypatch, capsys):
+    """BackendManager inline di extract_facts_nightly: WARN + switch, e
+    exhaustion solo dopo N timeout consecutivi."""
+    monkeypatch.setattr(efn, "_BACKENDS_CFG", [
+        {"provider": "anthropic", "model": "haiku", "workers": 2},
+        {"provider": "google", "model": "flash", "workers": 2},
+    ])
+    monkeypatch.setattr(efn, "_API_KEYS", {"anthropic": "k", "google": "k"})
+    manager = efn.BackendManager()
+
+    manager.mark_timeout()
+    out = capsys.readouterr().out
+    assert "WARN" in out and "anthropic" in out
+    assert manager.backends[0]["exhausted"] is False
+    assert manager.current()["name"] == "google"
+
+    for _ in range(efn.TIMEOUT_CONSECUTIVE_THRESHOLD - 1):
+        manager.current_idx = 0
+        manager.mark_timeout()
+    assert manager.backends[0]["exhausted"] is True

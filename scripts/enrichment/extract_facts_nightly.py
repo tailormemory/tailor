@@ -140,6 +140,19 @@ def _parse_facts_json(content):
 # v1.2.3.x cost-leak fix PR. Migration tracked in
 # docs/v1.2.4_resume_state.md "v1.2.5 backlog".
 NONE_CONSECUTIVE_THRESHOLD = 3  # rotate backend after this many consecutive None responses
+TIMEOUT_CONSECUTIVE_THRESHOLD = 3  # exhaust backend after this many consecutive HTTP timeouts
+
+# Explicit HTTP timeout, uniform across cloud providers (google, openai,
+# anthropic). Ollama is local and may pay a cold model-load, so it keeps
+# a wider budget. A timeout must surface as the "TIMEOUT" sentinel — never
+# as None (which would count the chunk as unparseable) and never as an
+# open-ended wait (observed 2026-07-22: worker hung 15+ min on a stalled
+# TCP connection, zero CPU, because no timeout was in force).
+HTTP_TIMEOUT_SECONDS = 60
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS)
+OLLAMA_TIMEOUT = aiohttp.ClientTimeout(total=120)
+
+_TIMEOUT_EXC = (asyncio.TimeoutError, aiohttp.ServerTimeoutError)
 
 
 class BackendManager:
@@ -158,6 +171,7 @@ class BackendManager:
                     "limit": DAILY_LIMIT_PER_BACKEND, "exhausted": False,
                     "workers": bcfg.get("workers", 5),
                     "none_consecutive": 0,
+                    "timeout_consecutive": 0,
                 })
             else:
                 print(f"  ⚠️  Skipping {provider}/{model} — no API key found")
@@ -176,6 +190,7 @@ class BackendManager:
         b = self.backends[self.current_idx]
         b["calls"] += 1
         b["none_consecutive"] = 0  # reset None streak
+        b["timeout_consecutive"] = 0  # backend is responding again
         if b["calls"] >= b["limit"]:
             b["exhausted"] = True
             print(f"  ⚠️  {b['name']} ha raggiunto il limite di {b['limit']} call. Switching...")
@@ -186,6 +201,24 @@ class BackendManager:
         b["exhausted"] = True
         b["none_consecutive"] = 0  # reset (rate limit is orthogonal to parse-fail)
         print(f"  ⚠️  {b['name']} rate limited (429). Switching...")
+        self.current_idx = (self.current_idx + 1) % len(self.backends)
+
+    def mark_timeout(self):
+        """Record an HTTP timeout from the current backend: log WARN and
+        rotate, so the chunk is immediately retried on the next provider.
+        Worker-visible treatment is the same as a 429 (never block, chunk
+        back in queue), but the backend is exhausted only after
+        TIMEOUT_CONSECUTIVE_THRESHOLD consecutive timeouts — a single
+        network stall must not burn a provider for the whole run."""
+        b = self.backends[self.current_idx]
+        b["timeout_consecutive"] = b.get("timeout_consecutive", 0) + 1
+        if b["timeout_consecutive"] >= TIMEOUT_CONSECUTIVE_THRESHOLD:
+            b["exhausted"] = True
+            print(f"  ⚠️  WARN {b['name']} timeout {b['timeout_consecutive']}× consecutive "
+                  f"({HTTP_TIMEOUT_SECONDS}s) — backend exhausted. Switching...", flush=True)
+        else:
+            print(f"  ⚠️  WARN {b['name']} HTTP timeout ({HTTP_TIMEOUT_SECONDS}s) — "
+                  f"switching backend, chunk back in queue", flush=True)
         self.current_idx = (self.current_idx + 1) % len(self.backends)
 
     def mark_none(self):
@@ -239,7 +272,7 @@ async def call_gemini(session, semaphore, prompt, model, api_key):
     async with semaphore:
         for attempt in range(3):
             try:
-                async with session.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                async with session.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=HTTP_TIMEOUT) as resp:
                     if resp.status == 429:
                         return "RATE_LIMITED"
                     if resp.status == 503:
@@ -250,6 +283,10 @@ async def call_gemini(session, semaphore, prompt, model, api_key):
                     data = await resp.json()
                     content = data["candidates"][0]["content"]["parts"][0]["text"].strip()
                     return _parse_facts_json(content)
+            except _TIMEOUT_EXC:
+                # No same-backend retry: 3 × 60s would rebuild the very
+                # stall the timeout exists to cap. Rotate instead.
+                return "TIMEOUT"
             except Exception as e:
                 if attempt < 2:
                     await asyncio.sleep(2 ** attempt)
@@ -267,7 +304,7 @@ async def call_openai(session, semaphore, prompt, model, api_key):
     }
     async with semaphore:
         try:
-            async with session.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+            async with session.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers, timeout=HTTP_TIMEOUT) as resp:
                 if resp.status == 429:
                     return "RATE_LIMITED"
                 if resp.status != 200:
@@ -275,6 +312,8 @@ async def call_openai(session, semaphore, prompt, model, api_key):
                 data = await resp.json()
                 content = data["choices"][0]["message"]["content"].strip()
                 return _parse_facts_json(content)
+        except _TIMEOUT_EXC:
+            return "TIMEOUT"
         except Exception:
             return None
 
@@ -293,7 +332,7 @@ async def call_anthropic(session, semaphore, prompt, model, api_key):
     }
     async with semaphore:
         try:
-            async with session.post("https://api.anthropic.com/v1/messages", json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+            async with session.post("https://api.anthropic.com/v1/messages", json=payload, headers=headers, timeout=HTTP_TIMEOUT) as resp:
                 if resp.status == 429:
                     return "RATE_LIMITED"
                 if resp.status != 200:
@@ -301,6 +340,8 @@ async def call_anthropic(session, semaphore, prompt, model, api_key):
                 data = await resp.json()
                 content = data["content"][0]["text"].strip()
                 return _parse_facts_json(content)
+        except _TIMEOUT_EXC:
+            return "TIMEOUT"
         except Exception:
             return None
 
@@ -446,12 +487,14 @@ async def call_ollama(session, semaphore, prompt, model):
     }
     async with semaphore:
         try:
-            async with session.post(ollama_url, json=payload, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+            async with session.post(ollama_url, json=payload, timeout=OLLAMA_TIMEOUT) as resp:
                 if resp.status != 200:
                     return None
                 data = await resp.json()
                 content = data.get("message", {}).get("content", "").strip()
                 return _parse_facts_json(content)
+        except _TIMEOUT_EXC:
+            return "TIMEOUT"
         except Exception:
             return None
 
@@ -520,25 +563,39 @@ async def main():
             if processed == 0:
                 print(f'  First result: {type(result).__name__} = {str(result)[:80] if result else "None"}', flush=True)
 
-            # Gestisci rate limit
-            if result == "RATE_LIMITED":
-                manager.mark_rate_limited()
+            # Rate limit / timeout: entrambi significano "questo backend non è
+            # utilizzabile adesso", mai "questo chunk è illeggibile". Log,
+            # switch al backend successivo, e il chunk torna in coda (retry
+            # immediato sul nuovo backend; nessuna riga failed_* scritta, così
+            # resta eleggibile anche per la run successiva).
+            if result in ("RATE_LIMITED", "TIMEOUT"):
+                first_reason = result
+                if result == "RATE_LIMITED":
+                    manager.mark_rate_limited()
+                else:
+                    manager.mark_timeout()
                 backend = manager.current()
-                if backend and args.workers <= 0:
+                if backend is None:
+                    print(f"\n⚠️  All backends exhausted after {first_reason.lower()}. "
+                          f"Stopped at {processed:,} chunk.")
+                    break
+                if args.workers <= 0:
                     nw = manager.current_workers()
                     if nw != current_worker_count:
                         semaphore = asyncio.Semaphore(nw)
                         current_worker_count = nw
                         print(f"  Workers: {nw} (auto-tuned for {backend['name']})")
-                if backend is None:
-                    print(f"\n⚠️  All backends exhausted after rate limit. Stopped at {processed:,} chunk.")
-                    break
                 result = await call_backend(session, semaphore, prompt, backend)
                 if result == "RATE_LIMITED":
                     manager.mark_rate_limited()
                     break
+                if result == "TIMEOUT":
+                    # Anche il secondo backend è in timeout: registra e passa
+                    # al chunk successivo. Mai bloccare il worker, mai
+                    # marcare il chunk come fallito.
+                    manager.mark_timeout()
 
-            if result is None or result == "RATE_LIMITED":
+            if result is None or result in ("RATE_LIMITED", "TIMEOUT"):
                 errors += 1
                 processed += 1
                 # Track persistent None failures: bump fail counter (stored as

@@ -22,6 +22,9 @@ Pattern (one item at a time, sync or async):
         if result == "RATE_LIMITED":
             mgr.mark_rate_limited()  # exhaust current, advance index
             continue                  # retry same item with new backend
+        if result == "TIMEOUT":
+            mgr.mark_timeout()       # WARN + advance index
+            continue                  # retry same item with new backend
         if result is None:
             mgr.mark_error()          # advance index without exhausting
             ...                        # script-specific: retry once or skip
@@ -52,6 +55,11 @@ _KEY_NAMES = {
     "anthropic": "ANTHROPIC_API_KEY",
 }
 _PLIST_PATH = "/Library/LaunchDaemons/com.tailor.mcp.plist"
+
+# Consecutive HTTP timeouts on the same backend before it is considered
+# down for the run. A single timeout rotates without exhausting (network
+# blips happen); a sustained streak means the provider is unreachable.
+TIMEOUT_CONSECUTIVE_THRESHOLD = 3
 
 
 def _load_api_key(provider: str) -> str:
@@ -88,7 +96,8 @@ class BackendManager:
          "workers": int,     # parallel-call hint (5 if unset)
          "calls": int,       # successful calls so far
          "limit": int,       # daily cap before exhaustion
-         "exhausted": bool}  # True when limit reached or rate-limited
+         "exhausted": bool,  # True when limit reached or rate-limited
+         "timeouts_consecutive": int}  # HTTP-timeout streak (reset on success)
     """
 
     def __init__(self, role: str, api_keys: Optional[dict] = None,
@@ -130,6 +139,7 @@ class BackendManager:
                 "calls": 0,
                 "limit": limit,
                 "exhausted": False,
+                "timeouts_consecutive": 0,
             })
         self.current_idx = 0
 
@@ -158,6 +168,7 @@ class BackendManager:
             return
         b = self.backends[self.current_idx]
         b["calls"] += n
+        b["timeouts_consecutive"] = 0  # backend is responding again
         if b["calls"] >= b["limit"] and not b["exhausted"]:
             b["exhausted"] = True
             print(
@@ -178,6 +189,33 @@ class BackendManager:
             print(
                 f"[backend_manager:{self.role}] {b['name']} rate "
                 f"limited (429); rotating",
+                file=sys.stderr,
+            )
+        self.current_idx = (self.current_idx + 1) % len(self.backends)
+
+    def mark_timeout(self) -> None:
+        """Record an HTTP timeout from the current backend: WARN + rotate,
+        so the caller can immediately retry the same item on the next
+        provider. Same worker-visible treatment as a 429 (never block,
+        item goes back in queue), but the backend is exhausted only after
+        TIMEOUT_CONSECUTIVE_THRESHOLD consecutive timeouts — one network
+        blip must not burn a provider for the whole nightly run."""
+        if not self.backends:
+            return
+        b = self.backends[self.current_idx]
+        b["timeouts_consecutive"] = b.get("timeouts_consecutive", 0) + 1
+        if (b["timeouts_consecutive"] >= TIMEOUT_CONSECUTIVE_THRESHOLD
+                and not b["exhausted"]):
+            b["exhausted"] = True
+            print(
+                f"[backend_manager:{self.role}] WARN {b['name']} timed out "
+                f"{b['timeouts_consecutive']}× consecutive; marking exhausted",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[backend_manager:{self.role}] WARN {b['name']} HTTP "
+                f"timeout; rotating (item back in queue)",
                 file=sys.stderr,
             )
         self.current_idx = (self.current_idx + 1) % len(self.backends)
