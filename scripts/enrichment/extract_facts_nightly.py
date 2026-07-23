@@ -429,10 +429,13 @@ class BackendManager:
 
 async def call_gemini(session, semaphore, prompt, model, api_key):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    gen_cfg = {"temperature": 0.1, "maxOutputTokens": 4000}
+    thinking = gemini_thinking_config(model)
+    if thinking:  # dict vuoto = il model non accetta thinkingConfig
+        gen_cfg["thinkingConfig"] = thinking
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 4000,
-                             "thinkingConfig": gemini_thinking_config(model)}
+        "generationConfig": gen_cfg,
     }
     async with semaphore:
         for attempt in range(3):

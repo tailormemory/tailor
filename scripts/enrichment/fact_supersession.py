@@ -298,10 +298,13 @@ async def call_gemini(session, semaphore, new_fact, old_fact, new_date, old_date
         new_date=new_date or "unknown", old_date=old_date or "unknown"
     )
     url = GEMINI_URL_TMPL.format(model=model, api_key=api_key)
+    gen_cfg = {"temperature": 0.0, "maxOutputTokens": 100}
+    thinking = gemini_thinking_config(model)
+    if thinking:  # dict vuoto = il model non accetta thinkingConfig
+        gen_cfg["thinkingConfig"] = thinking
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 100,
-                             "thinkingConfig": gemini_thinking_config(model)}
+        "generationConfig": gen_cfg,
     }
     async with semaphore:
         try:

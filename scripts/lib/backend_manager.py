@@ -89,17 +89,30 @@ def _load_api_key(provider: str) -> str:
 
 
 def gemini_thinking_config(model: str) -> dict:
-    """Return the `thinkingConfig` that disables reasoning for `model`.
+    """Return the `thinkingConfig` that minimises reasoning for `model`.
 
-    Gemini 3.x ha sostituito `thinkingBudget` con `thinkingLevel`: gli
-    alias non-gated (`gemini-flash-latest` → gemini-3.6-flash,
-    `gemini-flash-lite-latest` → gemini-3.5-flash-lite) rispondono 400
-    "Request contains an invalid argument" se ricevono `thinkingBudget`.
-    I model id 2.x pinnati vogliono ancora il budget. Verificato
-    2026-07-23: con `thinkingLevel: minimal` entrambi gli alias tornano
-    200 e `thoughtsTokenCount: 0`, cioè lo stesso effetto di budget 0."""
-    return ({"thinkingBudget": 0} if model.startswith("gemini-2.")
-            else {"thinkingLevel": "minimal"})
+    Un dict **vuoto** significa "non mandare `thinkingConfig`": il caller
+    deve omettere la chiave, non passare `{}`.
+
+    Tre casi (docs Google: ai.google.dev/gemini-api/docs/thinking):
+
+    - `gemini-2.5-flash*` (flash e flash-lite): `thinkingBudget: 0`, il
+      solo ramo in cui disattivare il thinking è documentato.
+    - altri `gemini-2.*`: nessun `thinkingConfig`. Su 2.5 Pro il thinking
+      non è disattivabile (budget 0 non ammesso, minimo 128); sulla serie
+      2.0 il parametro non è documentato. In entrambi i casi mandarlo
+      è, nel migliore dei casi, ignorato — nel peggiore un 400.
+    - tutto il resto (alias `*-latest` → 3.x): `thinkingLevel: minimal`.
+      Gemini 3.x ha sostituito `thinkingBudget` con `thinkingLevel` e
+      risponde 400 "Request contains an invalid argument" al budget.
+      Verificato 2026-07-23: `gemini-flash-latest` (→ gemini-3.6-flash)
+      e `gemini-flash-lite-latest` (→ gemini-3.5-flash-lite) tornano
+      200 con `thoughtsTokenCount: 0`, stesso effetto del budget 0."""
+    if model.startswith("gemini-2.5-flash"):
+        return {"thinkingBudget": 0}
+    if model.startswith("gemini-2."):
+        return {}
+    return {"thinkingLevel": "minimal"}
 
 
 class BackendManager:

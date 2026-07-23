@@ -321,17 +321,17 @@ def _call_anthropic(prompt: str, model: str, api_key: str, system: str):
 def _call_google(prompt: str, model: str, api_key: str, system: str):
     try:
         url = GEMINI_URL_TMPL.format(model=model, api_key=api_key)
+        gen_cfg = {"temperature": 0.3, "maxOutputTokens": 800}
+        thinking = gemini_thinking_config(model)
+        if thinking:  # dict vuoto = il model non accetta thinkingConfig
+            gen_cfg["thinkingConfig"] = thinking
         resp = requests.post(
             url,
             headers={"content-type": "application/json"},
             json={
                 "systemInstruction": {"parts": [{"text": system}]},
                 "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": 0.3,
-                    "maxOutputTokens": 800,
-                    "thinkingConfig": gemini_thinking_config(model),
-                },
+                "generationConfig": gen_cfg,
             },
             timeout=30,
         )
