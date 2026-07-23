@@ -330,8 +330,12 @@ MAX_TRANSIENT_ATTEMPTS = 3
 RATE_LIMIT_COOLDOWN_BASE = 20.0   # -> 10-30s jitterati
 RATE_LIMIT_COOLDOWN_MAX = 300.0   # tetto anche per un Retry-After assurdo
 
-# Budget di output per anthropic.
-ANTHROPIC_MAX_TOKENS = 1500
+# Budget di output per anthropic. 1500 tagliava: 13 troncamenti osservati,
+# tutti con stop_reason=max_tokens e content_len ~4050 — l'array JSON
+# restava aperto, _parse_facts_json tornava None e il chunk finiva a
+# failed_* pur avendo prodotto fatti validi. Solo anthropic: gemini ha già
+# maxOutputTokens 4000, openai non ha mostrato troncamenti.
+ANTHROPIC_MAX_TOKENS = 4000
 
 # 5xx = il provider è giù, non il chunk illeggibile. Vanno trattati come
 # TIMEOUT (rotazione + requeue), mai come None: un None scriverebbe una

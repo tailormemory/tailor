@@ -568,3 +568,24 @@ def test_worker_exception_does_not_kill_the_pool(monkeypatch):
     # il chunk vittima del bug non viene marcato failed_*
     assert db.execute(
         "SELECT COUNT(*) FROM extraction_log WHERE chunk_id='c0'").fetchone()[0] == 0
+
+
+# ==================================================================
+# Budget di output anthropic
+# ==================================================================
+
+def test_anthropic_max_tokens_covers_observed_truncations():
+    """13 troncamenti osservati, tutti stop_reason=max_tokens con
+    content_len ~4050: 1500 token di budget tagliavano l'array a metà e il
+    chunk finiva a failed_* pur avendo prodotto fatti validi."""
+    assert efn.ANTHROPIC_MAX_TOKENS == 4000
+
+    sent = {}
+
+    class _Session:
+        def post(self, url, **kw):
+            sent.update(kw["json"])
+            return _Response(200, body='{"content":[{"type":"text","text":"[]"}]}')
+
+    assert asyncio.run(efn.call_anthropic(_Session(), "p", "m", "k")) == []
+    assert sent["max_tokens"] == 4000

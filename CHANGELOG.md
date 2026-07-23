@@ -35,6 +35,14 @@ Template for upcoming changes. Move entries under a new version heading on relea
   [`scripts/enrichment/derive_facts.py`](scripts/enrichment/derive_facts.py).
 ### Changed
 
+- **`max_tokens` anthropic 1500 → 4000 in `extract_facts_nightly.py`.** 13 troncamenti
+  osservati, tutti con `stop_reason=max_tokens` e `content_len` ~4050: l'array JSON
+  restava aperto, `_parse_facts_json` tornava `None` (la guardia `_has_unclosed_array`
+  impedisce correttamente il successo parziale) e il chunk finiva a `failed_*` pur
+  avendo prodotto fatti validi. Solo anthropic: gemini ha già `maxOutputTokens` 4000,
+  openai non ha mostrato troncamenti.
+  File: [`scripts/enrichment/extract_facts_nightly.py`](scripts/enrichment/extract_facts_nightly.py).
+
 - **`extract_facts_nightly.py`: dispatch parallelo (N worker + writer unico).** Il
   loop era sequenziale — un chunk per volta, `await` sulla singola chiamata — e il
   semaforo "worker" non aveva alcun effetto sul throughput. Ora: `asyncio.TaskGroup`
