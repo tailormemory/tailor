@@ -33,6 +33,32 @@ Template for upcoming changes. Move entries under a new version heading on relea
   blocklist si restringe (reversibile). Bypass in `--entity`. Log di osservabilità
   con conteggi/categorie/campione. File:
   [`scripts/enrichment/derive_facts.py`](scripts/enrichment/derive_facts.py).
+### Fixed
+
+- **429: stop dispatch effettivo su tutti i worker (`extract_facts_nightly.py`).** Il
+  cooldown lo applicava solo il writer, e l'ack writer→worker ferma il worker che ha
+  preso il 429, non gli altri. Due finestre misurate, entrambe chiuse:
+  - **fast-path**: il worker che riceve il 429 applica lui il cooldown, sincrono,
+    prima di restituire il controllo al pool (single-thread asyncio, nessun await fra
+    il ritorno della chiamata e la riga: nessuna race). Il writer riapplica
+    `mark_rate_limited` con l'`epoch` congelato della chiamata, che l'epoch guard
+    scarta come residuo → un solo cooldown, un solo hit, requeue invariato.
+  - **ri-verifica dopo il semaforo**: quando il cap per-provider è più basso di
+    `--workers` (es. `--workers 8` con google cap 5), i worker si accodano al semaforo
+    avendo già superato il check di usabilità e chiamano comunque il provider in
+    cooldown. Ora la scelta del backend viene riconvalidata dopo l'acquisizione dello
+    slot, e in caso di stato cambiato il chunk ri-fa il lease.
+  Misura su 40 run × 6 configurazioni (worker × cap): senza fix fino a 14 chiamate
+  post-429 (16 worker / cap 2); con la sola ri-verifica restano 1-3; con entrambi 0
+  in tutte le configurazioni.
+
+- **Errori di rete = transienti (`extract_facts_nightly.py`).** `aiohttp.ClientError`
+  (ClientConnectorError, ServerDisconnectedError, DNS, connection reset) e
+  `ConnectionError` tornano il sentinel TIMEOUT invece di `None` in tutti e quattro i
+  provider: rotazione + requeue, mai una riga `failed_*` addebitata al chunk per un
+  problema di rete. L'`except Exception` residuo resta `None` — lì ci finiscono i bug
+  di codice, non la rete.
+
 ### Changed
 
 - **`max_tokens` anthropic 1500 → 4000 in `extract_facts_nightly.py`.** 13 troncamenti

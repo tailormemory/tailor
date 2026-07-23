@@ -358,6 +358,14 @@ OLLAMA_CALL_TIMEOUT_SECONDS = int(OLLAMA_TIMEOUT.total or 120) + 10
 
 _TIMEOUT_EXC = (asyncio.TimeoutError, aiohttp.ServerTimeoutError)
 
+# Errore di rete = backend non raggiungibile, esattamente come un timeout:
+# sentinel TIMEOUT (rotazione + requeue), mai None. Un None scriverebbe una
+# riga failed_* addebitando al chunk un connection reset o un DNS che non
+# risolve. Copre ClientConnectorError, ServerDisconnectedError,
+# ClientPayloadError, fallimenti DNS. L'`except Exception` residuo resta
+# None: lì ci finiscono i bug di codice, non la rete.
+_NETWORK_EXC = (aiohttp.ClientError, ConnectionError)
+
 
 # ---- Sentinelle di esito ---------------------------------------------
 # "TIMEOUT"/"RATE_LIMITED"/"NO_BACKEND" restano stringhe: i confronti
@@ -642,9 +650,12 @@ async def call_gemini(session, prompt, model, api_key):
             return _extract_and_parse("google", resp.status, body_text, _gemini_text)
     except _TIMEOUT_EXC:
         return TIMEOUT
-    except Exception as e:
+    except _NETWORK_EXC as e:
         # Solo il tipo: il messaggio di alcune eccezioni aiohttp riporta
         # l'URL, che qui contiene ?key=.
+        print(f"  ⚠️  gemini {model} {type(e).__name__} (network) — rotating", flush=True)
+        return TIMEOUT
+    except Exception as e:
         print(f"  ⚠️  gemini {model} {type(e).__name__}", flush=True)
         return None
 
@@ -668,6 +679,9 @@ async def call_openai(session, prompt, model, api_key):
             body_text = await resp.text()
             return _extract_and_parse("openai", resp.status, body_text, _openai_text)
     except _TIMEOUT_EXC:
+        return TIMEOUT
+    except _NETWORK_EXC as e:
+        print(f"  ⚠️  openai {model} {type(e).__name__} (network) — rotating", flush=True)
         return TIMEOUT
     except Exception:
         return None
@@ -697,6 +711,9 @@ async def call_anthropic(session, prompt, model, api_key):
             body_text = await resp.text()
             return _extract_and_parse("anthropic", resp.status, body_text, _anthropic_text)
     except _TIMEOUT_EXC:
+        return TIMEOUT
+    except _NETWORK_EXC as e:
+        print(f"  ⚠️  anthropic {model} {type(e).__name__} (network) — rotating", flush=True)
         return TIMEOUT
     except Exception:
         return None
@@ -881,6 +898,9 @@ async def call_ollama(session, prompt, model):
             return _extract_and_parse("ollama", resp.status, body_text, _ollama_text)
     except _TIMEOUT_EXC:
         return TIMEOUT
+    except _NETWORK_EXC as e:
+        print(f"  ⚠️  ollama {model} {type(e).__name__} (network) — rotating", flush=True)
+        return TIMEOUT
     except Exception:
         return None
 
@@ -972,18 +992,44 @@ async def _lease_backend(manager, poll=1.0):
 
 
 async def _run_one(session, chunk, manager, call=None):
-    backend = await _lease_backend(manager)
-    if backend is None:
-        return CallOutcome(chunk, NO_BACKEND, -1, "", "", -1)
-    # Identità congelata QUI: epoch e id appartengono alla chiamata, non
-    # allo stato che il manager avrà quando la risposta torna.
-    epoch = backend["epoch"]
-    prompt = EXTRACTION_PROMPT.format(
-        language=_USER_LANG, date=chunk["date"], source=chunk["source"], text=chunk["text"]
-    )
-    # Semaforo FUORI dal watchdog: prima lo slot, poi si arma il timer.
-    async with backend["semaphore"]:
-        result = await call_backend_guarded(session, prompt, backend, call=call)
+    while True:
+        backend = await _lease_backend(manager)
+        if backend is None:
+            return CallOutcome(chunk, NO_BACKEND, -1, "", "", -1)
+        # Identità congelata QUI: epoch e id appartengono alla chiamata, non
+        # allo stato che il manager avrà quando la risposta torna.
+        epoch = backend["epoch"]
+        prompt = EXTRACTION_PROMPT.format(
+            language=_USER_LANG, date=chunk["date"], source=chunk["source"], text=chunk["text"]
+        )
+        # Semaforo FUORI dal watchdog: prima lo slot, poi si arma il timer.
+        async with backend["semaphore"]:
+            # Ri-verifica DOPO l'acquisizione. Quando il cap per-provider è
+            # più basso di --workers, i worker si accodano al semaforo
+            # avendo già superato il check di usabilità: un 429 che arriva
+            # mentre sono in coda non li ferma, e appena prendono lo slot
+            # chiamano comunque il provider in cooldown (misurate fino a 14
+            # chiamate post-429 con workers 16 / cap 2). Qui la scelta del
+            # backend viene riconvalidata contro lo stato corrente.
+            if backend["epoch"] != epoch or not manager.usable(backend):
+                continue
+            result = await call_backend_guarded(session, prompt, backend, call=call)
+        break
+    if result == "RATE_LIMITED":
+        # FAST-PATH: unica eccezione alla regola "solo il writer aggiorna
+        # lo stato". L'ack è per-worker, quindi ferma il worker che ha
+        # preso il 429 ma non gli altri: fra il ritorno della chiamata e
+        # l'applicazione del cooldown da parte del writer resta una
+        # finestra in cui un worker può superare il check di usabilità e
+        # partire (misurate 1-3 chiamate post-429 con la sola
+        # ri-verifica post-semaforo). Qui il cooldown è attivo per il
+        # lease successivo di CHIUNQUE, e la finestra si chiude.
+        # Sicuro: siamo single-thread asyncio e fra il ritorno della call e
+        # questa riga non c'è alcun await. Idempotente: il writer
+        # riapplicherà mark_rate_limited con l'epoch della chiamata, che
+        # l'epoch guard scarta come residuo — un solo cooldown, un solo hit.
+        manager.mark_rate_limited(backend["id"], epoch,
+                                  getattr(result, "retry_after", None))
     return CallOutcome(chunk, result, backend["id"], backend["name"], backend["model"], epoch)
 
 

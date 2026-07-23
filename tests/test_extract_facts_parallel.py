@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 import sqlite3
 import sys
 
+import aiohttp
 import pytest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -370,6 +372,99 @@ def test_rate_limit_stops_dispatch_and_requeues_on_next_backend(monkeypatch):
         "dispatch continuato su un provider in cooldown"
 
 
+def _rate_limit_race(manager, workers, chunks, seed=7):
+    """Gira il pool con delay irregolari e un 429 che arriva a regime
+    avviato. Ritorna le chiamate ad anthropic partite DOPO il 429."""
+    rnd = random.Random(seed)
+    rate_limited = []
+    late = []
+
+    async def call(session, prompt, backend):
+        if backend["name"] == "anthropic" and rate_limited:
+            late.append(prompt)          # dispatch su un provider già in 429
+        if "[c0]" in prompt and not rate_limited:
+            await asyncio.sleep(0.005)   # il 429 arriva a regime avviato
+            rate_limited.append(True)
+            return efn.RateLimited(None)
+        delay = rnd.choice([0, 0.001, 0.002, 0.005])
+        if delay:
+            await asyncio.sleep(delay)
+        return [FACT]                    # il requeue di c0 riesce su google
+
+    state = _run(manager, chunks, call, workers=workers)
+    assert rate_limited, "il 429 non è mai stato servito"
+    return late, state
+
+
+def test_rate_limit_stops_dispatch_across_all_workers(monkeypatch):
+    """Repro multi-worker: dopo il 429 nessuna NUOVA chiamata al provider.
+
+    Due finestre, entrambe chiuse in questo commit:
+      - l'ack è per-worker, quindi ferma solo chi ha preso il 429: gli
+        altri worker vengono riammessi dai propri esiti e dispatchano su
+        un provider che il writer non ha ancora messo in cooldown →
+        cooldown applicato dal worker stesso (fast-path);
+      - i worker accodati al semaforo per-provider hanno già superato il
+        check di usabilità: quando prendono lo slot chiamano comunque →
+        ri-verifica dopo l'acquisizione.
+
+    Config con cap (2) < worker (8): è quella che espone la seconda
+    finestra — misurate fino a 14 chiamate post-429 con 16 worker."""
+    backends = [
+        {"provider": "anthropic", "model": "haiku", "workers": 2},
+        {"provider": "google", "model": "flash", "workers": 5},
+    ]
+    manager = _manager(monkeypatch, backends, worker_cap=8)
+    assert manager.backends[0]["workers"] == 2 < 8, "il cap non crea coda sul semaforo"
+
+    late, state = _rate_limit_race(manager, workers=8, chunks=_chunks(40))
+
+    assert late == [], f"{len(late)} dispatch su anthropic dopo il 429"
+    assert manager.backends[0]["rate_limit_hits"] == 1, "cooldown applicato due volte"
+    assert manager.backends[0]["epoch"] == 1
+    assert state.processed == 40
+    assert state.errors == 0
+
+
+def test_rate_limit_stops_dispatch_without_semaphore_queue(monkeypatch):
+    """Stessa invariante con cap == worker (nessuna coda sul semaforo):
+    isola la finestra chiusa dal fast-path."""
+    manager = _manager(monkeypatch, _two_backends(), worker_cap=4)
+
+    late, state = _rate_limit_race(manager, workers=4, chunks=_chunks(40))
+
+    assert late == []
+    assert manager.backends[0]["rate_limit_hits"] == 1
+    assert state.processed == 40
+
+
+def test_fast_path_and_writer_do_not_double_apply(monkeypatch):
+    """Il writer riapplica mark_rate_limited con l'epoch della chiamata:
+    l'epoch guard lo scarta. Un solo cooldown, un solo hit — ma il requeue
+    deve avvenire comunque."""
+    now = [1000.0]
+    manager = _manager(monkeypatch, _two_backends(), worker_cap=4,
+                       clock=lambda: now[0])
+    tracker = efn._WorkTracker(1)
+    state = efn.RunState(total=1)
+    queue = asyncio.Queue()
+
+    # fast-path del worker
+    assert manager.mark_rate_limited(0, epoch=0) is True
+    deadline = manager.backends[0]["cooldown_until"]
+
+    # stesso esito, ora al writer, con l'epoch congelato della chiamata
+    item = efn.CallOutcome({"id": "c0", "date": ""}, efn.RateLimited(None),
+                           0, "anthropic", "haiku", 0)
+    efn._apply_outcome(item, manager, queue, tracker, None, state, "now")
+
+    assert manager.backends[0]["rate_limit_hits"] == 1
+    assert manager.backends[0]["cooldown_until"] == deadline
+    assert manager.backends[0]["epoch"] == 1
+    assert state.requeued == 1 and queue.qsize() == 1  # requeue non saltato
+    assert tracker.pending == 1                        # chunk ancora aperto
+
+
 def test_cooldown_epoch_guard_collapses_a_burst_of_429(monkeypatch):
     """N worker in volo prendono 429 nella stessa raffica: un solo
     cooldown, un solo hit. I residui portano una epoch superata."""
@@ -589,3 +684,65 @@ def test_anthropic_max_tokens_covers_observed_truncations():
 
     assert asyncio.run(efn.call_anthropic(_Session(), "p", "m", "k")) == []
     assert sent["max_tokens"] == 4000
+
+
+# ==================================================================
+# Errori di rete: transienti, mai failed_*
+# ==================================================================
+
+@pytest.mark.parametrize("exc", [
+    aiohttp.ClientConnectorError(object(), OSError("dns")),
+    aiohttp.ServerDisconnectedError(),
+    aiohttp.ClientOSError(104, "Connection reset by peer"),
+    ConnectionResetError("reset"),
+])
+@pytest.mark.parametrize("fn,args", [
+    (efn.call_anthropic, ("p", "m", "k")),
+    (efn.call_openai, ("p", "m", "k")),
+    (efn.call_gemini, ("p", "m", "k")),
+])
+def test_network_error_is_transient_not_a_chunk_failure(fn, args, exc):
+    """Rete giù = backend irraggiungibile, come un timeout: sentinel
+    TIMEOUT (rotazione + requeue). Un None scriverebbe una riga failed_*
+    addebitando al chunk un connection reset."""
+    class _Session:
+        def post(self, url, **kw):
+            raise exc
+
+    assert asyncio.run(fn(_Session(), *args)) == "TIMEOUT"
+
+
+def test_network_error_on_ollama_is_transient():
+    class _Session:
+        def post(self, url, **kw):
+            raise aiohttp.ServerDisconnectedError()
+
+    assert asyncio.run(efn.call_ollama(_Session(), "p", "m")) == "TIMEOUT"
+
+
+@pytest.mark.parametrize("fn,args", [
+    (efn.call_anthropic, ("p", "m", "k")),
+    (efn.call_openai, ("p", "m", "k")),
+    (efn.call_gemini, ("p", "m", "k")),
+    (efn.call_ollama, ("p", "m")),
+])
+def test_code_bug_still_returns_none(fn, args):
+    """L'`except Exception` residuo non è la rete: un bug di codice deve
+    restare None, non travestirsi da transiente."""
+    class _Session:
+        def post(self, url, **kw):
+            raise TypeError("bug di codice")
+
+    assert asyncio.run(fn(_Session(), *args)) is None
+
+
+def test_network_error_log_never_echoes_the_gemini_key(capsys):
+    class _Session:
+        def post(self, url, **kw):
+            raise aiohttp.ClientOSError(104, f"reset on {url}")
+
+    result = asyncio.run(efn.call_gemini(_Session(), "p", "m", "sk-secret-key"))
+    out = capsys.readouterr().out
+
+    assert result == "TIMEOUT"
+    assert "sk-secret-key" not in out
