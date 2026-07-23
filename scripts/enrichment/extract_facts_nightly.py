@@ -1,19 +1,25 @@
 """
 TAILOR — 17b: Fact Extraction Nightly Runner (multi-backend rotation)
-Processes chunks in daily batches, rotating between Gemini and OpenAI to stay within rate limits.
+Processes chunks in daily batches, rotating between backends to stay within rate limits.
 
 Logica:
-  1. Try Gemini 2.5 Flash (cheapest)
-  2. When Gemini returns 429, switches to OpenAI GPT-4o-mini
-  3. When OpenAI returns 429, switches to Anthropic Haiku (fast, generous limits)
-  4. When all backends exhausted, stops
-  5. Next night resumes — incremental
+  1. Priorità ai backend in ordine di config (il primo è il preferito)
+  2. Su 429 il provider entra in cooldown: stop dispatch, drain degli
+     in-flight, il chunk torna in coda e riparte sul backend successivo
+  3. Quando tutti i backend sono esauriti, si ferma
+  4. La notte dopo riprende — incrementale
+
+Dispatch: pool di N worker su una coda di chunk + WRITER UNICO.
+I worker fanno SOLO la chiamata al provider; il writer è l'unico a toccare
+facts.sqlite3/extraction_log, ad aggiornare lo stato dei backend e a
+calcolare processed/errors/facts/ETA. Vedi §"PARALLEL DISPATCH".
 
 Integrated in the nightly pipeline as step 5e.
 
 Uso:
   python scripts/enrichment/extract_facts_nightly.py              # Run notturno (max 20k chunk)
   python scripts/enrichment/extract_facts_nightly.py --limit 5000 # Limita a N chunk
+  python scripts/enrichment/extract_facts_nightly.py --workers 8  # Parallelismo (default 4)
   python scripts/enrichment/extract_facts_nightly.py --test 10    # Test mode (no write)
 """
 
@@ -22,11 +28,13 @@ import re
 import os
 import sys
 import time
+import random
 import asyncio
 import sqlite3
 import argparse
 import subprocess
 import aiohttp
+from dataclasses import dataclass, field
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -304,6 +312,31 @@ def _parse_provider_content(provider, status, body_text, content_text, data=None
 # docs/v1.2.4_resume_state.md "v1.2.5 backlog".
 NONE_CONSECUTIVE_THRESHOLD = 3  # rotate backend after this many consecutive None responses
 TIMEOUT_CONSECUTIVE_THRESHOLD = 3  # exhaust backend after this many consecutive HTTP timeouts
+RATE_LIMIT_HITS_THRESHOLD = 5  # exhaust backend after this many 429 cooldowns in one run
+
+# Parallelismo di default. 4 e non 15: il numero alto in config è un cap
+# per-provider storico, non un target. Il parallelismo globale lo decide
+# --workers; il valore di config lo può solo ABBASSARE (min dei due).
+DEFAULT_WORKERS = 4
+
+# Tentativi massimi per chunk sugli esiti transienti (429/timeout/5xx).
+# Oltre questa soglia il chunk viene contato come errore della run ma NON
+# marcato failed_* : resta eleggibile per la run successiva.
+MAX_TRANSIENT_ATTEMPTS = 3
+
+# Cooldown provider-level su 429 quando il provider non manda Retry-After.
+# Breve e jitterato: N worker che sbattono sullo stesso 429 non devono
+# ripartire tutti insieme allo scadere.
+RATE_LIMIT_COOLDOWN_BASE = 20.0   # -> 10-30s jitterati
+RATE_LIMIT_COOLDOWN_MAX = 300.0   # tetto anche per un Retry-After assurdo
+
+# Budget di output per anthropic.
+ANTHROPIC_MAX_TOKENS = 1500
+
+# 5xx = il provider è giù, non il chunk illeggibile. Vanno trattati come
+# TIMEOUT (rotazione + requeue), mai come None: un None scriverebbe una
+# riga failed_* addebitando al chunk un'indisponibilità del backend.
+_TRANSIENT_STATUS = frozenset({500, 502, 503, 504, 529})
 
 # Explicit HTTP timeout, uniform across cloud providers (google, openai,
 # anthropic). Ollama is local and may pay a cold model-load, so it keeps
@@ -314,83 +347,221 @@ TIMEOUT_CONSECUTIVE_THRESHOLD = 3  # exhaust backend after this many consecutive
 HTTP_TIMEOUT_SECONDS = 60
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS)
 OLLAMA_TIMEOUT = aiohttp.ClientTimeout(total=120)
+# Watchdog uniforme: 70s cloud / 130s ollama, HTTP timeout + 10s di
+# margine. Copre gli await fuori dal path socket (DNS, pool, connector).
 BACKEND_CALL_TIMEOUT_SECONDS = HTTP_TIMEOUT_SECONDS + 10
 OLLAMA_CALL_TIMEOUT_SECONDS = int(OLLAMA_TIMEOUT.total or 120) + 10
 
 _TIMEOUT_EXC = (asyncio.TimeoutError, aiohttp.ServerTimeoutError)
 
 
-class BackendManager:
-    """Gestisce la rotazione tra backend con tracking dei rate limit."""
+# ---- Sentinelle di esito ---------------------------------------------
+# "TIMEOUT"/"RATE_LIMITED"/"NO_BACKEND" restano stringhe: i confronti
+# esistenti (`result == "TIMEOUT"`) continuano a valere. RateLimited è una
+# str che trasporta anche il Retry-After del provider —
+# `RateLimited(30) == "RATE_LIMITED"` è True, ma il writer può leggere
+# `.retry_after` per dimensionare il cooldown.
+TIMEOUT = "TIMEOUT"
+NO_BACKEND = "NO_BACKEND"        # nessun backend utilizzabile: chunk non tentato
+INTERNAL_ERROR = "INTERNAL_ERROR"  # bug nostro nel worker: mai colpa del chunk
 
-    def __init__(self):
+
+class RateLimited(str):
+    def __new__(cls, retry_after=None):
+        obj = super().__new__(cls, "RATE_LIMITED")
+        obj.retry_after = retry_after
+        return obj
+
+
+def _retry_after_seconds(headers):
+    """Retry-After -> secondi, o None.
+
+    Solo la forma numerica (quella che mandano openai/anthropic). La forma
+    HTTP-date torna None: si ricade sul cooldown jitterato, che è
+    l'obiettivo comunque — meglio un cooldown breve certo che una data
+    parsata male."""
+    if not headers:
+        return None
+    raw = None
+    try:
+        raw = headers.get("Retry-After")
+    except AttributeError:
+        return None
+    if raw is None:
+        try:
+            raw = next((v for k, v in headers.items() if k.lower() == "retry-after"), None)
+        except Exception:
+            return None
+    if raw is None:
+        return None
+    try:
+        val = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return min(val, RATE_LIMIT_COOLDOWN_MAX) if val > 0 else None
+
+
+class BackendManager:
+    """Rotazione backend con accounting PER IDENTITÀ.
+
+    Con N chiamate in volo "il backend corrente" non ha più significato:
+    quando un risultato torna, `current_idx` può già puntare altrove (una
+    rotazione decisa da un altro worker). Ogni mark_* prende quindi
+    `backend_id` — l'identità del backend che ha SERVITO quella chiamata —
+    e aggiorna quel backend, mai `self.current_idx`. `current_idx` resta
+    solo il puntatore di dispatch (quale backend serve il prossimo chunk).
+
+    `epoch` = generazione dello stato di un backend, incrementata a ogni
+    transizione (cooldown 429, exhaustion). Un 429 che arriva con una
+    epoch superata è il residuo in volo della stessa raffica che ha già
+    aperto il cooldown: va ignorato, altrimenti N worker impilerebbero N
+    cooldown e N hit per un singolo evento di rate limit.
+    """
+
+    def __init__(self, worker_cap=DEFAULT_WORKERS, clock=time.monotonic, jitter=random.random):
+        self._clock = clock
+        self._jitter = jitter
         self.backends = []
         for bcfg in _BACKENDS_CFG:
             provider = bcfg["provider"]
             model = bcfg["model"]
             api_key = _API_KEYS.get(provider, "")
             # Ollama doesn't need an API key
-            if provider == "ollama" or api_key:
-                self.backends.append({
-                    "name": provider, "model": model, "calls": 0,
-                    "limit": DAILY_LIMIT_PER_BACKEND, "exhausted": False,
-                    "workers": bcfg.get("workers", 5),
-                    "none_consecutive": 0,
-                    "timeout_consecutive": 0,
-                })
-            else:
+            if provider != "ollama" and not api_key:
                 print(f"  ⚠️  Skipping {provider}/{model} — no API key found")
+                continue
+            try:
+                cap = int(bcfg.get("workers") or worker_cap)
+            except (TypeError, ValueError):
+                cap = worker_cap
+            self.backends.append({
+                "id": len(self.backends),
+                "name": provider, "model": model, "calls": 0,
+                "limit": DAILY_LIMIT_PER_BACKEND, "exhausted": False,
+                # Cap per-provider: il valore di config non alza più il
+                # parallelismo, lo limita soltanto.
+                "workers": max(1, min(worker_cap, cap)),
+                "none_consecutive": 0,
+                "timeout_consecutive": 0,
+                "rate_limit_hits": 0,
+                "epoch": 0,
+                "cooldown_until": 0.0,
+                "semaphore": None,  # creato da init_semaphores(), dentro il loop
+            })
         self.current_idx = 0
 
+    # -- lifecycle -------------------------------------------------
+    def init_semaphores(self):
+        """Un semaforo per provider, capienza = cap per-provider. Va
+        chiamato dentro il loop asyncio che poi lo usa."""
+        for b in self.backends:
+            b["semaphore"] = asyncio.Semaphore(b["workers"])
+
+    # -- selezione -------------------------------------------------
+    def usable(self, b, now=None):
+        now = self._clock() if now is None else now
+        return not b["exhausted"] and b["cooldown_until"] <= now
+
     def current(self):
-        """Returns the current backend, or None if all exhausted."""
-        for _ in range(len(self.backends)):
-            b = self.backends[self.current_idx]
-            if not b["exhausted"]:
+        """Primo backend utilizzabile ORA, in ordine di priorità a partire
+        dal puntatore di dispatch. None se nessuno lo è (esauriti o tutti
+        in cooldown). Non muta lo stato: il puntatore lo spostano solo le
+        mark_*."""
+        if not self.backends:
+            return None
+        now = self._clock()
+        n = len(self.backends)
+        for off in range(n):
+            b = self.backends[(self.current_idx + off) % n]
+            if self.usable(b, now):
                 return b
-            self.current_idx = (self.current_idx + 1) % len(self.backends)
         return None
 
-    def mark_success(self):
-        b = self.backends[self.current_idx]
+    def cooldown_eta(self):
+        """Secondi al primo backend che esce dal cooldown, o None se non
+        c'è nulla da aspettare (i restanti sono esauriti per davvero)."""
+        now = self._clock()
+        etas = [b["cooldown_until"] - now for b in self.backends
+                if not b["exhausted"] and b["cooldown_until"] > now]
+        return min(etas) if etas else None
+
+    def _rotate_from(self, backend_id):
+        """Sposta il puntatore di dispatch solo se puntava a questo
+        backend: un altro worker può averlo già spostato."""
+        if self.backends and self.current_idx == backend_id:
+            self.current_idx = (self.current_idx + 1) % len(self.backends)
+
+    def _exhaust(self, b, reason):
+        if not b["exhausted"]:
+            b["exhausted"] = True
+            b["epoch"] += 1
+            print(f"  ⚠️  {b['name']} esaurito ({reason}). Switching...", flush=True)
+        self._rotate_from(b["id"])
+
+    # -- accounting per identità -----------------------------------
+    def mark_success(self, backend_id):
+        b = self.backends[backend_id]
         b["calls"] += 1
         b["none_consecutive"] = 0  # reset None streak
         b["timeout_consecutive"] = 0  # backend is responding again
         if b["calls"] >= b["limit"]:
-            b["exhausted"] = True
-            print(f"  ⚠️  {b['name']} ha raggiunto il limite di {b['limit']} call. Switching...")
-            self.current_idx = (self.current_idx + 1) % len(self.backends)
+            self._exhaust(b, f"limite di {b['limit']} call")
 
-    def mark_rate_limited(self):
-        b = self.backends[self.current_idx]
-        b["exhausted"] = True
+    def mark_rate_limited(self, backend_id, epoch, retry_after=None):
+        """429 -> cooldown provider-level. True se ha aperto un cooldown
+        nuovo, False se è il residuo di una epoch già gestita.
+
+        Il cooldown è ciò che ferma il dispatch verso quel provider
+        (current() lo salta) mentre le chiamate già partite drenano; i
+        chunk toccati tornano in coda e ripartono sul backend successivo.
+        Diversamente dal 429 del path sequenziale, il backend NON viene
+        bruciato per tutta la run: si riprende da solo allo scadere, e
+        viene esaurito solo dopo RATE_LIMIT_HITS_THRESHOLD cooldown."""
+        b = self.backends[backend_id]
+        if epoch != b["epoch"]:
+            return False
+        b["rate_limit_hits"] += 1
         b["none_consecutive"] = 0  # reset (rate limit is orthogonal to parse-fail)
-        print(f"  ⚠️  {b['name']} rate limited (429). Switching...")
-        self.current_idx = (self.current_idx + 1) % len(self.backends)
+        if retry_after:
+            cooldown = min(float(retry_after), RATE_LIMIT_COOLDOWN_MAX)
+            src = "Retry-After"
+        else:
+            cooldown = RATE_LIMIT_COOLDOWN_BASE * (0.5 + self._jitter())
+            src = "jitter"
+        b["cooldown_until"] = self._clock() + cooldown
+        b["epoch"] += 1
+        print(f"  ⚠️  {b['name']} rate limited (429) — cooldown {cooldown:.0f}s ({src}), "
+              f"stop dispatch + drain in volo", flush=True)
+        self._rotate_from(backend_id)
+        if b["rate_limit_hits"] >= RATE_LIMIT_HITS_THRESHOLD:
+            self._exhaust(b, f"{b['rate_limit_hits']}× 429")
+        return True
 
-    def mark_timeout(self):
-        """Record an HTTP timeout from the current backend: log WARN and
-        rotate, so the chunk is immediately retried on the next provider.
-        Worker-visible treatment is the same as a 429 (never block, chunk
-        back in queue), but the backend is exhausted only after
-        TIMEOUT_CONSECUTIVE_THRESHOLD consecutive timeouts — a single
-        network stall must not burn a provider for the whole run."""
-        b = self.backends[self.current_idx]
-        b["timeout_consecutive"] = b.get("timeout_consecutive", 0) + 1
+    def mark_timeout(self, backend_id, epoch=None):
+        """Timeout HTTP: WARN + rotazione del puntatore, così il chunk
+        riparte subito sul provider successivo. Il backend è esaurito solo
+        dopo TIMEOUT_CONSECUTIVE_THRESHOLD timeout consecutivi — un
+        singolo stallo di rete non deve bruciare un provider per la run.
+
+        Nessuna guardia su epoch, a differenza del 429: lo streak conta
+        per chiamata, e N chiamate in volo che scadono tutte sono
+        esattamente l'evidenza che il backend non risponde."""
+        b = self.backends[backend_id]
+        b["timeout_consecutive"] += 1
         if b["timeout_consecutive"] >= TIMEOUT_CONSECUTIVE_THRESHOLD:
-            b["exhausted"] = True
             print(f"  ⚠️  WARN {b['name']} timeout {b['timeout_consecutive']}× consecutive "
-                  f"({HTTP_TIMEOUT_SECONDS}s) — backend exhausted. Switching...", flush=True)
+                  f"({HTTP_TIMEOUT_SECONDS}s)", flush=True)
+            self._exhaust(b, "timeout streak")
         else:
             print(f"  ⚠️  WARN {b['name']} HTTP timeout ({HTTP_TIMEOUT_SECONDS}s) — "
                   f"switching backend, chunk back in queue", flush=True)
-        self.current_idx = (self.current_idx + 1) % len(self.backends)
+            self._rotate_from(backend_id)
 
-    def mark_none(self):
-        """Record a None response from current backend. After
-        NONE_CONSECUTIVE_THRESHOLD consecutive None responses, rotate
-        to the next backend (without exhausting current — backend may
-        recover later). Returns True if rotation occurred.
+    def mark_none(self, backend_id):
+        """Record a None response from the backend that served the call.
+        After NONE_CONSECUTIVE_THRESHOLD consecutive None responses,
+        rotate to the next backend (without exhausting it — the backend
+        may recover later). Returns True if rotation occurred.
 
         Rationale: a backend that returns None on N successive chunks
         is likely in a transient degraded state (timeout, malformed
@@ -399,15 +570,15 @@ class BackendManager:
         is cheap and may succeed (see indagine 2026-05-25: 17 chunks
         permanently failing on anthropic without ever being attempted
         on gemini/openai)."""
-        b = self.backends[self.current_idx]
-        b["none_consecutive"] = b.get("none_consecutive", 0) + 1
+        b = self.backends[backend_id]
+        b["none_consecutive"] += 1
         if b["none_consecutive"] >= NONE_CONSECUTIVE_THRESHOLD:
             print(
                 f"  🔄 {b['name']} returned None {b['none_consecutive']}× consecutive — rotating",
                 flush=True,
             )
             b["none_consecutive"] = 0  # reset counter so next rotation tracks fresh streak
-            self.current_idx = (self.current_idx + 1) % len(self.backends)
+            self._rotate_from(backend_id)
             return True
         return False
 
@@ -415,19 +586,28 @@ class BackendManager:
         return all(b["exhausted"] for b in self.backends)
 
     def status(self):
+        now = self._clock()
         parts = []
         for b in self.backends:
-            status = "✅" if not b["exhausted"] else "❌"
+            if b["exhausted"]:
+                status = "❌"
+            elif b["cooldown_until"] > now:
+                status = f"⏳{b['cooldown_until'] - now:.0f}s"
+            else:
+                status = "✅"
             parts.append(f"{b['name']}:{b['calls']}/{b['limit']}{status}")
         return " | ".join(parts)
 
-    def current_workers(self):
-        """Return optimal worker count for the current backend."""
-        b = self.current()
-        return b["workers"] if b else 5
 
-
-async def call_gemini(session, semaphore, prompt, model, api_key):
+# I caller NON prendono più il semaforo: lo slot lo acquisisce il consumer
+# PRIMA di armare il watchdog (vedi _run_one). Con l'acquisizione dentro il
+# timer, il wait_for misurava anche l'attesa in coda e faceva scattare
+# TIMEOUT su chiamate mai partite.
+#
+# Nessun retry interno, su nessun provider: rotazione backend + requeue del
+# chunk coprono il caso transiente, e un retry same-backend ricostruisce
+# esattamente lo stallo che il timeout esiste per tagliare.
+async def call_gemini(session, prompt, model, api_key):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     gen_cfg = {"temperature": 0.1, "maxOutputTokens": 4000}
     thinking = gemini_thinking_config(model)
@@ -437,63 +617,59 @@ async def call_gemini(session, semaphore, prompt, model, api_key):
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": gen_cfg,
     }
-    async with semaphore:
-        for attempt in range(3):
-            try:
-                async with session.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=HTTP_TIMEOUT) as resp:
-                    if resp.status == 429:
-                        return "RATE_LIMITED"
-                    if resp.status == 503:
-                        await asyncio.sleep(2 ** attempt)
-                        continue
-                    if resp.status != 200:
-                        # Senza questo il fallimento è silenzioso: il gating dei
-                        # modelli lato Google (404 "no longer available to new
-                        # users") era diagnosticabile solo via curl manuale.
-                        # NB: mai loggare l'URL — contiene ?key=.
-                        err_body = (await resp.text())[:200]
-                        print(f"  ⚠️  gemini {model} HTTP {resp.status}: {err_body}", flush=True)
-                        return None
-                    body_text = await resp.text()
-                    # Nessun retry sul safety block / shape inattesa: prima
-                    # sollevava KeyError dentro `except Exception` e bruciava
-                    # 3 tentativi con backoff su una risposta non recuperabile.
-                    return _extract_and_parse("google", resp.status, body_text, _gemini_text)
-            except _TIMEOUT_EXC:
-                # No same-backend retry: 3 × 60s would rebuild the very
-                # stall the timeout exists to cap. Rotate instead.
-                return "TIMEOUT"
-            except Exception as e:
-                if attempt < 2:
-                    await asyncio.sleep(2 ** attempt)
-                    continue
+    try:
+        async with session.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=HTTP_TIMEOUT) as resp:
+            if resp.status == 429:
+                return RateLimited(_retry_after_seconds(resp.headers))
+            if resp.status in _TRANSIENT_STATUS:
+                print(f"  ⚠️  gemini {model} HTTP {resp.status} (transient) — rotating", flush=True)
+                return TIMEOUT
+            if resp.status != 200:
+                # Senza questo il fallimento è silenzioso: il gating dei
+                # modelli lato Google (404 "no longer available to new
+                # users") era diagnosticabile solo via curl manuale.
+                # NB: mai loggare l'URL — contiene ?key=.
+                err_body = (await resp.text())[:200]
+                print(f"  ⚠️  gemini {model} HTTP {resp.status}: {err_body}", flush=True)
                 return None
+            body_text = await resp.text()
+            # Nessun retry sul safety block / shape inattesa: è una
+            # risposta non recuperabile, non un errore transitorio.
+            return _extract_and_parse("google", resp.status, body_text, _gemini_text)
+    except _TIMEOUT_EXC:
+        return TIMEOUT
+    except Exception as e:
+        # Solo il tipo: il messaggio di alcune eccezioni aiohttp riporta
+        # l'URL, che qui contiene ?key=.
+        print(f"  ⚠️  gemini {model} {type(e).__name__}", flush=True)
         return None
 
 
-async def call_openai(session, semaphore, prompt, model, api_key):
+async def call_openai(session, prompt, model, api_key):
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
         "model": model, "max_tokens": 1500, "temperature": 0.1,
         "messages": [{"role": "user", "content": prompt}],
         "response_format": {"type": "json_object"}
     }
-    async with semaphore:
-        try:
-            async with session.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers, timeout=HTTP_TIMEOUT) as resp:
-                if resp.status == 429:
-                    return "RATE_LIMITED"
-                if resp.status != 200:
-                    return None
-                body_text = await resp.text()
-                return _extract_and_parse("openai", resp.status, body_text, _openai_text)
-        except _TIMEOUT_EXC:
-            return "TIMEOUT"
-        except Exception:
-            return None
+    try:
+        async with session.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers, timeout=HTTP_TIMEOUT) as resp:
+            if resp.status == 429:
+                return RateLimited(_retry_after_seconds(resp.headers))
+            if resp.status in _TRANSIENT_STATUS:
+                print(f"  ⚠️  openai {model} HTTP {resp.status} (transient) — rotating", flush=True)
+                return TIMEOUT
+            if resp.status != 200:
+                return None
+            body_text = await resp.text()
+            return _extract_and_parse("openai", resp.status, body_text, _openai_text)
+    except _TIMEOUT_EXC:
+        return TIMEOUT
+    except Exception:
+        return None
 
 
-async def call_anthropic(session, semaphore, prompt, model, api_key):
+async def call_anthropic(session, prompt, model, api_key):
     headers = {
         "x-api-key": api_key,
         "content-type": "application/json",
@@ -501,23 +677,25 @@ async def call_anthropic(session, semaphore, prompt, model, api_key):
     }
     payload = {
         "model": model,
-        "max_tokens": 1500,
+        "max_tokens": ANTHROPIC_MAX_TOKENS,
         "temperature": 0.1,
         "messages": [{"role": "user", "content": prompt}]
     }
-    async with semaphore:
-        try:
-            async with session.post("https://api.anthropic.com/v1/messages", json=payload, headers=headers, timeout=HTTP_TIMEOUT) as resp:
-                if resp.status == 429:
-                    return "RATE_LIMITED"
-                if resp.status != 200:
-                    return None
-                body_text = await resp.text()
-                return _extract_and_parse("anthropic", resp.status, body_text, _anthropic_text)
-        except _TIMEOUT_EXC:
-            return "TIMEOUT"
-        except Exception:
-            return None
+    try:
+        async with session.post("https://api.anthropic.com/v1/messages", json=payload, headers=headers, timeout=HTTP_TIMEOUT) as resp:
+            if resp.status == 429:
+                return RateLimited(_retry_after_seconds(resp.headers))
+            if resp.status in _TRANSIENT_STATUS:
+                print(f"  ⚠️  anthropic {model} HTTP {resp.status} (transient) — rotating", flush=True)
+                return TIMEOUT
+            if resp.status != 200:
+                return None
+            body_text = await resp.text()
+            return _extract_and_parse("anthropic", resp.status, body_text, _anthropic_text)
+    except _TIMEOUT_EXC:
+        return TIMEOUT
+    except Exception:
+        return None
 
 
 # ============================================================
@@ -629,55 +807,57 @@ def load_chunks(limit=20000):
 
 
 # ============================================================
-# MAIN
+# DISPATCH AL PROVIDER
 # ============================================================
 
-async def call_backend(session, semaphore, prompt, backend):
+async def call_backend(session, prompt, backend):
     """Dispatch to the correct provider's API call."""
     provider = backend["name"]
     model = backend["model"]
     api_key = _API_KEYS.get(provider, "")
     if provider == "google":
-        return await call_gemini(session, semaphore, prompt, model, api_key)
+        return await call_gemini(session, prompt, model, api_key)
     elif provider == "anthropic":
-        return await call_anthropic(session, semaphore, prompt, model, api_key)
+        return await call_anthropic(session, prompt, model, api_key)
     elif provider == "openai":
-        return await call_openai(session, semaphore, prompt, model, api_key)
+        return await call_openai(session, prompt, model, api_key)
     elif provider == "ollama":
-        return await call_ollama(session, semaphore, prompt, model)
+        return await call_ollama(session, prompt, model)
     else:
         print(f"  ❌ Unknown provider: {provider}")
         return None
 
 
-async def call_backend_guarded(session, semaphore, prompt, backend):
-    """Dispatch with an outer watchdog.
+async def call_backend_guarded(session, prompt, backend, call=None):
+    """Dispatch with an outer watchdog: 70s cloud / 130s ollama.
 
     The provider functions pass aiohttp timeouts, but the watchdog also
     covers any await outside the socket read path (connector/DNS/pool bugs,
     future code drift, or local Ollama oddities). This is the guard that keeps
     an idle event loop from sleeping forever after a None/error path.
+
+    Il semaforo per-provider è GIÀ acquisito dal chiamante quando si arriva
+    qui: dentro questo wait_for c'è solo la chiamata al provider, mai
+    l'attesa di uno slot.
     """
     timeout = (
         OLLAMA_CALL_TIMEOUT_SECONDS
         if backend["name"] == "ollama"
         else BACKEND_CALL_TIMEOUT_SECONDS
     )
+    fn = call or call_backend
     try:
-        return await asyncio.wait_for(
-            call_backend(session, semaphore, prompt, backend),
-            timeout=timeout,
-        )
+        return await asyncio.wait_for(fn(session, prompt, backend), timeout=timeout)
     except asyncio.TimeoutError:
         print(
             f"  ⚠️  WARN {backend['name']} backend await exceeded {timeout}s — "
             "treating as TIMEOUT",
             flush=True,
         )
-        return "TIMEOUT"
+        return TIMEOUT
 
 
-async def call_ollama(session, semaphore, prompt, model):
+async def call_ollama(session, prompt, model):
     """Call Ollama local API."""
     ollama_url = os.environ.get("OLLAMA_URL", cfg("ollama", "base_url") or "http://localhost:11434") + "/api/chat"
     payload = {
@@ -686,27 +866,324 @@ async def call_ollama(session, semaphore, prompt, model):
         "stream": False,
         "options": {"temperature": 0.1}
     }
-    async with semaphore:
-        try:
-            async with session.post(ollama_url, json=payload, timeout=OLLAMA_TIMEOUT) as resp:
-                if resp.status != 200:
-                    return None
-                body_text = await resp.text()
-                return _extract_and_parse("ollama", resp.status, body_text, _ollama_text)
-        except _TIMEOUT_EXC:
-            return "TIMEOUT"
-        except Exception:
-            return None
+    try:
+        async with session.post(ollama_url, json=payload, timeout=OLLAMA_TIMEOUT) as resp:
+            if resp.status in _TRANSIENT_STATUS:
+                print(f"  ⚠️  ollama {model} HTTP {resp.status} (transient) — rotating", flush=True)
+                return TIMEOUT
+            if resp.status != 200:
+                return None
+            body_text = await resp.text()
+            return _extract_and_parse("ollama", resp.status, body_text, _ollama_text)
+    except _TIMEOUT_EXC:
+        return TIMEOUT
+    except Exception:
+        return None
 
+
+# ============================================================
+# PARALLEL DISPATCH — N worker + writer unico
+# ============================================================
+#
+# Ruoli, rigidi:
+#   worker  — prende un chunk, sceglie un backend, acquisisce lo slot,
+#             chiama il provider sotto watchdog, mette l'esito su result_q.
+#             NON tocca sqlite, NON aggiorna contatori, NON decide rotazioni.
+#   writer  — unico consumer di result_q: aggiorna lo stato dei backend per
+#             identità, scrive facts/extraction_log, tiene
+#             processed/errors/facts/ETA, decide requeue e commit.
+#
+# Un solo scrittore = niente lock su sqlite, niente conteggi che si
+# sovrappongono, un solo punto in cui leggere la logica di esito.
+
+_STOP = object()  # sentinella di chiusura per le due code
+
+
+@dataclass
+class CallOutcome:
+    """Esito di UNA chiamata, con l'identità del backend che l'ha servita.
+
+    provider/model sono quelli EFFETTIVI della chiamata: con N in volo,
+    rileggerli dal manager al ritorno darebbe il backend sbagliato (è
+    l'errore che questa struttura esiste per rendere impossibile).
+
+    `ack` è l'Event con cui il writer dice al worker "esito contabilizzato".
+    Il worker lo aspetta prima di prendere il chunk successivo: senza,
+    dopo un 429 continuerebbe a dispatchare sul provider appena messo in
+    cooldown (il writer non ha ancora girato), e sforerebbe i limiti per
+    lo stesso motivo. Non serializza le chiamate — gli altri worker sono
+    già in volo — costa solo un giro di event loop per chunk."""
+    chunk: dict
+    result: object
+    backend_id: int
+    provider: str
+    model: str
+    epoch: int
+    ack: object = None
+
+
+@dataclass
+class RunState:
+    total: int = 0
+    processed: int = 0
+    errors: int = 0
+    facts: int = 0
+    requeued: int = 0
+    unprocessed: int = 0      # chunk mai tentati (backend finiti): nessuna riga scritta
+    start_time: float = field(default_factory=time.time)
+
+
+class _WorkTracker:
+    """Conteggio esplicito del lavoro in sospeso.
+
+    Non si usa Queue.join(): il requeue lo decide il writer, DOPO che il
+    worker ha già fatto task_done(). Con join() la coda potrebbe risultare
+    finita l'istante prima che il writer rimetta dentro il chunk, e il pool
+    chiuderebbe lasciando lavoro fuori. Qui il contatore scende solo quando
+    il writer chiude definitivamente un chunk."""
+
+    def __init__(self, pending):
+        self.pending = pending
+        self.done = asyncio.Event()
+        if pending <= 0:
+            self.done.set()
+
+    def complete(self, n=1):
+        self.pending -= n
+        if self.pending <= 0:
+            self.done.set()
+
+
+async def _lease_backend(manager, poll=1.0):
+    """Backend utilizzabile per il prossimo chunk, aspettando l'eventuale
+    cooldown. None quando non ne resta nessuno (tutti esauriti)."""
+    while True:
+        backend = manager.current()
+        if backend is not None:
+            return backend
+        eta = manager.cooldown_eta()
+        if eta is None:
+            return None
+        await asyncio.sleep(min(max(eta, 0.05), poll))
+
+
+async def _run_one(session, chunk, manager, call=None):
+    backend = await _lease_backend(manager)
+    if backend is None:
+        return CallOutcome(chunk, NO_BACKEND, -1, "", "", -1)
+    # Identità congelata QUI: epoch e id appartengono alla chiamata, non
+    # allo stato che il manager avrà quando la risposta torna.
+    epoch = backend["epoch"]
+    prompt = EXTRACTION_PROMPT.format(
+        language=_USER_LANG, date=chunk["date"], source=chunk["source"], text=chunk["text"]
+    )
+    # Semaforo FUORI dal watchdog: prima lo slot, poi si arma il timer.
+    async with backend["semaphore"]:
+        result = await call_backend_guarded(session, prompt, backend, call=call)
+    return CallOutcome(chunk, result, backend["id"], backend["name"], backend["model"], epoch)
+
+
+async def _chunk_worker(name, session, chunk_q, result_q, manager, call=None):
+    while True:
+        chunk = await chunk_q.get()
+        try:
+            if chunk is _STOP:
+                return
+            try:
+                outcome = await _run_one(session, chunk, manager, call=call)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Un bug nostro non deve né uccidere il pool né addebitare
+                # un failed_* al chunk.
+                print(f"  ❌ {name}: {type(e).__name__}: {e}", flush=True)
+                outcome = CallOutcome(chunk, INTERNAL_ERROR, -1, "", "", -1)
+            outcome.ack = asyncio.Event()
+            await result_q.put(outcome)
+            # Prossimo dispatch solo su stato aggiornato: vedi CallOutcome.ack.
+            await outcome.ack.wait()
+        finally:
+            chunk_q.task_done()
+
+
+def _write_failure(facts_conn, chunk, now_str):
+    """Bump del fail counter (facts_count negativo). Dopo 3 None
+    consecutivi il chunk diventa 'failed_persistent' e smette di essere
+    ricaricato — vedi indagine 2026-05-25: 17 chunk ritentati ogni notte
+    per settimane, sempre None da Claude Haiku."""
+    if not facts_conn:
+        return
+    cur = facts_conn.cursor()
+    row = cur.execute(
+        "SELECT facts_count FROM extraction_log WHERE chunk_id = ?", (chunk["id"],)
+    ).fetchone()
+    prev = row[0] if row and row[0] < 0 else 0
+    new_count = prev - 1
+    new_model = "failed_persistent" if new_count <= -3 else f"failed_{abs(new_count)}"
+    cur.execute(
+        "INSERT OR REPLACE INTO extraction_log "
+        "(chunk_id, facts_count, model, extracted_at) VALUES (?, ?, ?, ?)",
+        (chunk["id"], new_count, new_model, now_str)
+    )
+
+
+def _write_facts(facts_conn, chunk, facts, provider, now_str):
+    """Valida e scrive i fatti. Ritorna quanti ne ha tenuti."""
+    valid = []
+    for f in facts:
+        if not isinstance(f, dict):
+            continue
+        fact_text = f.get("fact", "").strip()
+        if not fact_text or len(fact_text) < 10:
+            continue
+        valid.append(f)
+    if not facts_conn:
+        return len(valid)
+    cur = facts_conn.cursor()
+    for f in valid:
+        cur.execute("""
+            INSERT INTO facts (chunk_id, fact, category, entity_tags, event_date, expires_at, confidence, created_at, document_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (chunk["id"], f["fact"][:500], f.get("category", "")[:50].lower(),
+              json.dumps(f.get("entity_tags", [])[:10]),
+              f.get("event_date", "") or "", _clean_expires(f.get("expires_at", "")),
+              1.0, now_str, chunk.get("date", "")))
+    cur.execute("""
+        INSERT OR REPLACE INTO extraction_log (chunk_id, facts_count, model, extracted_at)
+        VALUES (?, ?, ?, ?)
+    """, (chunk["id"], len(valid), provider, now_str))
+    return len(valid)
+
+
+def _requeue_or_drop(item, manager, chunk_q, tracker, state, reason):
+    """Esito transiente (429/timeout/5xx): il chunk NON è colpevole. Torna
+    in coda e riparte sul prossimo backend utilizzabile; nessuna riga
+    failed_* viene scritta, così resta eleggibile anche per la run
+    successiva."""
+    chunk = item.chunk
+    chunk["attempts"] = chunk.get("attempts", 0) + 1
+    if chunk["attempts"] < MAX_TRANSIENT_ATTEMPTS and not manager.all_exhausted():
+        state.requeued += 1
+        chunk_q.put_nowait(chunk)
+        return
+    print(f"  ⚠️  chunk {chunk['id']} lasciato indietro dopo {chunk['attempts']} "
+          f"tentativi ({reason}) — nessun failed_* scritto", flush=True)
+    state.errors += 1
+    state.processed += 1
+    tracker.complete()
+
+
+def _apply_outcome(item, manager, chunk_q, tracker, facts_conn, state, now_str):
+    """Unico punto in cui un esito diventa stato. Gira solo nel writer."""
+    result = item.result
+
+    if result == "RATE_LIMITED":
+        manager.mark_rate_limited(item.backend_id, item.epoch,
+                                  getattr(result, "retry_after", None))
+        _requeue_or_drop(item, manager, chunk_q, tracker, state, "rate limited")
+        return
+
+    if result == TIMEOUT:
+        manager.mark_timeout(item.backend_id, item.epoch)
+        _requeue_or_drop(item, manager, chunk_q, tracker, state, "timeout")
+        return
+
+    if result in (NO_BACKEND, INTERNAL_ERROR):
+        # Mai tentato davvero: conta come errore della run, ma il chunk
+        # resta pulito in extraction_log.
+        state.errors += 1
+        state.unprocessed += 1
+        tracker.complete()
+        return
+
+    if result is None:
+        manager.mark_none(item.backend_id)
+        state.errors += 1
+        state.processed += 1
+        _write_failure(facts_conn, item.chunk, now_str)
+        tracker.complete()
+        return
+
+    manager.mark_success(item.backend_id)
+    state.facts += _write_facts(facts_conn, item.chunk, result, item.provider, now_str)
+    state.processed += 1
+    tracker.complete()
+
+
+async def _result_writer(result_q, chunk_q, manager, tracker, facts_conn, state, now_str):
+    logged_bucket = 0
+    while True:
+        item = await result_q.get()
+        if item is _STOP:
+            return
+        try:
+            _apply_outcome(item, manager, chunk_q, tracker, facts_conn, state, now_str)
+        finally:
+            # Il worker riparte solo ora: un esito non contabilizzato non
+            # deve mai influenzare il dispatch successivo.
+            if item.ack is not None:
+                item.ack.set()
+
+        # Commit + progress ogni 100 chunk chiusi.
+        bucket = state.processed // 100
+        if bucket > logged_bucket:
+            logged_bucket = bucket
+            if facts_conn:
+                facts_conn.commit()
+            elapsed = time.time() - state.start_time
+            rate = state.processed / elapsed if elapsed > 0 else 0
+            remaining = state.total - state.processed
+            eta = remaining / rate if rate > 0 else 0
+            print(f"  [{state.processed:,}/{state.total:,}] {rate:.1f}/s | "
+                  f"Facts={state.facts:,} ERR={state.errors} RQ={state.requeued} | "
+                  f"{manager.status()} | ETA {eta/60:.0f}m", flush=True)
+
+
+async def run_pool(session, chunks, manager, facts_conn, worker_count, state, now_str, call=None):
+    """Avvia N worker + il writer e ritorna quando ogni chunk è chiuso."""
+    manager.init_semaphores()
+    chunk_q = asyncio.Queue()
+    result_q = asyncio.Queue()
+    for chunk in chunks:
+        chunk_q.put_nowait(chunk)
+    tracker = _WorkTracker(len(chunks))
+
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(
+            _result_writer(result_q, chunk_q, manager, tracker, facts_conn, state, now_str),
+            name="fact-writer",
+        )
+        workers = [
+            tg.create_task(
+                _chunk_worker(f"worker-{i}", session, chunk_q, result_q, manager, call=call),
+                name=f"fact-worker-{i}",
+            )
+            for i in range(worker_count)
+        ]
+        await tracker.done.wait()
+        for _ in workers:
+            chunk_q.put_nowait(_STOP)
+        # Il writer chiude solo dopo i worker: nessun esito resta in coda.
+        await asyncio.gather(*workers)
+        result_q.put_nowait(_STOP)
+    return state
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 async def main():
     parser = argparse.ArgumentParser(description="TAILOR Nightly Fact Extraction (multi-backend)")
     parser.add_argument("--limit", type=int, default=20000, help="Max chunk da processare (default 20k)")
     parser.add_argument("--test", type=int, default=0, help="Test mode (no write)")
-    parser.add_argument("--workers", type=int, default=0, help="Worker paralleli (0 = auto-tune per backend)")
+    parser.add_argument("--workers", type=int, default=0,
+                        help=f"Worker paralleli (0 = default {DEFAULT_WORKERS}); "
+                             "il valore in config resta solo come cap per-provider")
     args = parser.parse_args()
 
-    manager = BackendManager()
+    worker_count = args.workers if args.workers > 0 else DEFAULT_WORKERS
+    manager = BackendManager(worker_cap=worker_count)
     if not manager.backends:
         print("❌ No backend available. Check enrichment.fact_extraction.backends in config/tailor.yaml")
         sys.exit(1)
@@ -734,160 +1211,29 @@ async def main():
         facts_conn = sqlite3.connect(FACTS_DB_PATH, timeout=30)
         facts_conn.execute("PRAGMA journal_mode=WAL")
         facts_conn.execute("PRAGMA busy_timeout=30000")
-    current_worker_count = args.workers if args.workers > 0 else manager.current_workers()
-    semaphore = asyncio.Semaphore(current_worker_count)
-    print(f"  Workers: {current_worker_count} (auto-tuned for {manager.current()['name']})")
-    processed = 0
-    total_facts = 0
-    errors = 0
-    start_time = time.time()
+
+    caps = ", ".join(f"{b['name']}:{b['workers']}" for b in manager.backends)
+    print(f"  Workers: {worker_count} (cap per-provider: {caps})")
+    state = RunState(total=total)
     now_str = datetime.now().isoformat()
 
     async with aiohttp.ClientSession() as session:
-        print(f'  Session created, starting loop on {len(chunks):,} chunks...', flush=True)
-        for chunk in chunks:
-            # Check if all backends are exhausted
-            backend = manager.current()
-            if backend is None:
-                print(f"\n⚠️  All backends exhausted. Stopped at {processed:,} chunk.")
-                break
-
-            prompt = EXTRACTION_PROMPT.format(language=_USER_LANG, 
-                date=chunk["date"], source=chunk["source"], text=chunk["text"]
-            )
-
-            # Call al backend corrente
-            if processed == 0:
-                print(f'  First call: {backend["name"]}/{backend["model"]}...', flush=True)
-            result = await call_backend_guarded(session, semaphore, prompt, backend)
-            if processed == 0:
-                print(f'  First result: {type(result).__name__} = {str(result)[:80] if result else "None"}', flush=True)
-
-            # Rate limit / timeout: entrambi significano "questo backend non è
-            # utilizzabile adesso", mai "questo chunk è illeggibile". Log,
-            # switch al backend successivo, e il chunk torna in coda (retry
-            # immediato sul nuovo backend; nessuna riga failed_* scritta, così
-            # resta eleggibile anche per la run successiva).
-            if result in ("RATE_LIMITED", "TIMEOUT"):
-                first_reason = result
-                if result == "RATE_LIMITED":
-                    manager.mark_rate_limited()
-                else:
-                    manager.mark_timeout()
-                backend = manager.current()
-                if backend is None:
-                    print(f"\n⚠️  All backends exhausted after {first_reason.lower()}. "
-                          f"Stopped at {processed:,} chunk.")
-                    break
-                if args.workers <= 0:
-                    nw = manager.current_workers()
-                    if nw != current_worker_count:
-                        semaphore = asyncio.Semaphore(nw)
-                        current_worker_count = nw
-                        print(f"  Workers: {nw} (auto-tuned for {backend['name']})")
-                result = await call_backend_guarded(session, semaphore, prompt, backend)
-                if result == "RATE_LIMITED":
-                    manager.mark_rate_limited()
-                    break
-                if result == "TIMEOUT":
-                    # Anche il secondo backend è in timeout: registra e passa
-                    # al chunk successivo. Mai bloccare il worker, mai
-                    # marcare il chunk come fallito.
-                    manager.mark_timeout()
-
-            if result is None or result in ("RATE_LIMITED", "TIMEOUT"):
-                errors += 1
-                processed += 1
-                # Track persistent None failures: bump fail counter (stored as
-                # negative facts_count). After 3 consecutive None results,
-                # mark as 'failed_persistent' to stop the infinite retry loop.
-                # See indagine 2026-05-25 — 17 chunks were retried every night
-                # for weeks, all returning None from Claude Haiku.
-                if facts_conn and result is None:
-                    cur = facts_conn.cursor()
-                    row = cur.execute(
-                        "SELECT facts_count FROM extraction_log WHERE chunk_id = ?",
-                        (chunk["id"],)
-                    ).fetchone()
-                    prev = row[0] if row and row[0] < 0 else 0
-                    new_count = prev - 1
-                    new_model = "failed_persistent" if new_count <= -3 else f"failed_{abs(new_count)}"
-                    cur.execute(
-                        "INSERT OR REPLACE INTO extraction_log "
-                        "(chunk_id, facts_count, model, extracted_at) VALUES (?, ?, ?, ?)",
-                        (chunk["id"], new_count, new_model, now_str)
-                    )
-                # Backend rotation on N consecutive None: try a different
-                # provider on the next chunk. May recover transient backend
-                # degradation OR succeed where the previous backend's parser
-                # cannot handle the chunk pattern.
-                if result is None:
-                    if manager.mark_none():
-                        backend = manager.current()
-                        if backend and args.workers <= 0:
-                            nw = manager.current_workers()
-                            if nw != current_worker_count:
-                                semaphore = asyncio.Semaphore(nw)
-                                current_worker_count = nw
-                                print(f"  Workers: {nw} (auto-tuned for {backend['name']})")
-                continue
-
-            manager.mark_success()
-
-            # Valida fatti
-            valid_facts = []
-            for f in result:
-                if not isinstance(f, dict):
-                    continue
-                fact_text = f.get("fact", "").strip()
-                if not fact_text or len(fact_text) < 10:
-                    continue
-                valid_facts.append(f)
-
-            n_facts = len(valid_facts)
-            total_facts += n_facts
-
-            # Salva
-            if facts_conn:
-                cur = facts_conn.cursor()
-                backend_name = backend["name"]
-                for f in valid_facts:
-                    cur.execute("""
-                        INSERT INTO facts (chunk_id, fact, category, entity_tags, event_date, expires_at, confidence, created_at, document_date)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (chunk["id"], f["fact"][:500], f.get("category", "")[:50].lower(),
-                          json.dumps(f.get("entity_tags", [])[:10]),
-                          f.get("event_date", "") or "", _clean_expires(f.get("expires_at", "")),
-                          1.0, now_str, chunk.get("date", "")))
-                cur.execute("""
-                    INSERT OR REPLACE INTO extraction_log (chunk_id, facts_count, model, extracted_at)
-                    VALUES (?, ?, ?, ?)
-                """, (chunk["id"], n_facts, backend_name, now_str))
-
-            processed += 1
-
-            # Commit and log every 100
-            if processed % 100 == 0:
-                if facts_conn:
-                    facts_conn.commit()
-                elapsed = time.time() - start_time
-                rate = processed / elapsed if elapsed > 0 else 0
-                remaining = total - processed
-                eta = remaining / rate if rate > 0 else 0
-                print(f"  [{processed:,}/{total:,}] {rate:.1f}/s | "
-                      f"Facts={total_facts:,} ERR={errors} | "
-                      f"{manager.status()} | ETA {eta/60:.0f}m")
+        print(f'  Session created, {worker_count} worker su {len(chunks):,} chunks...', flush=True)
+        await run_pool(session, chunks, manager, facts_conn, worker_count, state, now_str)
 
     if facts_conn:
         facts_conn.commit()
         facts_conn.close()
 
-    elapsed = time.time() - start_time
+    elapsed = time.time() - state.start_time
     print(f"\n{'═' * 55}")
     print(f"Completed in {elapsed/60:.1f} minutes")
-    print(f"  Chunks processed: {processed:,}")
-    print(f"  Facts extracted: {total_facts:,}")
-    print(f"  Errors: {errors:,}")
+    print(f"  Chunks processed: {state.processed:,}")
+    print(f"  Facts extracted: {state.facts:,}")
+    print(f"  Errors: {state.errors:,}")
+    print(f"  Requeued: {state.requeued:,}")
+    if state.unprocessed:
+        print(f"  ⚠️  Non tentati (backend esauriti): {state.unprocessed:,}")
     print(f"  Backend: {manager.status()}")
     if args.test:
         print(f"  ⚠️  TEST mode — no changes")

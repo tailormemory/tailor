@@ -106,8 +106,10 @@ def test_extract_facts_backends_pass_timeout_and_return_sentinel(monkeypatch, ca
     session = HangingSession()
     fn = getattr(efn, call_name)
 
+    # Nessun semaforo nella firma: lo slot lo acquisisce il consumer, fuori
+    # dal watchdog (dispatch parallelo).
     started = time.monotonic()
-    result = asyncio.run(fn(session, asyncio.Semaphore(2), "prompt", "m", "k"))
+    result = asyncio.run(fn(session, "prompt", "m", "k"))
     elapsed = time.monotonic() - started
 
     assert session.timeouts == [FAKE_TIMEOUT.total], "timeout esplicito non passato"
@@ -188,7 +190,8 @@ def test_timeout_streak_exhausts_backend(monkeypatch):
 
 def test_extract_facts_manager_rotates_on_timeout(monkeypatch, capsys):
     """BackendManager inline di extract_facts_nightly: WARN + switch, e
-    exhaustion solo dopo N timeout consecutivi."""
+    exhaustion solo dopo N timeout consecutivi. Accounting per identità:
+    il backend lo indica il chiamante, non `current_idx`."""
     monkeypatch.setattr(efn, "_BACKENDS_CFG", [
         {"provider": "anthropic", "model": "haiku", "workers": 2},
         {"provider": "google", "model": "flash", "workers": 2},
@@ -196,15 +199,14 @@ def test_extract_facts_manager_rotates_on_timeout(monkeypatch, capsys):
     monkeypatch.setattr(efn, "_API_KEYS", {"anthropic": "k", "google": "k"})
     manager = efn.BackendManager()
 
-    manager.mark_timeout()
+    manager.mark_timeout(0)
     out = capsys.readouterr().out
     assert "WARN" in out and "anthropic" in out
     assert manager.backends[0]["exhausted"] is False
     assert manager.current()["name"] == "google"
 
     for _ in range(efn.TIMEOUT_CONSECUTIVE_THRESHOLD - 1):
-        manager.current_idx = 0
-        manager.mark_timeout()
+        manager.mark_timeout(0)
     assert manager.backends[0]["exhausted"] is True
 
 
@@ -246,7 +248,6 @@ def test_extract_facts_guarded_backend_timeout(monkeypatch):
     started = time.monotonic()
     result = asyncio.run(efn.call_backend_guarded(
         object(),
-        asyncio.Semaphore(1),
         "prompt",
         {"name": "anthropic", "model": "m"},
     ))

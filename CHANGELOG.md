@@ -35,6 +35,35 @@ Template for upcoming changes. Move entries under a new version heading on relea
   [`scripts/enrichment/derive_facts.py`](scripts/enrichment/derive_facts.py).
 ### Changed
 
+- **`extract_facts_nightly.py`: dispatch parallelo (N worker + writer unico).** Il
+  loop era sequenziale — un chunk per volta, `await` sulla singola chiamata — e il
+  semaforo "worker" non aveva alcun effetto sul throughput. Ora: `asyncio.TaskGroup`
+  con N consumer su una coda di chunk e un **writer unico** su coda di risultati. I
+  worker fanno SOLO la chiamata al provider; il writer è l'unico a toccare
+  `facts.sqlite3`/`extraction_log`, ad aggiornare lo stato dei backend e a calcolare
+  `processed`/`errors`/`facts`/ETA. Punti chiave:
+  - **Accounting per identità**: ogni esito porta `backend_id`/provider/model/`epoch`
+    della chiamata effettiva, e `mark_success`/`mark_timeout`/`mark_rate_limited`/
+    `mark_none` aggiornano QUEL backend. Con N chiamate in volo `current_idx` non
+    identifica più chi ha servito la chiamata: restava solo il puntatore di dispatch.
+  - **Semaforo fuori dal watchdog**: il consumer acquisisce lo slot per-provider e
+    solo dopo arma il `wait_for` sulla chiamata. Prima l'acquisizione stava dentro il
+    timer, quindi una coda lunga faceva scattare TIMEOUT su chiamate mai partite.
+  - **Nessun retry interno** (rimosso il 3× di Gemini): rotazione backend + requeue
+    del chunk coprono il transiente. Watchdog uniforme 70s cloud / 130s ollama.
+  - **429**: `Retry-After` se presente, altrimenti cooldown provider-level jitterato
+    (10-30s). Il cooldown ferma il dispatch nuovo su quel provider, le chiamate in
+    volo drenano, il chunk rientra in coda sul backend successivo. Il backend non è
+    più bruciato per tutta la run: si riprende allo scadere, ed è esaurito solo dopo
+    5 cooldown. Una raffica di 429 dalla stessa `epoch` apre UN solo cooldown.
+  - **Worker di default 4** (`--workers`); il numero in config resta solo come cap
+    per-provider, e può abbassare il parallelismo, mai alzarlo.
+  - I 5xx (500/502/503/504/529) diventano sentinel TIMEOUT: prima un 503 dopo i
+    retry tornava `None` e addebitava al chunk una riga `failed_*` per
+    un'indisponibilità del provider.
+  File: [`scripts/enrichment/extract_facts_nightly.py`](scripts/enrichment/extract_facts_nightly.py),
+  test [`tests/test_extract_facts_parallel.py`](tests/test_extract_facts_parallel.py).
+
 - **WARNING drift: rimossa la CTA `repair_hnsw_index.py`.** Il WARNING (drift > 800)
   resta come segnale informativo della zona di lazy compaction [800,1000), ma non
   suggerisce più l'azione manuale di repair: era un consiglio no-op su uno stato che
