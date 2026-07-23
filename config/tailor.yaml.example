@@ -223,8 +223,8 @@ chat_interface:
   #     model: gpt-4o-mini
   #     label: "GPT-4o mini"
   #   - provider: google
-  #     model: gemini-2.5-flash
-  #     label: "Gemini 2.5 Flash"
+  #     model: gemini-flash-latest
+  #     label: "Gemini Flash (latest)"
   #   - provider: deepseek
   #     model: deepseek-chat
   #     label: "DeepSeek V3.2"
@@ -259,7 +259,7 @@ enrichment:
   fact_extraction:
     backends:
       - provider: google
-        model: gemini-2.5-flash
+        model: gemini-flash-latest
         workers: 5           # optional, parallel requests (default auto-tuned per provider)
       - provider: openai
         model: gpt-4o-mini
@@ -272,7 +272,7 @@ enrichment:
   fact_derivation:
     backends:
       - provider: google
-        model: gemini-2.5-flash
+        model: gemini-flash-latest
       - provider: anthropic
         model: claude-haiku-4-5-20251001  # fallback on Gemini rate-limit/error
 
@@ -300,7 +300,7 @@ enrichment:
     daily_limit_per_backend: 50000  # high-volume role; default 4500 would route 91% of pairs to fallback
     backends:
       - provider: google
-        model: gemini-2.5-flash
+        model: gemini-flash-latest
         workers: 5
       - provider: anthropic
         model: claude-haiku-4-5-20251001  # fallback on Gemini rate-limit/error

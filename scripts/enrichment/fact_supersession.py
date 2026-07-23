@@ -46,7 +46,7 @@ DB_DIR = os.path.join(BASE_DIR, "db")
 FACTS_DB_PATH = os.path.join(DB_DIR, "facts.sqlite3")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from scripts.lib.backend_manager import BackendManager
+from scripts.lib.backend_manager import BackendManager, gemini_thinking_config
 
 DEFAULT_WORKERS = 5
 SIMILARITY_THRESHOLD = 0.45  # soglia fuzzy match per candidare una coppia
@@ -301,7 +301,7 @@ async def call_gemini(session, semaphore, new_fact, old_fact, new_date, old_date
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.0, "maxOutputTokens": 100,
-                             "thinkingConfig": {"thinkingBudget": 0}}
+                             "thinkingConfig": gemini_thinking_config(model)}
     }
     async with semaphore:
         try:

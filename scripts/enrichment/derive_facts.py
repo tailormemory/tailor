@@ -32,7 +32,7 @@ CHECKPOINT_FILE = os.path.join(DB_DIR, "checkpoints", "derives_checkpoint.json")
 # Provider rotation on rate-limit / transient error is handled by the
 # shared BackendManager in scripts/lib/backend_manager.py.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from scripts.lib.backend_manager import BackendManager
+from scripts.lib.backend_manager import BackendManager, gemini_thinking_config
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 GEMINI_URL_TMPL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
@@ -330,7 +330,7 @@ def _call_google(prompt: str, model: str, api_key: str, system: str):
                 "generationConfig": {
                     "temperature": 0.3,
                     "maxOutputTokens": 800,
-                    "thinkingConfig": {"thinkingBudget": 0},
+                    "thinkingConfig": gemini_thinking_config(model),
                 },
             },
             timeout=30,

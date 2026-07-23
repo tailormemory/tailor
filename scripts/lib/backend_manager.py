@@ -3,6 +3,8 @@
 Used by:
 - scripts/enrichment/fact_supersession.py
 - scripts/enrichment/derive_facts.py
+- scripts/enrichment/extract_facts_nightly.py (solo
+  `gemini_thinking_config`, non BackendManager — vedi nota sotto)
 
 TECHNICAL DEBT: scripts/enrichment/extract_facts_nightly.py has an
 in-line BackendManager copy (introduced before this shared module
@@ -84,6 +86,20 @@ def _load_api_key(provider: str) -> str:
     except Exception:
         pass
     return ""
+
+
+def gemini_thinking_config(model: str) -> dict:
+    """Return the `thinkingConfig` that disables reasoning for `model`.
+
+    Gemini 3.x ha sostituito `thinkingBudget` con `thinkingLevel`: gli
+    alias non-gated (`gemini-flash-latest` → gemini-3.6-flash,
+    `gemini-flash-lite-latest` → gemini-3.5-flash-lite) rispondono 400
+    "Request contains an invalid argument" se ricevono `thinkingBudget`.
+    I model id 2.x pinnati vogliono ancora il budget. Verificato
+    2026-07-23: con `thinkingLevel: minimal` entrambi gli alias tornano
+    200 e `thoughtsTokenCount: 0`, cioè lo stesso effetto di budget 0."""
+    return ({"thinkingBudget": 0} if model.startswith("gemini-2.")
+            else {"thinkingLevel": "minimal"})
 
 
 class BackendManager:

@@ -30,6 +30,7 @@ import aiohttp
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from scripts.lib.backend_manager import gemini_thinking_config
 from scripts.lib.config import get_enrichment_backends, get_enrichment_daily_limit
 from scripts.lib.config import get as cfg
 _USER_LANG = cfg("user", "language") or "en"
@@ -431,7 +432,7 @@ async def call_gemini(session, semaphore, prompt, model, api_key):
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.1, "maxOutputTokens": 4000,
-                             "thinkingConfig": {"thinkingBudget": 0}}
+                             "thinkingConfig": gemini_thinking_config(model)}
     }
     async with semaphore:
         for attempt in range(3):

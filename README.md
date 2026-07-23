@@ -270,7 +270,7 @@ enrichment:
   fact_extraction:
     backends:
       - provider: google
-        model: gemini-2.5-flash
+        model: gemini-flash-latest
       - provider: openai
         model: gpt-4o-mini
       - provider: anthropic
