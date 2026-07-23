@@ -150,7 +150,7 @@ def verify_openai(
 def verify_google(
     key: str, timeout: float = _DEFAULT_TIMEOUT
 ) -> tuple[bool, str | None, int]:
-    """POST gemini-2.5-flash-lite:generateContent with maxOutputTokens=1.
+    """POST gemini-flash-lite-latest:generateContent with maxOutputTokens=1.
 
     Gemini's auth is a ``?key=`` query param rather than a header — the
     key must never leak into logs. ``_run`` converts exceptions to class
@@ -160,7 +160,7 @@ def verify_google(
     def call() -> "requests.Response":
         return requests.post(
             "https://generativelanguage.googleapis.com/v1beta/models/"
-            "gemini-2.5-flash-lite:generateContent",
+            "gemini-flash-lite-latest:generateContent",
             params={"key": key},
             headers={"content-type": "application/json"},
             json={

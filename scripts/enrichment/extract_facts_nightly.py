@@ -443,6 +443,12 @@ async def call_gemini(session, semaphore, prompt, model, api_key):
                         await asyncio.sleep(2 ** attempt)
                         continue
                     if resp.status != 200:
+                        # Senza questo il fallimento è silenzioso: il gating dei
+                        # modelli lato Google (404 "no longer available to new
+                        # users") era diagnosticabile solo via curl manuale.
+                        # NB: mai loggare l'URL — contiene ?key=.
+                        err_body = (await resp.text())[:200]
+                        print(f"  ⚠️  gemini {model} HTTP {resp.status}: {err_body}", flush=True)
                         return None
                     body_text = await resp.text()
                     # Nessun retry sul safety block / shape inattesa: prima

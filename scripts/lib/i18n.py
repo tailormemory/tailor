@@ -195,7 +195,7 @@ def _try_google(prompt: str, original: str) -> str | None:
         return None
     
     resp = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}",
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={api_key}",
         json={"contents": [{"parts": [{"text": prompt}]}],
               "generationConfig": {"temperature": 0.1, "maxOutputTokens": len(original) * 4}},
         timeout=15

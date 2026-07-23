@@ -57,7 +57,7 @@ def get(section: str, key: str = "", default=None):
 # ── Enrichment config ─────────────────────────────────────────
 
 _ENRICHMENT_DEFAULTS = {
-    "fact_extraction": [{"provider": "google", "model": "gemini-2.5-flash"}],
+    "fact_extraction": [{"provider": "google", "model": "gemini-flash-latest"}],
     "fact_derivation": [{"provider": "anthropic", "model": "claude-haiku-4-5-20251001"}],
     "entity_extraction": [{"provider": "anthropic", "model": "claude-haiku-4-5-20251001"}],
     "doc_enrichment": [{"provider": "anthropic", "model": "claude-haiku-4-5-20251001"}],
