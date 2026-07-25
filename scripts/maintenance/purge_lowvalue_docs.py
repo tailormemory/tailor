@@ -109,9 +109,9 @@ SEQUENZA OPERATIVA (di Emiliano — lo script non tocca daemon/launchctl)
        prudenziale. Il denominatore e' max(KB_dopo, indice_prima) = l'indice
        pre-purge.
     6. maintenance OFF: kill -USR2 <mcp_pid>
-    7. persist durevole: sudo launchctl kickstart system/com.tailor.mcp
-       (graceful, senza -k: e' lo shutdown pulito a persistere l'HNSW e a
-        drenare embeddings_queue dopo 51k delete)
+    7. persist durevole: sudo launchctl kickstart -k system/com.tailor.mcp
+       (-k forza il restart del servizio gia' avviato, cosi' lo shutdown pulito
+        persiste l'HNSW e drena embeddings_queue dopo 51k delete)
 
 ================================================================================
 VINCOLI
@@ -1062,8 +1062,8 @@ def execute(limit_docs: int | None) -> int:
     print("\n[next] reconciler:  ./.venv/bin/python "
           "scripts/maintenance/reconcile_lexical_index.py --max-churn 1.0")
     print("[next] maintenance OFF: kill -USR2 <mcp_pid>")
-    print("[next] persist:     sudo launchctl kickstart system/com.tailor.mcp"
-          "   (graceful, senza -k)")
+    print("[next] persist:     sudo launchctl kickstart -k system/com.tailor.mcp"
+          "   (restart graceful forzato)")
     return 0
 
 

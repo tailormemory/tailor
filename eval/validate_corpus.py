@@ -266,7 +266,7 @@ def validate_warnings(rec: dict) -> list:
     if rec.get("status") == "ready" and rec.get("source_doc_id") is None:
         warnings.append(
             "status=ready con source_doc_id=null — legittimo per un gold di tipo "
-            "summary il cui doc sorgente non è in KB (cfr. miss_analisi_sangue_2025); "
+            "summary il cui doc sorgente non è in KB; "
             "promemoria per i consumer che assumono ready ⇒ source_doc_id"
         )
     return warnings

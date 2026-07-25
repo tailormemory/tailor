@@ -89,7 +89,13 @@ from embedding import get_embeddings, info as embedding_info   # noqa: E402
 from embedding_contract import embedding_text, MAX_EMBED_CHARS  # noqa: E402
 
 # maintenance-mode gate: unica fonte, condivisa con repair_hnsw_index.py
-from repair_hnsw_index import is_in_maintenance_mode, MAINTENANCE_LOCK  # noqa: E402
+try:
+    from scripts.maintenance.repair_hnsw_index import (  # noqa: E402
+        is_in_maintenance_mode,
+        MAINTENANCE_LOCK,
+    )
+except ImportError:
+    from repair_hnsw_index import is_in_maintenance_mode, MAINTENANCE_LOCK  # noqa: E402
 
 # ----------------------------------------------------------------------------
 DB_DIR = os.path.join(BASE_DIR, "db")

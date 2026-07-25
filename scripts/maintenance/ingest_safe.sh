@@ -105,14 +105,15 @@ log() {
 
 bail() {
     log "BAIL OUT: $1"
-    send_telegram "🚨 *ingest_safe BAIL OUT*: $1
-Log: $LOG_FILE"
+    send_telegram "🚨 \`ingest_safe\` *BAIL OUT*: $1
+Log: \`$LOG_FILE\`"
     exit 1
 }
 
 send_telegram() {
-    # Send via Telegram, retry without Markdown on 400 (avoids underscore-
-    # in-path parse errors). Pattern matches sync_and_ingest.sh.
+    # Send via Telegram, retry without Markdown on 400 (parse errors). Pattern
+    # matches sync_and_ingest.sh. Il retry resta come rete: la costruzione del
+    # messaggio è già markdown-safe (vedi TG_MSG), quindi non deve più scattare.
     if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT" ]; then
         log "Telegram skipped: TG_TOKEN or TG_CHAT empty"
         return 0
@@ -447,15 +448,15 @@ fi
 log "── STEP 6: restart MCP via sudo launchctl bootstrap ──"
 if ! sudo launchctl bootstrap system "$MCP_PLIST" 2>>"$LOG_FILE"; then
     log "CRITICAL: sudo launchctl bootstrap failed"
-    send_telegram "🚨 *ingest_safe CRITICAL*: MCP restart failed after ingest. Manual intervention required.
-Log: $LOG_FILE"
+    send_telegram "🚨 \`ingest_safe\` *CRITICAL*: MCP restart failed after ingest. Manual intervention required.
+Log: \`$LOG_FILE\`"
     exit 1
 fi
 sleep 8
 if [ -z "$(mcp_pid)" ]; then
     log "CRITICAL: MCP not running after bootstrap"
-    send_telegram "🚨 *ingest_safe CRITICAL*: MCP not running after bootstrap. Manual intervention required.
-Log: $LOG_FILE"
+    send_telegram "🚨 \`ingest_safe\` *CRITICAL*: MCP not running after bootstrap. Manual intervention required.
+Log: \`$LOG_FILE\`"
     exit 1
 fi
 NEW_PID=$(mcp_pid)
@@ -527,24 +528,30 @@ if [ "$NO_SUMMARIES" = "1" ]; then
 elif [ "$INGEST_FAILED" = "1" ] || [ "$ENTITIES_FAILED" = "1" ]; then
     SUMMARIES_LINE="📝 Summaries: SKIPPED (prior step failed)"
 elif [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-    SUMMARIES_LINE="📝 Summaries: SKIPPED (ANTHROPIC_API_KEY not set)"
+    SUMMARIES_LINE="📝 Summaries: SKIPPED (\`ANTHROPIC_API_KEY\` not set)"
 else
     SUMMARIES_LINE="📝 Summaries: ${SUMMARIES_CREATED} created"
 fi
 
-TG_MSG="${ICON} *ingest_safe ${STATUS}*
+# parse_mode=Markdown (legacy): un `_` non accoppiato apre un'entità italic che
+# resta aperta e fa 400 "can't parse entities". I path del run ne portano 8 (in
+# BACKUP_DIR e LOG_FILE, es. db_pre_ingest_safe_20260723_232248) più sql_only=
+# nell'audit: parità dispari => ogni run ripiegava sul plain. I valori dinamici
+# vanno quindi in backtick (entità code: dentro non si parsa nulla) e il nome
+# dello script esce dal bold, che non può contenerne uno.
+TG_MSG="${ICON} \`ingest_safe\` *${STATUS}*
 
 ⏱ Duration: ${TOTAL_DURATION}s
-📦 Backup: ${BACKUP_DIR}
+📦 Backup: \`${BACKUP_DIR}\`
 📄 Files processed: ${FILES_PROCESSED}
 📥 Chunks added: ${CHUNKS_ADDED}
 ${ENTITIES_LINE}
 ${SUMMARIES_LINE}
 📊 Embeddings: ${COUNT_BASELINE} → ${COUNT_FINAL} (Δ$((COUNT_FINAL - COUNT_BASELINE)))
 🧷 Queue: ${QUEUE_BASELINE} → ${QUEUE_POST}
-🔍 Audit: ${AUDIT_SUMMARY}
+🔍 Audit: \`${AUDIT_SUMMARY}\`
 🖥 MCP: PID ${NEW_PID:-?} (smoke=$([ "$SMOKE_OK" = "1" ] && echo OK || echo FAIL))
-📋 Log: ${LOG_FILE}"
+📋 Log: \`${LOG_FILE}\`"
 
 send_telegram "$TG_MSG"
 

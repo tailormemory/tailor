@@ -108,7 +108,10 @@ from embedding_contract import embedding_text                     # noqa: E402
 # chunk_gmail USATO COME LIBRERIA (vedi docstring): mai process().
 from chunk_gmail import should_keep, strip_quoted, chunk_email     # noqa: E402
 
-from repair_hnsw_index import MAINTENANCE_LOCK                     # noqa: E402
+try:
+    from scripts.maintenance.repair_hnsw_index import MAINTENANCE_LOCK  # noqa: E402
+except ImportError:
+    from repair_hnsw_index import MAINTENANCE_LOCK                  # noqa: E402
 
 # ----------------------------------------------------------------------------
 DB_DIR = os.path.join(BASE_DIR, "db")
@@ -202,7 +205,7 @@ def maintenance_state() -> tuple[bool, str]:
         return False, (f"lock STALE: PID {pid} non esiste piu' "
                        f"(il MCP che rilascio' Chroma e' morto)")
     except PermissionError:
-        pass   # esiste ma di altro utente (il MCP gira come root): vivo, ok
+        pass   # esiste ma non ispezionabile da questo utente: vivo, ok
     is_mcp, why = _pid_is_mcp(pid)
     if not is_mcp:
         return False, why
