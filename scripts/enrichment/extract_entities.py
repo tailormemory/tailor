@@ -11,7 +11,7 @@ Extracted entities:
 - date_ref: riferimenti temporali espliciti
 
 Funzionamento:
-- Processes only chunks without "entities_extracted" field in metadata (incremental)
+- Incremental: processes every chunk where metadata entities_extracted != 1
 - For each chunk: call LLM → JSON → update metadata in ChromaDB
 - File checkpoint every CHECKPOINT_EVERY chunks (resumable if interrupted)
 - Does not modify text or embeddings — only adds metadata
@@ -421,7 +421,7 @@ def get_chunks_to_process(collection, full_mode=False, source_filter="", limit=N
     for chunk_id, doc, meta, emb in zip(all_ids, all_docs, all_metas, all_embeddings):
         if source_filter and meta.get("source", "") != source_filter:
             continue
-        if not full_mode and meta.get("entities_extracted", 0) == 1:
+        if not full_mode and not _needs_extraction(meta):
             already_done += 1
             continue
         to_process.append({"id": chunk_id, "text": doc, "metadata": meta, "embedding": emb})
@@ -432,6 +432,16 @@ def get_chunks_to_process(collection, full_mode=False, source_filter="", limit=N
         to_process = to_process[:limit]
         print(f"  (limitato a {limit} per test)")
     return to_process
+
+
+def _needs_extraction(meta):
+    return meta.get("entities_extracted", 0) != 1
+
+
+def prune_stale_checkpoint(checkpoint_ids, to_process_ids):
+    checkpoint_ids = set(checkpoint_ids)
+    stale_ids = checkpoint_ids & set(to_process_ids)
+    return checkpoint_ids - stale_ids, stale_ids
 
 
 def update_chunk_metadata(existing_metadata, entities, types):
@@ -459,10 +469,10 @@ def show_stats(collection):
         all_metas.extend(batch["metadatas"])
         offset += len(batch["ids"])
 
-    processed = sum(1 for m in all_metas if m.get("entities_extracted", 0) == 1)
+    processed = sum(1 for m in all_metas if not _needs_extraction(m))
     entity_counts, type_counts, total_entities = {}, {}, 0
     for meta in all_metas:
-        if meta.get("entities_extracted", 0) != 1:
+        if _needs_extraction(meta):
             continue
         try:
             entities = json.loads(meta.get("entities", "[]"))
@@ -561,7 +571,17 @@ def main():
         print(f"Estimated time: {total * 3 // 60} - {total * 5 // 60} minutes\n")
 
     checkpoint = load_checkpoint()
-    already_processed_ids = set(checkpoint.get("processed_ids", []))
+    checkpoint_ids = checkpoint.get("processed_ids", [])
+    if full_mode:
+        already_processed_ids = set(checkpoint_ids)
+        stale_checkpoint_ids = set()
+    else:
+        already_processed_ids, stale_checkpoint_ids = prune_stale_checkpoint(
+            checkpoint_ids,
+            {c["id"] for c in chunks},
+        )
+    if stale_checkpoint_ids:
+        print(f"Checkpoint stale ignored: {len(stale_checkpoint_ids):,}")
 
     # Filter chunks already in checkpoint
     remaining = [c for c in chunks if c["id"] not in already_processed_ids or full_mode]
