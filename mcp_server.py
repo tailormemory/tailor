@@ -250,7 +250,8 @@ def _compute_dashboard_stats():
             source_counts[src] = 0
 
     facts_data = {"total": 0, "extracted": 0, "derived": 0, "superseded": 0, "covered": 0,
-                  "skipped_empty": 0, "skipped_code": 0, "failed_persistent": 0}
+                  "skipped_empty": 0, "skipped_short": 0, "skipped_code": 0,
+                  "failed_persistent": 0}
     if os.path.exists(FACTS_DB_PATH):
         fc = _sq3.connect(f"file:{FACTS_DB_PATH}?mode=ro", uri=True)
         facts_data["total"]      = fc.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
@@ -259,9 +260,10 @@ def _compute_dashboard_stats():
         facts_data["superseded"] = fc.execute("SELECT COUNT(*) FROM facts WHERE superseded_by IS NOT NULL").fetchone()[0]
         facts_data["covered"]    = fc.execute("SELECT COUNT(DISTINCT chunk_id) FROM facts WHERE relation_type = 'extracted'").fetchone()[0]
         # Chunks that can never yield facts — excluded from the coverage
-        # denominator (near-empty grids, code-heavy, LLM-unparseable). See
-        # extract_facts_nightly.is_empty_chunk / is_code_heavy.
-        for _m in ("skipped_empty", "skipped_code", "failed_persistent"):
+        # denominator (near-empty grids, too short, code-heavy, LLM-unparseable).
+        # See extract_facts_nightly.is_empty_chunk / MIN_FACT_CHUNK_CHARS /
+        # is_code_heavy.
+        for _m in ("skipped_empty", "skipped_short", "skipped_code", "failed_persistent"):
             facts_data[_m] = fc.execute(
                 "SELECT COUNT(*) FROM extraction_log WHERE model = ?", (_m,)).fetchone()[0]
         fc.close()
@@ -269,6 +271,7 @@ def _compute_dashboard_stats():
     # Coverage denominator: total chunks minus those that can never yield facts.
     facts_data["coverable"] = max(0, total_chunks
                                   - facts_data["skipped_empty"]
+                                  - facts_data["skipped_short"]
                                   - facts_data["skipped_code"]
                                   - facts_data["failed_persistent"])
 

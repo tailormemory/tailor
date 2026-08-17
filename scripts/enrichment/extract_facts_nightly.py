@@ -48,6 +48,10 @@ DB_DIR = os.path.join(BASE_DIR, "db")
 CHROMA_DB_PATH = os.path.join(DB_DIR, "chroma.sqlite3")
 FACTS_DB_PATH = os.path.join(DB_DIR, "facts.sqlite3")
 
+# Soglia minima di testo per tentare l'estrazione: sotto, il chunk non puo'
+# rendere fatti utili (vedi load_chunks -> skipped_short).
+MIN_FACT_CHUNK_CHARS = 50
+
 # Read backends and daily limit from config (supports old and new YAML format)
 _BACKENDS_CFG = get_enrichment_backends("fact_extraction")
 DAILY_LIMIT_PER_BACKEND = get_enrichment_daily_limit("fact_extraction")
@@ -783,14 +787,19 @@ def load_chunks(limit=20000):
     chunks = []
     skipped_code = []
     skipped_empty = []
+    skipped_short = []
     for eid, text, date, source in cur.fetchall():
         if eid in extracted:
             continue
-        if not text or len(text.strip()) < 50:
-            continue
-        # Skip near-empty chunks (sparse xlsx grids, separator-only) — no facts
-        if is_empty_chunk(text):
+        # Skip near-empty chunks (sparse xlsx grids, separator-only) — no facts.
+        # Va prima del filtro di lunghezza: una griglia vuota corta e' empty,
+        # non short.
+        if not text or is_empty_chunk(text):
             skipped_empty.append(eid)
+            continue
+        # Skip chunks troppo corti per rendere fatti (testo presente ma esiguo)
+        if len(text.strip()) < MIN_FACT_CHUNK_CHARS:
+            skipped_short.append(eid)
             continue
         # Skip pure code/markup chunks (>60% code lines — no useful facts)
         if is_code_heavy(text):
@@ -801,9 +810,9 @@ def load_chunks(limit=20000):
             break
     conn.close()
 
-    # Mark skipped chunks (code-heavy + near-empty) in extraction_log so they're
-    # not retried and are excluded from the coverage denominator.
-    if (skipped_code or skipped_empty) and os.path.exists(FACTS_DB_PATH):
+    # Mark skipped chunks (code-heavy + near-empty + too-short) in extraction_log
+    # so they're not retried and are excluded from the coverage denominator.
+    if (skipped_code or skipped_empty or skipped_short) and os.path.exists(FACTS_DB_PATH):
         fconn = sqlite3.connect(FACTS_DB_PATH, timeout=30)
         fconn.execute("PRAGMA journal_mode=WAL")
         now_str = datetime.now().isoformat()
@@ -817,12 +826,19 @@ def load_chunks(limit=20000):
                 "INSERT OR IGNORE INTO extraction_log (chunk_id, model, facts_count, extracted_at) VALUES (?, ?, ?, ?)",
                 (cid, "skipped_empty", 0, now_str)
             )
+        for cid in skipped_short:
+            fconn.execute(
+                "INSERT OR IGNORE INTO extraction_log (chunk_id, model, facts_count, extracted_at) VALUES (?, ?, ?, ?)",
+                (cid, "skipped_short", 0, now_str)
+            )
         fconn.commit()
         fconn.close()
         if skipped_code:
             print(f"  Skipped {len(skipped_code):,} code-heavy chunks (marked in extraction_log)")
         if skipped_empty:
             print(f"  Skipped {len(skipped_empty):,} near-empty chunks (marked in extraction_log)")
+        if skipped_short:
+            print(f"  Skipped {len(skipped_short):,} too-short chunks (marked in extraction_log)")
 
     return chunks
 

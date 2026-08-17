@@ -92,10 +92,12 @@ def _call_system_status(args: dict) -> str:
         cur.execute("SELECT COUNT(DISTINCT chunk_id) FROM facts")
         chunks_covered = cur.fetchone()[0]
         # Chunks that can never yield facts — excluded from coverage denominator
-        # (near-empty grids, code-heavy, LLM-unparseable).
+        # (near-empty grids, too short, code-heavy, LLM-unparseable). See
+        # extract_facts_nightly.is_empty_chunk / MIN_FACT_CHUNK_CHARS /
+        # is_code_heavy.
         cur.execute(
             "SELECT COUNT(*) FROM extraction_log "
-            "WHERE model IN ('skipped_empty', 'skipped_code', 'failed_persistent')"
+            "WHERE model IN ('skipped_empty', 'skipped_short', 'skipped_code', 'failed_persistent')"
         )
         excluded = cur.fetchone()[0]
         conn.close()
