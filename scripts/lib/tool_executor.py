@@ -83,7 +83,14 @@ def _call_system_status(args: dict) -> str:
 
     # Fact extraction coverage
     try:
-        conn = sqlite3.connect(os.path.join(base, "db", "facts.sqlite3"))
+        # mode=ro + busy_timeout: query di sola lettura sulla coverage, ma il
+        # db ha un writer notturno (extract_facts_nightly). Aprire rw
+        # creerebbe/migrerebbe il file; senza busy_timeout un lock del writer
+        # farebbe fallire la lettura. Mai immutable=1 (fix 16/07 sul
+        # reconciler): il file cambia sotto di noi. Gemello: mcp_server.py:256.
+        conn = sqlite3.connect(
+            f"file:{os.path.join(base, 'db', 'facts.sqlite3')}?mode=ro", uri=True)
+        conn.execute("PRAGMA busy_timeout=30000")
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM facts")
         total_facts = cur.fetchone()[0]
@@ -102,7 +109,12 @@ def _call_system_status(args: dict) -> str:
         excluded = cur.fetchone()[0]
         conn.close()
 
-        conn2 = sqlite3.connect(os.path.join(base, "db", "entity_index.sqlite3"))
+        # Stesso trattamento: build_entity_index.py droppa e ricrea il db,
+        # quindi il lettore live corre contro un writer. Gemello:
+        # mcp_server.py:281, stessa query sulla stessa tabella.
+        conn2 = sqlite3.connect(
+            f"file:{os.path.join(base, 'db', 'entity_index.sqlite3')}?mode=ro", uri=True)
+        conn2.execute("PRAGMA busy_timeout=30000")
         cur2 = conn2.cursor()
         cur2.execute("SELECT COUNT(DISTINCT entity) FROM entity_index")
         entities = cur2.fetchone()[0]
