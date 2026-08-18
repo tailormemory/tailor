@@ -67,6 +67,24 @@ NORMAL_TEXT = (
 # Chunk già lavorato in una notte precedente da un backend reale.
 DONE_TEXT = NORMAL_TEXT + " Verbale archiviato."
 
+# Chunk estraibili quanto NORMAL_TEXT, ma con un tentativo fallito alle
+# spalle: servono a esercitare il selettore di rientro
+#   WHERE model = 'failed_persistent' OR model NOT LIKE 'failed_%'
+# (extract_facts_nightly:769). Il testo NON deve attivare nessun filtro,
+# altrimenti il test misurerebbe lo scarto invece del rientro.
+RETRY_1_TEXT = (
+    "Contratto di fornitura firmato il 3 febbraio con scadenza annuale: "
+    "canone 1.200 euro al mese, rinnovo tacito salvo disdetta a 60 giorni."
+)
+RETRY_2_TEXT = (
+    "Nota spese di aprile approvata dall'amministrazione: trasferta a "
+    "Milano, 340 euro di rimborso chilometrico piu' 95 euro di pernottamento."
+)
+PERSISTENT_TEXT = (
+    "Tabella assicurativa multilingua con codici polizza e massimali, "
+    "illeggibile per l'LLM dopo tre tentativi consecutivi a vuoto."
+)
+
 
 CHROMA_SCHEMA = """
 CREATE TABLE embeddings (
@@ -110,6 +128,9 @@ FIXTURE_CHUNKS = [
     ("chunk_code", CODE_TEXT),
     ("chunk_normal", NORMAL_TEXT),
     ("chunk_done", DONE_TEXT),
+    ("chunk_failed_1", RETRY_1_TEXT),
+    ("chunk_failed_2", RETRY_2_TEXT),
+    ("chunk_failed_persistent", PERSISTENT_TEXT),
 ]
 
 EXPECTED_MODELS = {
@@ -118,8 +139,19 @@ EXPECTED_MODELS = {
     "chunk_short": "skipped_short",
     "chunk_code": "skipped_code",
     "chunk_done": "anthropic",   # pre-esistente, non deve essere toccato
+    # I tre failed_* sono pre-esistenti come chunk_done: load_chunks non
+    # riscrive mai una riga già presente, nemmeno quando rimette il chunk in
+    # coda. Il model resta quello dell'ultimo tentativo.
+    "chunk_failed_1": "failed_1",
+    "chunk_failed_2": "failed_2",
+    "chunk_failed_persistent": "failed_persistent",
     # chunk_normal: nessuna riga attesa
 }
+
+# Chunk estraibili attesi in coda: chunk_normal (mai visto) + i due
+# transienti che rientrano. chunk_done e chunk_failed_persistent restano
+# fuori.
+EXPECTED_QUEUE = ["chunk_failed_1", "chunk_failed_2", "chunk_normal"]
 
 
 @pytest.fixture
@@ -162,10 +194,17 @@ def kb(tmp_path, monkeypatch):
 
     fc = sqlite3.connect(facts_path)
     fc.executescript(FACTS_SCHEMA)
-    fc.execute(
+    fc.executemany(
         "INSERT INTO extraction_log (chunk_id, facts_count, model, extracted_at) "
         "VALUES (?, ?, ?, ?)",
-        ("chunk_done", 3, "anthropic", "2026-08-16T02:00:00"),
+        [
+            ("chunk_done", 3, "anthropic", "2026-08-16T02:00:00"),
+            # 1o e 2o tentativo a vuoto: transienti, devono rientrare.
+            ("chunk_failed_1", 0, "failed_1", "2026-08-16T02:00:00"),
+            ("chunk_failed_2", 0, "failed_2", "2026-08-16T02:00:00"),
+            # 3 tentativi a vuoto: permanente, deve restare fuori.
+            ("chunk_failed_persistent", 0, "failed_persistent", "2026-08-16T02:00:00"),
+        ],
     )
     fc.commit()
     fc.close()
@@ -186,13 +225,19 @@ def _log(facts_path):
 
 # ── coda ─────────────────────────────────────────────────────────────────
 
-def test_only_extractable_chunk_is_queued(kb):
-    """Un solo chunk è estraibile: gli altri cinque sono scarti o già fatti."""
+def test_only_extractable_chunks_are_queued(kb):
+    """In coda solo gli estraibili: scarti, già-fatti e permanenti restano fuori.
+
+    Confronto su `sorted`: l'ordine del result set dipende dal GROUP BY di
+    SQLite, non dall'ordine di inserimento — inchiodarlo renderebbe il test
+    fragile senza coprire nulla in più.
+    """
     chunks = efn.load_chunks()
-    assert [c["id"] for c in chunks] == ["chunk_normal"]
-    assert chunks[0]["text"] == NORMAL_TEXT
-    assert chunks[0]["source"] == "document"
-    assert chunks[0]["date"] == "2026-08-17"
+    assert sorted(c["id"] for c in chunks) == EXPECTED_QUEUE
+    by_id = {c["id"]: c for c in chunks}
+    assert by_id["chunk_normal"]["text"] == NORMAL_TEXT
+    assert by_id["chunk_normal"]["source"] == "document"
+    assert by_id["chunk_normal"]["date"] == "2026-08-17"
 
 
 # ── classificazione ──────────────────────────────────────────────────────
@@ -244,6 +289,49 @@ def test_skipped_rows_have_zero_facts(kb):
 
 
 # ── selettore di rientro ─────────────────────────────────────────────────
+
+def test_transient_failures_are_requeued(kb):
+    """`failed_1` / `failed_2` rientrano: il retry ha 3 tentativi totali.
+
+    Ramo `model NOT LIKE \'failed_%\'` del selettore (extract_facts_nightly:769):
+    la riga in extraction_log esiste, ma NON esclude il chunk. In produzione
+    non è mai stato esercitato da dati reali (13 failed_persistent, 0
+    failed_1/failed_2), quindi un domani chi semplifica quella WHERE in
+    `model IS NOT NULL` non romperebbe nessun test — questo lo rompe.
+    """
+    chunks = efn.load_chunks()
+    queued = {c["id"]: c for c in chunks}
+    assert "chunk_failed_1" in queued
+    assert "chunk_failed_2" in queued
+    assert queued["chunk_failed_1"]["text"] == RETRY_1_TEXT
+    assert queued["chunk_failed_2"]["text"] == RETRY_2_TEXT
+
+
+def test_persistent_failure_stays_excluded(kb):
+    """`failed_persistent` resta fuori: è il freno al retry loop infinito.
+
+    Il ramo `model = \'failed_persistent\'` è l'unico `failed_*` che esclude.
+    Senza, i chunk che l'LLM non sa parsare (mojibake, tabelle assicurative
+    multilingua — indagine 2026-05-25) rientrerebbero ogni notte per sempre.
+    """
+    chunks = efn.load_chunks()
+    assert "chunk_failed_persistent" not in [c["id"] for c in chunks]
+    # e la riga non viene ri-marcata come scarto: resta failed_persistent
+    assert _log(kb)["chunk_failed_persistent"] == ("failed_persistent", 0)
+
+
+def test_requeued_chunk_log_row_is_not_rewritten(kb):
+    """Il rientro non tocca extraction_log: il model resta failed_N.
+
+    load_chunks scrive solo gli scarti. Se un domani marcasse anche i
+    rientri, il chunk uscirebbe dal denominatore di coverage pur non avendo
+    mai prodotto fatti.
+    """
+    before = {k: v for k, v in _log(kb).items() if k.startswith("chunk_failed_")}
+    efn.load_chunks()
+    after = {k: v for k, v in _log(kb).items() if k.startswith("chunk_failed_")}
+    assert after == before
+
 
 def test_already_extracted_chunk_is_untouched(kb):
     """Un chunk con model reale è escluso dal selettore e non ri-marcato."""
