@@ -115,10 +115,11 @@ ls ~/tailor/maintenance.lock 2>/dev/null && echo "ANCORA PRESENTE — verifica" 
 Il flush ha scritto via client separato e ha **già persistito su disco** (`_persist()`): l'HNSW in-memory del MCP in esecuzione è ora **stale** rispetto al disco. Restart **solo per rinfrescare il client** e ricaricare il pickle fresco — il restart **non** drena nulla (§0):
 
 ```sh
-sudo launchctl kickstart system/com.tailor.mcp      # rinfresca il client (vedi nota)
+sudo launchctl bootout system/com.tailor.mcp                                    # SIGTERM, verifica down
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.tailor.mcp.plist     # verifica up: PID cambiato
 ```
 
-> **Il restart non drena** — né graceful né `-k` (§0). Qui è sicuro perché il drain è **già** avvenuto via flush: il disco è persistito, quindi qualunque forma di restart è data-safe (vale il **vincolo §0**: mai riavviare con upsert in-memory non persistiti). Il graceful (senza `-k`) resta preferibile come buona prassi di shutdown pulito, **non** per un drain che non avviene.
+> **Il restart non drena** — né graceful né `-k` (§0). Qui è sicuro perché il drain è **già** avvenuto via flush: il disco è persistito, quindi qualunque forma di restart è data-safe (vale il **vincolo §0**: mai riavviare con upsert in-memory non persistiti). Il graceful (`bootout` + `bootstrap`, SIGTERM) resta preferibile come buona prassi di shutdown pulito, **non** per un drain che non avviene.
 
 ### Verifica finale (post-flush)
 

@@ -145,7 +145,7 @@ Edit a backend/runtime richiedono restart (operatore-side, sezione 3):
 
 | Modifica a | Componente da restartare | Comando |
 |---|---|---|
-| `mcp_server.py` o `scripts/lib/*.py` (importati da MCP) | MCP server | `sudo launchctl kickstart system/com.tailor.mcp` (graceful, **senza `-k`**) |
+| `mcp_server.py` o `scripts/lib/*.py` (importati da MCP) | MCP server | `sudo launchctl bootout system/com.tailor.mcp` (verifica down) poi `sudo launchctl bootstrap system /Library/LaunchDaemons/com.tailor.mcp.plist` (verifica up: PID cambiato) |
 | `scripts/services/telegram_bot.py` | Telegram bot | `sudo launchctl kickstart -k system/com.tailor.telegram` |
 | `dashboard/index.html` o `dashboard/*.jsx` | nessuno | hard-refresh in browser (Cmd+Shift+R) |
 | `config/tailor.yaml` (campi runtime) | dipende dal campo, spesso MCP | come sopra |
@@ -153,7 +153,7 @@ Edit a backend/runtime richiedono restart (operatore-side, sezione 3):
 
 L'agente riporta il comando, non lo esegue.
 
-**MCP — restart graceful di default (no `-k`)**: `-k` manda SIGKILL e salta lo shutdown pulito (`System.stop()`/atexit), che è l'unico momento in cui chromadb persiste l'indice HNSW e drena `embeddings_queue` (bug chromadb #6975). Un `kickstart -k` lascia il backlog non drenato e può lasciare l'HNSW su disco indietro rispetto a SQL. Usare il restart **graceful** (senza `-k`). `-k` resta accettabile solo per daemon che non scrivono Chroma (es. `com.tailor.telegram`), o subito dopo un `--flush-queue-backlog` che ha già persistito su disco. Procedura completa drift/queue: [docs/runbooks/RUNBOOK_drift_alert.md](docs/runbooks/RUNBOOK_drift_alert.md).
+**MCP — il restart non drena mai; l'unico vincolo è *quando* riavviare**: nessuna forma di restart persiste la WAL di chromadb. L'`atexit` / `System.stop()` di chromadb 1.5.9 **non** persiste la WAL (verificato 10/06/2026): il `PersistentClient` vive nei globals del modulo, slegato dal lifespan uvicorn, e lo shutdown ASGI non chiama `System.stop()`. Vale sia per il graceful (`bootout`/`bootstrap`) sia per `kickstart -k` (SIGKILL) — bug chromadb #6975. Il vincolo operativo non è quindi quale segnale usare, ma **mai riavviare l'MCP con upsert in-memory non ancora persistiti**, in qualunque forma di restart: un restart pre-`_persist()` li perde. Restart sicuro **solo dopo** drain confermato (audit `queue=0` oppure `--flush-queue-backlog` riuscito). Sul *come*: `bootout` + `bootstrap` perché ricarica davvero il processo (e manda SIGTERM, shutdown pulito per quel che vale); `kickstart` **senza** `-k` su un servizio già in esecuzione è un no-op — non riavvia nulla, quindi non ricarica il codice modificato. Procedura completa drift/queue: [docs/runbooks/RUNBOOK_drift_alert.md](docs/runbooks/RUNBOOK_drift_alert.md).
 
 ---
 
