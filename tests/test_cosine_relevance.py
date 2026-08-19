@@ -168,10 +168,16 @@ def _build_entity_index(path):
     """entity_index con 3 entita' che condividono chunk_id → duplicati garantiti.
 
     sorted(candidates) itera: Alburnea, Ninfa, Usufrutto (i bi/tri-grammi non matchano
-    nessuna entity). Con ORDER BY chunk_id:
-      Alburnea  → [c1, c3]
-      Ninfa     → [c1, c2]   (c1 duplica Alburnea)
-      Usufrutto → [c2, c4]   (c2 duplica Ninfa)
+    nessuna entity). Con ORDER BY chunk_id DESC:
+      Alburnea  → [c3, c1]
+      Ninfa     → [c2, c1]   (c1 duplica Alburnea)
+      Usufrutto → [c4, c2]   (c2 duplica Ninfa)
+
+    NB il DESC: il lookup ordina per chunk_id DECRESCENTE da quando il cap ha
+    smesso di tagliare il materiale recente (chunk_id cresce col tempo). Cambia
+    solo la SEQUENZA concreta degli id; le proprieta' sotto test — dedup
+    order-preserving, conteggi pre/post, un solo get() per id unico — sono
+    indifferenti al verso e restano identiche: 6 righe, 4 unici, 2 duplicati.
     """
     import sqlite3
     conn = sqlite3.connect(path)
@@ -207,13 +213,13 @@ def test_dedup_order_preserving_prima_del_cap(monkeypatch, tmp_path):
     assert pre["count"] == 4
     assert pre["unique_lost_to_cap"] == 0  # 4 < 100
 
-    # ordine di PRIMA APPARIZIONE preservato: Alburnea(c1,c3) → Ninfa(c1 dup, c2) → Usufrutto(c2 dup, c4)
+    # ordine di PRIMA APPARIZIONE preservato: Alburnea(c3,c1) → Ninfa(c2, c1 dup) → Usufrutto(c4, c2 dup)
     order = [it["chunk_id"] for it in pre["items"]]
-    assert order == ["c1", "c3", "c2", "c4"]
+    assert order == ["c3", "c1", "c2", "c4"]
     assert len(order) == len(set(order))  # nessun duplicato residuo
 
     # il cap/get ha visto SOLO unici, nell'ordine di prima apparizione, ciascuno una volta
-    assert stub.requested_ids == ["c1", "c3", "c2", "c4"]
+    assert stub.requested_ids == ["c3", "c1", "c2", "c4"]
     assert len(stub.requested_ids) == len(set(stub.requested_ids))
 
     # side effect finale: 4 chunk entity materializzati in seen_ids

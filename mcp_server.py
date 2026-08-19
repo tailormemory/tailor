@@ -140,6 +140,23 @@ DB_DIR = os.path.join(BASE_DIR, "db")
 # (altrimenti B2 alzerebbe il cap ma la metrica continuerebbe a misurare contro 100).
 ENTITY_FETCH_CAP = 100
 
+# Parole che in italiano/inglese aprono una frase e risultano capitalizzate
+# per posizione, non perche' siano entita'. Senza questo filtro "Mi dai i
+# valori..." genera il candidato "Mi", che con LIKE '%Mi%' matcha "$1 million",
+# "#MicrodosiBitcoin" e satura il cap a 100 con rumore puro.
+ENTITY_CANDIDATE_STOPWORDS = frozenset({
+    "mi", "ti", "ci", "vi", "si", "lo", "la", "le", "gli", "il", "un", "una", "uno",
+    "di", "da", "in", "con", "su", "per", "tra", "fra", "al", "del", "dal", "nel",
+    "che", "chi", "cosa", "come", "dove", "quando", "quale", "quali", "quanto",
+    "quanta", "quanti", "quante", "perche", "perché", "non", "ho", "hai", "ha",
+    "sono", "sei", "era", "e", "ma", "se", "o",
+    "dammi", "dimmi", "fammi", "riassumi", "elenca", "trova", "cerca", "mostra",
+    "spiega", "vorrei", "puoi", "potresti", "sai", "devo", "posso", "voglio",
+    "the", "what", "who", "where", "when", "why", "how", "which", "whose",
+    "give", "show", "find", "list", "tell", "can", "could", "would", "is", "are",
+    "do", "does", "did", "my", "me", "i", "a", "an", "and", "or", "but", "if",
+})
+
 # Embedding: loaded from lib.embedding (config-driven)
 from embedding import get_embedding, get_embeddings, info as embedding_info
 from embedding_contract import embedding_text, MAX_EMBED_CHARS
@@ -2121,12 +2138,26 @@ def _hybrid_collect(query: str, n_results: int, source_filter: str,
             if w1 and w3 and w1[0].isupper():
                 candidates.add(f"{w1} {w2} {w3}")
 
+        # Scarta i candidati la cui PRIMA parola e' una stopword: sono
+        # capitalizzati per posizione (inizio frase), non perche' entita'.
+        # Vale su unigrammi, bigrammi e trigrammi — il trigramma soprattutto,
+        # visto che la sua condizione richiede solo w1 capitalizzato e quindi
+        # produce anche "Mi dai i".
+        candidates = {
+            c for c in candidates
+            if c.split()[0].lower() not in ENTITY_CANDIDATE_STOPWORDS
+        }
+
         # Search each candidate nell'entity index
         # sorted() → ordine d'iterazione deterministico (candidates è un set):
         # entity_hits e a valle new_entity_ids risultano ripetibili a parità di query.
+        # ORDER BY chunk_id DESC: chunk_id cresce col tempo (misurato su 400 email,
+        # 8 inversioni su 19.900 coppie = 0,04%, arco 2010→2026), quindi il LIMIT
+        # tagliava sempre il materiale RECENTE. 8 query su 12 del corpus saturano il
+        # cap; con ASC su "Persehais" (520 chunk reali) nessuno dei 6 gold rientrava.
         for candidate in sorted(candidates):
             idx_cursor.execute(
-                "SELECT DISTINCT chunk_id FROM entity_index WHERE entity LIKE ? COLLATE NOCASE ORDER BY chunk_id LIMIT 100",
+                "SELECT DISTINCT chunk_id FROM entity_index WHERE entity LIKE ? COLLATE NOCASE ORDER BY chunk_id DESC LIMIT 100",
                 (f"%{candidate}%",)
             )
             chunk_ids = [r[0] for r in idx_cursor.fetchall()]
