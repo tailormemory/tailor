@@ -224,3 +224,231 @@ def test_lookup_entity_ordina_per_chunk_id_desc(monkeypatch, tmp_path):
     assert entity_sql, "nessun lookup sull'entity index: il test non prova nulla"
     for sql in entity_sql:
         assert "ORDER BY chunk_id DESC" in sql
+
+
+# ── FIX B: cap SQL per-candidato + diagnostico di saturazione ────────────────
+#
+# Il ramo entity ha DUE tetti distinti e per mesi ne e' stato misurato uno solo:
+#   - ENTITY_SQL_CANDIDATE_CAP → LIMIT della SELECT, per SINGOLO candidato
+#   - ENTITY_FETCH_CAP         → slice aggregato post-dedup, prima del get() Chroma
+# unique_lost_to_cap (ora unique_lost_to_fetch_cap) misura SOLO il secondo: con il
+# LIMIT letterale a 100 riportava 0 mentre la SELECT scartava due terzi dei
+# candidati. Da qui due diagnosi sbagliate. I test sotto presidiano che il LIMIT
+# resti legato alla costante e che la saturazione per-candidato sia visibile.
+
+import re as _re_test  # noqa: E402
+
+
+class _EntityFetchStub:
+    """query() semantico vuoto; get() ritorna array allineati sugli id richiesti."""
+
+    def __init__(self):
+        self.requested_ids = []
+
+    def query(self, **kwargs):
+        return {"documents": [[]], "metadatas": [[]], "distances": [[]], "ids": [[]]}
+
+    def get(self, ids=None, include=None, **kwargs):
+        ids = list(ids or [])
+        self.requested_ids.extend(ids)
+        return {
+            "ids": ids,
+            "documents": [f"doc-{c}" for c in ids],
+            "metadatas": [{"date": ""} for _ in ids],
+            "embeddings": [[0.5, 0.5, 0.5] for _ in ids],
+        }
+
+
+class _SpyCursor:
+    """Cursor reale, ma registra (sql, params) di ogni execute."""
+
+    def __init__(self, cursor, log):
+        self._cursor = cursor
+        self._log = log
+
+    def execute(self, sql, params=()):
+        self._log.append((sql, tuple(params)))
+        self._cursor.execute(sql, params)
+        return self
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+
+class _SpyConnection:
+    def __init__(self, conn, log):
+        self._conn = conn
+        self._log = log
+
+    def cursor(self):
+        return _SpyCursor(self._conn.cursor(), self._log)
+
+    def close(self):
+        self._conn.close()
+
+
+def _build_index(path, rows):
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE entity_index (entity TEXT, chunk_id TEXT)")
+    conn.executemany("INSERT INTO entity_index VALUES (?, ?)", rows)
+    conn.commit()
+    conn.close()
+
+
+@pytest.fixture
+def sql_cap_env(monkeypatch, tmp_path):
+    """entity_index REALE (5 chunk distinti per 'Ninfa', uno ripetuto) + spy SQL.
+
+    La SELECT gira davvero su SQLite: il LIMIT e il COUNT(DISTINCT) sono valutati
+    dal motore, non simulati — cosi' matched_count/returned_count sono i numeri
+    veri e non una copia della logica re-implementata nel test.
+    """
+    db = tmp_path / "entity_index.sqlite3"
+    _build_index(str(db), [
+        ("Ninfa", "c1"), ("Ninfa", "c2"), ("Ninfa", "c3"),
+        ("Ninfa", "c4"), ("Ninfa", "c5"),
+        ("Ninfa", "c5"),  # duplicato: COUNT(DISTINCT) deve dire 5, non 6
+    ])
+
+    stub = _EntityFetchStub()
+    monkeypatch.setattr(mcp_server, "DB_DIR", str(tmp_path))
+    monkeypatch.setattr(mcp_server, "get_embedding", lambda q: [0.5, 0.5, 0.5])
+    monkeypatch.setattr(mcp_server, "get_collection", lambda: stub)
+    monkeypatch.setattr(mcp_server, "_get_collection_readonly", lambda: stub)
+
+    log: list[tuple[str, tuple]] = []
+    real_connect = sqlite3.connect
+    monkeypatch.setattr(
+        sqlite3, "connect",
+        lambda *a, **k: _SpyConnection(real_connect(*a, **k), log),
+    )
+
+    def _run(query="Ninfa", diag=True):
+        log.clear()
+        stub.requested_ids.clear()
+        return mcp_server._hybrid_collect(
+            query, n_results=5, source_filter="",
+            include_superseded=True, diag=diag,
+        )
+
+    return _run, log, stub
+
+
+def _lookups(log):
+    return [(s, p) for (s, p) in log if "entity_index" in s and "SELECT DISTINCT" in s]
+
+
+def _counts(log):
+    return [(s, p) for (s, p) in log if "entity_index" in s and "COUNT(" in s]
+
+
+def test_limit_e_parametrizzato_non_letterale(sql_cap_env, monkeypatch):
+    """Il LIMIT arriva come bind param dalla costante, non come numero nella SQL."""
+    run, log, _ = sql_cap_env
+    monkeypatch.setattr(mcp_server, "ENTITY_SQL_CANDIDATE_CAP", 3)
+    run()
+
+    found = _lookups(log)
+    assert found, "nessun lookup sull'entity index: il test non prova nulla"
+    for sql, params in found:
+        assert "LIMIT ?" in sql
+        # nessun letterale residuo (il vecchio "LIMIT 100")
+        assert _re_test.search(r"LIMIT\s+\d", sql) is None
+        assert params[-1] == 3
+        # invarianti che il fix non deve toccare
+        assert "ORDER BY chunk_id DESC" in sql
+        assert params[0] == "%Ninfa%"
+
+
+def test_mutation_cambiare_la_costante_cambia_il_limit(sql_cap_env, monkeypatch):
+    """Presidio anti-hardcode: due valori diversi → due LIMIT diversi.
+
+    Senza questo, un LIMIT reinserito come letterale che per caso coincide con la
+    costante passerebbe il test sopra sul solo `params[-1]`.
+    """
+    run, log, _ = sql_cap_env
+
+    monkeypatch.setattr(mcp_server, "ENTITY_SQL_CANDIDATE_CAP", 2)
+    run()
+    assert [p[-1] for _, p in _lookups(log)] == [2]
+
+    monkeypatch.setattr(mcp_server, "ENTITY_SQL_CANDIDATE_CAP", 4)
+    run()
+    assert [p[-1] for _, p in _lookups(log)] == [4]
+
+
+def test_candidato_saturo_compare_con_lost_corretto(sql_cap_env, monkeypatch):
+    run, log, _ = sql_cap_env
+    monkeypatch.setattr(mcp_server, "ENTITY_SQL_CANDIDATE_CAP", 3)
+
+    out = run()
+    pre = out["stages"]["entity_candidates_pre_cap"]
+
+    assert pre["entity_sql_cap"] == 3
+    assert pre["entity_sql_cap_saturated"] == [{
+        "entity": "Ninfa",
+        "matched_count": 5,     # COUNT(DISTINCT): il c5 ripetuto non conta due volte
+        "returned_count": 3,
+        "lost": 2,
+    }]
+    # il COUNT si paga una sola volta, solo per il candidato saturo
+    assert len(_counts(log)) == 1
+
+
+def test_candidato_non_saturo_lista_vuota_e_nessun_count(sql_cap_env, monkeypatch):
+    """Il caso normale non deve pagare la query in piu'."""
+    run, log, _ = sql_cap_env
+    monkeypatch.setattr(mcp_server, "ENTITY_SQL_CANDIDATE_CAP", 10)
+
+    out = run()
+    pre = out["stages"]["entity_candidates_pre_cap"]
+
+    assert pre["entity_sql_cap_saturated"] == []
+    assert pre["entity_sql_cap"] == 10
+    assert _counts(log) == []
+    assert len(_lookups(log)) == 1
+
+
+def test_cap_esatto_senza_perdita_non_e_saturazione(sql_cap_env, monkeypatch):
+    """righe == cap ma matched == returned: il COUNT gira, la lista resta vuota.
+
+    E' il confine: `matched_count > returned_count` e' la condizione, non
+    `len(righe) == cap`.
+    """
+    run, log, _ = sql_cap_env
+    monkeypatch.setattr(mcp_server, "ENTITY_SQL_CANDIDATE_CAP", 5)
+
+    out = run()
+    pre = out["stages"]["entity_candidates_pre_cap"]
+
+    assert len(_counts(log)) == 1        # il COUNT viene eseguito...
+    assert pre["entity_sql_cap_saturated"] == []  # ...ma non c'e' nulla di perso
+
+
+def test_unique_lost_to_fetch_cap_misura_entity_fetch_cap(sql_cap_env, monkeypatch):
+    """Il campo rinominato resta agganciato al cap AGGREGATO, non a quello SQL."""
+    run, log, stub = sql_cap_env
+    monkeypatch.setattr(mcp_server, "ENTITY_SQL_CANDIDATE_CAP", 10)  # non satura
+    monkeypatch.setattr(mcp_server, "ENTITY_FETCH_CAP", 2)
+
+    out = run()
+    pre = out["stages"]["entity_candidates_pre_cap"]
+
+    assert pre["unique_count"] == 5
+    assert pre["unique_lost_to_fetch_cap"] == 3          # 5 unici - 2 di cap
+    assert "unique_lost_to_cap" not in pre               # vecchio nome rimosso
+    assert pre["entity_sql_cap_saturated"] == []         # l'altro cap non c'entra
+    assert stub.requested_ids == ["c5", "c4"]            # slice effettivo, DESC
+
+    monkeypatch.setattr(mcp_server, "ENTITY_FETCH_CAP", 5)
+    pre2 = run()["stages"]["entity_candidates_pre_cap"]
+    assert pre2["unique_lost_to_fetch_cap"] == 0
+
+
+def test_default_costanti_allineati_alla_misura_del_corpus():
+    """700/700: sotto questo valore la copertura misurata torna a 11/21."""
+    assert mcp_server.ENTITY_SQL_CANDIDATE_CAP == 700
+    assert mcp_server.ENTITY_FETCH_CAP == 700

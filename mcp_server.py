@@ -131,14 +131,25 @@ apply_pending_rollback(os.path.join(BASE_DIR, "config", "tailor.yaml"))
 
 DB_DIR = os.path.join(BASE_DIR, "db")
 
-# Cap sui candidati entity fetchati in _hybrid_collect() STEP 3. Agisce PRIMA di
-# qualsiasi ranking: limita quanti chunk_id (deduplicati, order-preserving) vengono
-# materializzati via collection.get() prima che il cosine li ordini. Il fetch costa
-# ~10ms/100 chunk, quindi 100 potrebbe essere conservativo — valore SOTTO REVISIONE
-# (Livello B2). Usato sia dallo slice reale sia dalla metrica diag unique_lost_to_cap:
-# tenerli sulla stessa costante rende la coincidenza strutturale, non accidentale
-# (altrimenti B2 alzerebbe il cap ma la metrica continuerebbe a misurare contro 100).
-ENTITY_FETCH_CAP = 100
+# Cap SQL per SINGOLO candidato. Distinto da ENTITY_FETCH_CAP (aggregato,
+# post-dedup): serve a impedire che un candidato larghissimo (YOUniversal
+# = 33.093 chunk) faccia esplodere SQLite e il fetch Chroma a valle.
+# 700 copre p75/p80 dei candidati reali misurati sul corpus (Ippocrate 378,
+# Persehais 520, Marche 661) senza inseguire la coda lunga.
+ENTITY_SQL_CANDIDATE_CAP = 700
+
+# Cap AGGREGATO sui candidati entity fetchati in _hybrid_collect() STEP 3, applicato
+# dopo il dedup order-preserving fra tutti i candidati. Agisce PRIMA di qualsiasi
+# ranking: limita quanti chunk_id vengono materializzati via collection.get() prima
+# che il cosine li ordini. A 100 tagliava 10/21 candidati misurati sul corpus; a 700
+# la copertura passa da 11/21 a 17/21, e oltre 700 rientrano solo le entita'
+# larghissime (Yahoo 5.760, YOUniversal 33.093) che sono rumore.
+# Usato sia dallo slice reale sia dalla metrica diag unique_lost_to_fetch_cap:
+# tenerli sulla stessa costante rende la coincidenza strutturale, non accidentale.
+# NB: il tetto per-candidato e' ENTITY_SQL_CANDIDATE_CAP sopra — sono due cap
+# distinti, e la metrica qui misura SOLO questo (unique_lost_to_fetch_cap);
+# la saturazione dell'altro sta in entity_sql_cap_saturated.
+ENTITY_FETCH_CAP = 700
 
 # Parole che in italiano/inglese aprono una frase e risultano capitalizzate
 # per posizione, non perche' siano entita'. Senza questo filtro "Mi dai i
@@ -2109,6 +2120,7 @@ def _hybrid_collect(query: str, n_results: int, source_filter: str,
     # --- STEP 2: Extract candidate entities from the query ---
     _t1 = _now()
     entity_hits = []
+    entity_sql_saturated = []  # candidati che hanno toccato ENTITY_SQL_CANDIDATE_CAP
     if os.path.exists(ENTITY_DB_PATH):
         idx_conn = _sqlite3.connect(f"file:{ENTITY_DB_PATH}?mode=ro", uri=True)
         idx_cursor = idx_conn.cursor()
@@ -2155,12 +2167,37 @@ def _hybrid_collect(query: str, n_results: int, source_filter: str,
         # 8 inversioni su 19.900 coppie = 0,04%, arco 2010→2026), quindi il LIMIT
         # tagliava sempre il materiale RECENTE. 8 query su 12 del corpus saturano il
         # cap; con ASC su "Persehais" (520 chunk reali) nessuno dei 6 gold rientrava.
+        # LIMIT parametrizzato su ENTITY_SQL_CANDIDATE_CAP (non f-string: il valore
+        # passa come bind param, cosi' la SQL resta una sola statement cacheabile e
+        # non c'e' modo di interpolare per sbaglio input non numerico).
         for candidate in sorted(candidates):
+            like = f"%{candidate}%"
             idx_cursor.execute(
-                "SELECT DISTINCT chunk_id FROM entity_index WHERE entity LIKE ? COLLATE NOCASE ORDER BY chunk_id DESC LIMIT 100",
-                (f"%{candidate}%",)
+                "SELECT DISTINCT chunk_id FROM entity_index WHERE entity LIKE ? COLLATE NOCASE "
+                "ORDER BY chunk_id DESC LIMIT ?",
+                (like, ENTITY_SQL_CANDIDATE_CAP)
             )
             chunk_ids = [r[0] for r in idx_cursor.fetchall()]
+            # COUNT separato SOLO se il candidato ha riempito il cap: nel caso normale
+            # (righe < cap) matched == returned per costruzione e la query in piu' non
+            # si paga. Il LIKE '%...%' e' un full scan, quindi il COUNT raddoppia il
+            # costo del lookup — per questo e' anche subordinato a diag: il campo
+            # entity_sql_cap_saturated esiste solo nell'output diagnostico.
+            if diag and len(chunk_ids) == ENTITY_SQL_CANDIDATE_CAP:
+                idx_cursor.execute(
+                    "SELECT COUNT(DISTINCT chunk_id) FROM entity_index "
+                    "WHERE entity LIKE ? COLLATE NOCASE",
+                    (like,)
+                )
+                _row = idx_cursor.fetchone()
+                _matched = int(_row[0]) if _row and _row[0] is not None else len(chunk_ids)
+                if _matched > len(chunk_ids):
+                    entity_sql_saturated.append({
+                        "entity": candidate,
+                        "matched_count": _matched,
+                        "returned_count": len(chunk_ids),
+                        "lost": _matched - len(chunk_ids),
+                    })
             if chunk_ids:
                 entity_hits.append({"entity": candidate, "chunk_ids": chunk_ids})
 
@@ -2177,7 +2214,7 @@ def _hybrid_collect(query: str, n_results: int, source_filter: str,
     # NB perche' i due numeri non si contraddicono: i duplicati NON sono distribuiti
     # uniformemente, si CONCENTRANO oltre il cap. Le entita' sono iterate in ordine
     # alfabetico (sorted(candidates)); le prime emettono chunk nuovi, le successive
-    # ripetono in gran parte chunk gia' emessi. Nei primi ENTITY_FETCH_CAP slot cadono
+    # ripetono in gran parte chunk gia' emessi. Nei primi 100 slot (cap storico) cadono
     # solo ~2 doppioni (→ ~98 unici su 100), mentre i restanti ~166 duplicati stanno
     # TUTTI dopo il cap. Quindi senza dedup il cap taglia una lista gonfiata alla coda
     # ma quasi-pulita in testa. Dedup: seen-set + lista, NON set() nudo — l'ordine di
@@ -2203,7 +2240,11 @@ def _hybrid_collect(query: str, n_results: int, source_filter: str,
             "rows_appended": _rows_appended,          # totale righe pre-dedup (vecchio count)
             "unique_count": _unique_count,            # unici dopo dedup
             "duplicates_dropped": _rows_appended - _unique_count,
-            "unique_lost_to_cap": max(0, _unique_count - ENTITY_FETCH_CAP),  # unici scartati dal cap
+            # scartati dal cap AGGREGATO (ENTITY_FETCH_CAP), non da quello per-candidato
+            "unique_lost_to_fetch_cap": max(0, _unique_count - ENTITY_FETCH_CAP),
+            # candidati che hanno saturato il cap SQL per-candidato: lista vuota se nessuno
+            "entity_sql_cap_saturated": entity_sql_saturated,
+            "entity_sql_cap": ENTITY_SQL_CANDIDATE_CAP,
             "entities_recognized": [h["entity"] for h in entity_hits],
             "items": [{"chunk_id": c, "rank": i, "score": None,
                        "source_type": "entity", "doc_type": None}

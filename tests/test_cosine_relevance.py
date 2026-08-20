@@ -211,7 +211,7 @@ def test_dedup_order_preserving_prima_del_cap(monkeypatch, tmp_path):
     assert pre["unique_count"] == 4
     assert pre["duplicates_dropped"] == 2
     assert pre["count"] == 4
-    assert pre["unique_lost_to_cap"] == 0  # 4 < 100
+    assert pre["unique_lost_to_fetch_cap"] == 0  # 4 < ENTITY_FETCH_CAP
 
     # ordine di PRIMA APPARIZIONE preservato: Alburnea(c3,c1) → Ninfa(c2, c1 dup) → Usufrutto(c4, c2 dup)
     order = [it["chunk_id"] for it in pre["items"]]
