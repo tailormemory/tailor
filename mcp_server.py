@@ -3767,7 +3767,7 @@ def read_personal_doc(
     Returns content[offset:offset+length] with metadata. Use offset/length
     to paginate large files.
 
-    Supported extensions: .txt .md .csv .pdf .docx .xlsx
+    Supported extensions: .txt .md .csv .pdf .doc .docx .xlsx
     Whitelisted folders: configured in tailor.yaml under ingest.document_paths.
 
     Args:
@@ -3815,7 +3815,7 @@ def read_personal_doc(
         err_key, default_detail = mapping.get(e.reason, ("invalid_path", str(e)))
         return {"error": err_key, "detail": default_detail}
 
-    SUPPORTED = {".txt", ".md", ".csv", ".pdf", ".docx", ".xlsx"}
+    SUPPORTED = {".txt", ".md", ".csv", ".pdf", ".doc", ".docx", ".xlsx"}
     ext = os.path.splitext(abs_path)[1].lower()
     if ext not in SUPPORTED:
         return {
@@ -3833,8 +3833,12 @@ def read_personal_doc(
             with open(abs_path, encoding="utf-8", errors="replace") as f:
                 full_text = f.read()
         else:
-            # .csv .pdf .docx .xlsx — reuse ingest extractors. They return
+            # .csv .pdf .doc .docx .xlsx — reuse ingest extractors. They return
             # list[{"text": ..., "metadata": ...}]; we concat the .text fields.
+            # extract_text routes .doc to extract_doc (/usr/bin/textutil): nessun
+            # ramo dedicato qui, stesso contratto degli altri — non solleva mai,
+            # ritorna [] quando non c'e' testo, quindi content="" come un .pdf
+            # illeggibile.
             from scripts.ingest.ingest_docs import extract_text as _extract_text
             sections = _extract_text(abs_path)
             full_text = "\n\n".join(s.get("text", "") for s in sections)
