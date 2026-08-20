@@ -7,6 +7,7 @@ Features:
 - Excel (.xlsx, .xls): extracts text per sheet via openpyxl
 - CSV/TSV: extracts text as table
 - Word (.docx): extracts text per paragraph + tables via python-docx
+- Word legacy (.doc): extracts text via /usr/bin/textutil (macOS only)
 - PowerPoint (.pptx): extracts text per slide via python-pptx
 - Markdown (.md, .markdown): extracts text per header section (header+fence aware)
 - Chunking with v2 logic (target ~1200 chars)
@@ -1136,6 +1137,69 @@ def extract_docx(filepath):
     return sections
 
 
+# textutil e' nativo macOS (/usr/bin, non installabile via pip): path assoluto
+# per non dipendere dal PATH del daemon che lancia l'ingest.
+TEXTUTIL_BIN = "/usr/bin/textutil"
+DOC_EXTRACT_TIMEOUT = 20
+
+
+def extract_doc(filepath):
+    """Estrae testo da .doc (Word 97-2003) via /usr/bin/textutil.
+
+    python-docx apre solo OOXML: il .doc binario legacy richiede un decoder
+    esterno, e textutil e' gia' sul sistema — zero dipendenze nuove.
+
+    Contratto identico agli altri estrattori: non solleva mai, ritorna [] quando
+    non c'e' testo. Il chiamante marca "no_text_extracted", lascia intatti i
+    chunk gia' in KB e passa al file successivo — un .doc corrotto o sparito non
+    ferma il batch.
+
+    L'unico caso non-silenzioso e' textutil assente (non-macOS): il messaggio
+    nomina il binario mancante invece di far passare tutti i .doc per "vuoti".
+    """
+    import subprocess
+
+    sections = []
+    try:
+        # Lista di argomenti, mai shell: i path reali contengono spazi,
+        # apostrofi e accenti e qualunque quoting a mano sarebbe una bomba.
+        proc = subprocess.run(
+            [TEXTUTIL_BIN, "-convert", "txt", "-stdout", filepath],
+            capture_output=True,
+            timeout=DOC_EXTRACT_TIMEOUT,
+        )
+    except FileNotFoundError:
+        print(f"    ERRORE DOC {filepath}: {TEXTUTIL_BIN} non trovato — "
+              f"l'estrazione .doc richiede macOS")
+        return sections
+    except subprocess.TimeoutExpired:
+        print(f"    ERRORE DOC {filepath}: textutil timeout "
+              f"({DOC_EXTRACT_TIMEOUT}s)")
+        return sections
+    except Exception as e:
+        print(f"    ERRORE DOC {filepath}: {e}")
+        return sections
+
+    if proc.returncode != 0:
+        stderr = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
+        print(f"    ERRORE DOC {filepath}: textutil rc={proc.returncode} {stderr}")
+        return sections
+
+    text = (proc.stdout or b"").decode("utf-8", errors="replace").strip()
+    if not text:
+        print(f"    ERRORE DOC {filepath}: textutil ha prodotto output vuoto")
+        return sections
+
+    sections.append({
+        "text": text,
+        "metadata": {
+            "extractor": "textutil",
+            "char_count": len(text),
+        },
+    })
+    return sections
+
+
 def extract_pptx(filepath):
     """Estrae testo da .pptx via python-pptx. Una sezione per slide."""
     from pptx import Presentation
@@ -1280,6 +1344,8 @@ def extract_text(filepath, doctype=None):
         return extract_csv(filepath)
     elif ext == ".docx":
         return extract_docx(filepath)
+    elif ext == ".doc":
+        return extract_doc(filepath)
     elif ext == ".pptx":
         return extract_pptx(filepath)
     elif ext in (".md", ".markdown"):
