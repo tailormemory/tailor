@@ -340,7 +340,7 @@ def test_perimetro_include_i_gia_purgati_dal_checkpoint(monkeypatch):
     """Il purge cancella l'entry di registry: senza il checkpoint il perimetro
     si accorcerebbe a ogni run e la validazione del piano abortirebbe."""
     a, b = "/w/a.xlsx", "/w/b.xlsx"
-    monkeypatch.setattr(ing, "load_denylist", lambda: {a, b})
+    monkeypatch.setattr(ing, "load_denylist", lambda path=None: {a, b})
 
     # stato iniziale: entrambi in registry
     per, off = purge.resolve_perimeter({a: {"hash": "h1"}, b: {"hash": "h2"}}, {})
@@ -375,7 +375,7 @@ def exec_env(facts_db, tmp_path, monkeypatch):
                         lambda *a, **k: {"facts": 0})
     monkeypatch.setattr(ing, "acquire_single_instance_lock",
                         lambda *a, **k: open(os.devnull))
-    monkeypatch.setattr(ing, "load_denylist", lambda: {path})
+    monkeypatch.setattr(ing, "load_denylist", lambda p=None: {path})
     monkeypatch.setattr(ing, "save_registry", lambda reg: None)
     monkeypatch.setattr(ing, "infer_folder", lambda p: "W")
 
@@ -543,7 +543,8 @@ def test_dry_run_gira_su_stato_post_resume_parziale(facts_db, tmp_path,
     monkeypatch.setattr(purge, "CHECKPOINT_PATH", str(tmp_path / "ck.done"))
     monkeypatch.setattr(purge, "CHROMA_SQLITE",
                         _fake_chroma(tmp_path, [OTHER_HASH], extra_rows=4))
-    monkeypatch.setattr(ing, "load_denylist", lambda: {purgato, rimasto})
+    monkeypatch.setattr(ing, "load_denylist",
+                        lambda path=None: {purgato, rimasto})
     monkeypatch.setattr(ing, "load_registry",
                         lambda: {rimasto: {"hash": OTHER_HASH + "0" * 52,
                                            "chunks": 2}})
@@ -621,3 +622,113 @@ def test_audit_resta_rosso_se_manca_un_derivato_della_quarantena(
     con.execute("DELETE FROM facts WHERE id=?", (plan["quarantine"][0]["id"],))
     con.commit(); con.close()
     assert purge.audit_state(in_reg, plan, log=lambda m: None) == 1
+
+
+# ============================================================================
+# STATO PER-RUN — --perimeter / --run-id
+# ============================================================================
+@pytest.fixture
+def run_state(monkeypatch):
+    """apply_run() muta i globals: li registra per il ripristino a fine test."""
+    for name in ("RUN_ID", "PERIMETER_FILE", "CHECKPOINT_PATH",
+                 "DERIVED_PLAN_PATH", "PURGE_DATE"):
+        monkeypatch.setattr(purge, name, getattr(purge, name))
+    return purge
+
+
+def test_run_id_default_riproduce_i_path_di_oggi(run_state):
+    """Il default non e' "quasi" il comportamento storico: e' quello."""
+    purge.apply_run(purge.DEFAULT_RUN_ID)
+    assert purge.CHECKPOINT_PATH == os.path.join(
+        purge.LOGS_DIR, "purge_lowvalue_docs.done")
+    assert purge.DERIVED_PLAN_PATH == os.path.join(
+        purge.LOGS_DIR, "purge_lowvalue_derived_plan.json")
+    assert purge.PERIMETER_FILE == ing.DENYLIST_FILE
+    assert purge.PURGE_DATE == "2026-07-20"
+
+
+def test_run_id_nuovo_non_tocca_i_file_del_purge_contabile(run_state, tmp_path):
+    """Checkpoint e piano di luglio sono l'unico record di quella quarantena.
+
+    Se un altro purge li riusasse, le sentinelle __SUMMARIES__/__DERIVED__ gli
+    farebbero saltare le fasi 2 e 3 in silenzio.
+    """
+    per = tmp_path / "hr.paths"
+    per.write_text("/w/a.pdf\n")
+    luglio_ck, luglio_plan = purge.CHECKPOINT_PATH, purge.DERIVED_PLAN_PATH
+
+    purge.apply_run("hr_20260820", str(per), "2026-08-20")
+
+    assert purge.CHECKPOINT_PATH != luglio_ck
+    assert purge.DERIVED_PLAN_PATH != luglio_plan
+    assert purge.CHECKPOINT_PATH.endswith("purge_hr_20260820_docs.done")
+    assert purge.DERIVED_PLAN_PATH.endswith(
+        "purge_hr_20260820_derived_plan.json")
+    assert purge.PERIMETER_FILE == str(per)
+    assert purge.PURGE_DATE == "2026-08-20"
+
+
+def test_perimetro_letto_dal_file_indicato(run_state, tmp_path):
+    """Nessun monkeypatch su load_denylist: e' il parser vero a leggere."""
+    per = tmp_path / "hr.paths"
+    per.write_text("# perimetro HR\n\n/w/hr/a.pdf\n/w/hr/b.docx\n")
+    purge.apply_run("hr_20260820", str(per), "2026-08-20")
+
+    in_reg, off = purge.resolve_perimeter(
+        {"/w/hr/a.pdf": {"hash": "h1"}, "/w/altro.pdf": {"hash": "h9"}}, {})
+
+    assert [p for p, _ in in_reg] == ["/w/hr/a.pdf"], "solo i path del file"
+    assert off == ["/w/hr/b.docx"]
+
+
+def test_baseline_expected_solo_sul_purge_contabile(run_state, capsys):
+    """Con un altro perimetro le 8 divergenze sarebbero certe e senza senso:
+    stampare numeri misurati e nessun giudizio e' l'unica cosa onesta."""
+    args = dict(deleted=1, doc_chunks=1, summaries=0, kb_after=1, docs=1,
+                quarantined=0, superseded=0, kb_before=2)
+
+    purge.apply_run(purge.DEFAULT_RUN_ID)
+    assert purge._audit_expected(**args) == len(purge.EXPECTED)
+    assert "DIVERGENZA" in capsys.readouterr().out
+
+    purge.apply_run("hr_20260820", "/dev/null", "2026-08-20")
+    assert purge._audit_expected(**args) == 0
+    out = capsys.readouterr().out
+    assert "DIVERGENZA" not in out
+    assert "nessuna baseline" in out
+
+
+def test_cli_run_id_nuovo_esige_perimetro_e_data(run_state, monkeypatch, capsys):
+    """Senza il vincolo, --run-id da solo purgherebbe la denylist contabile
+    scrivendola sotto uno slug nuovo, con la data di luglio nei marker."""
+    monkeypatch.setattr(sys, "argv", ["purge", "--run-id", "hr_20260820"])
+    with pytest.raises(SystemExit) as e:
+        purge.main()
+    assert e.value.code == 2
+    assert "--perimeter e --purge-date" in capsys.readouterr().err
+
+
+def test_cli_run_id_non_finisce_in_un_path(run_state, monkeypatch):
+    """Lo slug diventa un nome di file: niente separatori."""
+    monkeypatch.setattr(sys, "argv", ["purge", "--run-id", "../../etc/x",
+                                      "--perimeter", "/dev/null",
+                                      "--purge-date", "2026-08-20"])
+    with pytest.raises(SystemExit) as e:
+        purge.main()
+    assert e.value.code == 2
+
+
+def test_cli_applica_il_run_prima_di_eseguire(run_state, monkeypatch, tmp_path):
+    """apply_run deve girare PRIMA di dry_run/execute, non dopo."""
+    per = tmp_path / "hr.paths"
+    per.write_text("/w/a.pdf\n")
+    visto = {}
+    monkeypatch.setattr(purge, "dry_run",
+                        lambda show: visto.update(ck=purge.CHECKPOINT_PATH,
+                                                  per=purge.PERIMETER_FILE) or 0)
+    monkeypatch.setattr(sys, "argv", ["purge", "--run-id", "hr_20260820",
+                                      "--perimeter", str(per),
+                                      "--purge-date", "2026-08-20"])
+    assert purge.main() == 0
+    assert visto["ck"].endswith("purge_hr_20260820_docs.done")
+    assert visto["per"] == str(per)

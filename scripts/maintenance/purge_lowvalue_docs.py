@@ -91,6 +91,36 @@ a meta' purge, con parte dei facts gia' spariti, darebbe una lista di
 contaminati piu' corta e lascerebbe derivati sporchi in circolazione.
 
 ================================================================================
+PERIMETRO E STATO PER-RUN (--perimeter / --run-id)
+================================================================================
+La logica a tre livelli non dipende da QUALE perimetro: dipende dall'avere una
+lista di path. Due flag la rendono esplicita, e i default sono il purge
+contabile di sempre.
+
+  * --perimeter FILE  lista di path assoluti da purgare. Stesso formato e
+    stesso parser della denylist (ing.load_denylist): path esatti, '#'
+    commento. Default: config/ingest_denylist.txt.
+  * --run-id SLUG     lega fra loro i file di stato di QUESTO purge:
+    logs/purge_<slug>_docs.done e logs/purge_<slug>_derived_plan.json.
+    Default 'lowvalue' -> gli stessi path di prima, byte per byte.
+
+Lo slug non e' cosmesi. Il checkpoint porta le sentinelle di fase
+__SUMMARIES__/__DERIVED__: un secondo purge che riusasse il checkpoint del
+primo si vedrebbe saltare in silenzio le fasi 2 e 3 ("gia' fatta, salto") e
+chiuderebbe verde avendo cancellato i soli chunk dei documenti. Il piano
+derivati persistito, dal canto suo, verrebbe rifiutato da validate_plan
+(bloccando il run) o — se i due perimetri si somigliassero — riusato.
+
+Un --run-id diverso dal default ESIGE --perimeter e --purge-date: ereditare in
+silenzio la denylist contabile o la data di luglio significa purgare la cosa
+sbagliata o scrivere marker di provenienza falsi.
+
+Il perimetro NON deve per forza essere una denylist. Per un perimetro definito
+da ingest.ignore_folders (che pota l'albero per nome di cartella in os.walk) il
+rientro allo scan e' gia' impedito a monte: il file serve solo a dire QUALI
+path purgare, e la denylist resterebbe ridondanza che mente sul perche' e' li'.
+
+================================================================================
 SEQUENZA OPERATIVA (di Emiliano — lo script non tocca daemon/launchctl)
 ================================================================================
     1. maintenance ON:  kill -USR1 <mcp_pid>
@@ -161,14 +191,24 @@ from reingest_xlsx import (                                        # noqa: E402
 )
 
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
-CHECKPOINT_PATH = os.path.join(LOGS_DIR, "purge_lowvalue_docs.done")
-DERIVED_PLAN_PATH = os.path.join(LOGS_DIR, "purge_lowvalue_derived_plan.json")
+
+# --- stato per-run: un perimetro + i suoi file di stato, tenuti insieme dallo
+# slug e separati da quelli di ogni altro purge (vedi docstring). Con lo slug
+# di default i path sono esattamente quelli storici.
+DEFAULT_RUN_ID = "lowvalue"
+RUN_ID = DEFAULT_RUN_ID
+PERIMETER_FILE = ing.DENYLIST_FILE
+CHECKPOINT_PATH = os.path.join(LOGS_DIR, f"purge_{RUN_ID}_docs.done")
+DERIVED_PLAN_PATH = os.path.join(LOGS_DIR, f"purge_{RUN_ID}_derived_plan.json")
 FACTS_DB = os.path.join(ing.DB_DIR, "facts.sqlite3")
 CHROMA_SQLITE = os.path.join(ing.DB_DIR, "chroma.sqlite3")
 
 # Marker di provenienza scritto nei derivati messi in quarantena. Costante e
 # non datetime.now(): il valore deve restare identico tra il primo run e un
 # eventuale resume, altrimenti lo stesso purge lascia marker con date diverse.
+# Con --run-id non di default arriva da --purge-date, e vale lo stesso vincolo:
+# la si ripassa identica a ogni resume, e validate_plan boccia una data diversa
+# da quella del piano su disco.
 PURGE_DATE = "2026-07-20"
 QUARANTINE_RELATION = "derived_purged_source"
 
@@ -184,6 +224,10 @@ SENTINEL_DERIVED = "__DERIVED__"
 # ATTESI — misurati sulla KB del 2026-07-20 a maintenance ferma. Servono da
 # audit: una divergenza significa che la KB si e' mossa sotto i piedi (nightly
 # entrato in finestra, ingest concorrente) e il risultato va guardato a mano.
+# Sono la baseline del purge `lowvalue` E DI NESSUN ALTRO: con un run_id
+# diverso non c'e' niente con cui confrontarsi e il blocco viene saltato,
+# perche' 8 divergenze certe e prive di significato addestrano a ignorarle.
+EXPECTED_RUN_ID = DEFAULT_RUN_ID
 EXPECTED = {
     "docs": 21,
     "doc_chunks": 51_090,
@@ -196,11 +240,29 @@ EXPECTED = {
 }
 
 
+def apply_run(run_id: str, perimeter: str | None = None,
+              purge_date: str | None = None) -> None:
+    """Punta lo stato del modulo al purge `run_id`. Chiamata una volta da main().
+
+    Muta i globals invece di far girare un contesto: lo script e' costruito su
+    costanti di modulo, ed e' li' che i test montano i loro monkeypatch.
+    Con lo slug di default i tre path ricalcolati sono identici a quelli
+    storici — e' un test, non una speranza.
+    """
+    global RUN_ID, PERIMETER_FILE, CHECKPOINT_PATH, DERIVED_PLAN_PATH, PURGE_DATE
+    RUN_ID = run_id
+    PERIMETER_FILE = perimeter or ing.DENYLIST_FILE
+    CHECKPOINT_PATH = os.path.join(LOGS_DIR, f"purge_{run_id}_docs.done")
+    DERIVED_PLAN_PATH = os.path.join(LOGS_DIR, f"purge_{run_id}_derived_plan.json")
+    if purge_date:
+        PURGE_DATE = purge_date
+
+
 # ============================================================================
 # PERIMETRO
 # ============================================================================
 def resolve_perimeter(registry: dict, done: dict[str, str] | None = None):
-    """(perimetro, off_registry) dalla denylist. Nessun pattern: path esatti.
+    """(perimetro, off_registry) da PERIMETER_FILE. Nessun pattern: path esatti.
 
     perimetro: [(filepath, hash12)] dei documenti INDICIZZATI — quelli ancora
     in registry PIU' quelli gia' purgati, che dal registry sono spariti ma
@@ -213,17 +275,16 @@ def resolve_perimeter(registry: dict, done: dict[str, str] | None = None):
     finale guarderebbe solo i documenti rimasti, dichiarando verde un purge
     incompleto. Il checkpoint e' cio' che rende il perimetro stabile.
 
-    off_registry: path denylistati mai indicizzati (le copie deduplicate per
-    hash all'ingest). Niente da cancellare: stanno in denylist per non
-    rientrare domani. Un path gia' purgato NON finisce qui — lo distingue la
-    presenza nel checkpoint.
+    off_registry: path in perimetro mai indicizzati (per il purge contabile:
+    le copie deduplicate per hash all'ingest). Niente da cancellare. Un path
+    gia' purgato NON finisce qui — lo distingue la presenza nel checkpoint.
     """
     done = done or {}
-    denylist = ing.load_denylist()
+    wanted = ing.load_denylist(PERIMETER_FILE)
     reg_norm = {os.path.normpath(p): p for p in registry}
     done_norm = {os.path.normpath(p): (p, h) for p, h in done.items()}
     perimeter, off_reg = [], []
-    for path in sorted(denylist):
+    for path in sorted(wanted):
         real = reg_norm.get(path)
         if real is not None:
             perimeter.append((real, (registry[real].get("hash") or "")[:12]))
@@ -512,13 +573,13 @@ def _assert_maintenance(stage: str) -> None:
 # ============================================================================
 def dry_run(show: int) -> int:
     print("=" * 78)
-    print("PURGE DOCUMENTI CONTABILI — DRY-RUN (READ-ONLY, zero scritture)")
+    print(f"PURGE — DRY-RUN (READ-ONLY, zero scritture)   run_id={RUN_ID}")
     print("=" * 78)
-    print(f"[denylist] {ing.DENYLIST_FILE}")
+    print(f"[perimetro] {PERIMETER_FILE}")
     registry = ing.load_registry()
     done = load_checkpoint()
     in_reg, off_reg = resolve_perimeter(registry, done)
-    print(f"[denylist] {len(in_reg) + len(off_reg)} path "
+    print(f"[perimetro] {len(in_reg) + len(off_reg)} path "
           f"({len(in_reg)} indicizzati, {len(off_reg)} copie mai indicizzate)")
 
     if done:
@@ -565,7 +626,8 @@ def dry_run(show: int) -> int:
 
     print(f"\n{'=' * 78}\nCOPIE MAI INDICIZZATE ({len(off_reg)}) — "
           f"niente da cancellare\n{'=' * 78}")
-    print("  (in denylist per non rientrare al prossimo ingest)")
+    print("  (in perimetro; il rientro allo scan lo impediscono denylist o "
+          "ignore_folders, non questo script)")
     for p in off_reg[:show]:
         print(f"  {os.path.basename(p)}")
         print(f"      {os.path.dirname(p)}")
@@ -743,6 +805,14 @@ def _audit_expected(deleted, doc_chunks, summaries, kb_after, docs,
         "total_deleted": deleted, "kb_before": kb_before, "kb_after": kb_after,
         "derived_quarantined": quarantined, "superseded_reset": superseded,
     }
+    if RUN_ID != EXPECTED_RUN_ID:
+        print(f"\n{'=' * 78}\nMISURATI — nessuna baseline per "
+              f"run_id={RUN_ID!r}\n{'=' * 78}")
+        for k, v in got.items():
+            print(f"  {k:<22} {v:>10,}")
+        print("  (EXPECTED e' la baseline del purge contabile: qui non c'e'\n"
+              "   niente da confrontare, il giudizio lo da' audit_state())")
+        return 0
     print(f"\n{'=' * 78}\n{label}\n{'=' * 78}")
     diverged = 0
     for k, exp in EXPECTED.items():
@@ -788,7 +858,7 @@ def execute(limit_docs: int | None) -> int:
 
     os.makedirs(LOGS_DIR, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = os.path.join(LOGS_DIR, f"purge_lowvalue_docs_{ts}.log")
+    log_path = os.path.join(LOGS_DIR, f"purge_{RUN_ID}_docs_{ts}.log")
     logf = open(log_path, "a")
 
     def log(msg: str) -> None:
@@ -796,13 +866,14 @@ def execute(limit_docs: int | None) -> int:
         logf.write(msg + "\n")
         logf.flush()
 
-    log(f"[execute] start {ts}  log={log_path}")
+    log(f"[execute] start {ts}  run_id={RUN_ID}  log={log_path}")
     log(f"[lock]    {ing.LOCK_FILE} acquisito (pid {os.getpid()})")
 
     registry = ing.load_registry()
     done = load_checkpoint()
     in_reg, off_reg = resolve_perimeter(registry, done)
-    log(f"[denylist] perimetro {len(in_reg)} doc, {len(off_reg)} copie "
+    log(f"[perimetro] {PERIMETER_FILE}")
+    log(f"[perimetro] {len(in_reg)} doc, {len(off_reg)} copie "
         f"mai indicizzate (nulla da cancellare)")
     log(f"[ckpt]    {len(done)} voci a checkpoint -> resume")
 
@@ -1082,7 +1153,30 @@ def main() -> int:
                          "summary e derivati, che hanno senso solo complete")
     ap.add_argument("--show", type=int, default=10, metavar="N",
                     help="dry-run: quanti path elencare per lista (default 10)")
+    ap.add_argument("--perimeter", default=None, metavar="FILE",
+                    help="file coi path assoluti da purgare, formato denylist "
+                         "(default: config/ingest_denylist.txt)")
+    ap.add_argument("--run-id", default=DEFAULT_RUN_ID, metavar="SLUG",
+                    help="lega checkpoint e piano derivati a questo purge: "
+                         "logs/purge_<slug>_docs.done e "
+                         "logs/purge_<slug>_derived_plan.json "
+                         f"(default: {DEFAULT_RUN_ID})")
+    ap.add_argument("--purge-date", default=None, metavar="YYYY-MM-DD",
+                    help="data nei marker di quarantena e nel piano. Costante "
+                         "per tutto il purge, resume inclusi")
     args = ap.parse_args()
+
+    if not args.run_id or not all(c.isalnum() or c in "-_" for c in args.run_id):
+        ap.error("--run-id: solo lettere, cifre, '-' e '_' (finisce in un "
+                 "nome di file)")
+    if args.run_id != DEFAULT_RUN_ID and not (args.perimeter and args.purge_date):
+        ap.error("--run-id non di default richiede --perimeter e --purge-date: "
+                 "ereditare in silenzio la denylist contabile o la data di "
+                 "luglio significa purgare la cosa sbagliata o scrivere "
+                 "marker di provenienza falsi")
+    if args.perimeter and not os.path.exists(args.perimeter):
+        ap.error(f"--perimeter: file inesistente ({args.perimeter})")
+    apply_run(args.run_id, args.perimeter, args.purge_date)
 
     if args.execute:
         return execute(args.limit_docs)
