@@ -109,6 +109,13 @@ def _no_entity_env(monkeypatch):
     stub = _StubCollection(stub_sem)
     monkeypatch.setattr(mcp_server, "get_embedding", lambda q: [0.5, 0.5, 0.5])
     monkeypatch.setattr(mcp_server, "get_collection", lambda: stub)
+    # Ramo lexical neutralizzato: qui si isola il ramo ENTITY, e il divieto su
+    # get() è la sua sonda. Il lexical chiama get() di suo (I1: la FTS ritorna
+    # solo id+rank, doc/meta si ri-prendono da Chroma) e farebbe scattare la
+    # sonda per il motivo sbagliato. Prima dell'unscoped-OR il ramo taceva solo
+    # perché l'AND implicito su 6 token non matchava nulla nell'indice reale:
+    # dipendenza dal contenuto del sidecar in produzione, non un invariante.
+    monkeypatch.setattr(mcp_server, "_lexical_match_expr", lambda q: "")
     return stub, stub_sem
 
 

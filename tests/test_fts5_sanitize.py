@@ -14,6 +14,7 @@ from scripts.lib.fts5_sanitize import (
     sanitize_column_terms,
     sanitize_phrase,
     sanitize_terms,
+    sanitize_terms_or,
 )
 
 
@@ -217,6 +218,60 @@ def test_allowlist_contenuto():
     )
 
 
+# --- sanitize_terms_or ----------------------------------------------------
+
+
+def test_terms_or_join_esplicito():
+    assert sanitize_terms_or("alfa beta gamma") == '"alfa" OR "beta" OR "gamma"'
+
+
+def test_terms_or_scarta_le_stopword():
+    assert sanitize_terms_or("Mi dai i valori delle analisi del sangue del 2025?") == (
+        '"valori" OR "analisi" OR "sangue" OR "2025"'
+    )
+
+
+def test_terms_or_stopword_confrontate_su_forma_normalizzata():
+    # lowercase + NFD senza combining marks: 'Perché'/'Più'/'NON' cadono.
+    assert sanitize_terms_or("Perché più NON mutuo") == '"mutuo"'
+
+
+def test_terms_or_dedup_su_forma_normalizzata():
+    # 'Mutuo', 'mutuo' e 'mùtuo' sono lo stesso termine per l'indice
+    # (unicode61 remove_diacritics 1) → un solo ramo OR, vince la prima forma.
+    assert sanitize_terms_or("Mutuo mutuo mùtuo ninfa") == '"Mutuo" OR "ninfa"'
+
+
+def test_terms_or_tutte_stopword_e_vuoto():
+    # Nessun fallback ai token originali: il chiamante salta il ramo.
+    assert sanitize_terms_or("che cosa è per me") == ""
+    assert sanitize_terms_or("perché non lo fa") == ""
+
+
+def test_terms_or_senza_token_alfanumerici_e_vuoto():
+    assert sanitize_terms_or("") == ""
+    assert sanitize_terms_or("   ") == ""
+    assert sanitize_terms_or("!!! ---") == ""
+    assert sanitize_terms_or(None) == ""
+
+
+def test_terms_or_keyword_utente_restano_quotate():
+    # Gli unici OR nudi sono i nostri separatori; l'AND dell'utente è stringa.
+    assert sanitize_terms_or("usufrutto AND ninfa") == \
+        '"usufrutto" OR "AND" OR "ninfa"'
+
+
+def test_terms_or_non_emette_mai_scope_di_colonna():
+    out = sanitize_terms_or("email_from:gianluca@x.com")
+    assert out == '"email" OR "from" OR "gianluca" OR "x" OR "com"'
+    assert ":" not in out
+
+
+def test_terms_or_non_altera_sanitize_terms():
+    # Regressione: la semantica AND resta quella di prima.
+    assert sanitize_terms("mi dai i valori") == '"mi" "dai" "i" "valori"'
+
+
 # --- MATCH reale su FTS5 in-memory ---------------------------------------
 
 
@@ -274,3 +329,34 @@ def test_wildcard_non_espande_in_match_reale(fts):
     # 'prevent*' quotato è la parola letterale 'prevent', che non esiste.
     assert _match(fts, sanitize_terms("prevent*")) == []
     assert _match(fts, sanitize_terms("preventivo")) == [(1,)]
+
+
+def test_terms_or_matcha_con_un_solo_termine_presente(fts):
+    # La fixture ha '2026' nel titolo ma non 'sangue': in OR basta un termine.
+    expr = sanitize_terms_or("il sangue del 2026")
+    assert expr == '"sangue" OR "2026"'
+    assert _match(fts, expr) == [(1,)]
+    # Gli stessi due token in AND non matchano: è esattamente il bug che il
+    # ramo unscoped-OR risolve (0 candidati su 11 query su 13).
+    assert _match(fts, sanitize_terms("sangue 2026")) == []
+
+
+def test_terms_or_nessun_termine_presente_non_matcha(fts):
+    assert _match(fts, sanitize_terms_or("sangue analisi")) == []
+
+
+def test_column_terms_resta_and_dentro_la_colonna(fts):
+    # email_from:("gianluca" "x" "com") — 'x' non è nella colonna → nessun
+    # match, i token restano tutti obbligatori.
+    assert _match(fts, sanitize_column_terms("email_from", "gianluca@x.com")) == []
+    # Con i token realmente presenti nella colonna, l'AND passa.
+    assert _match(
+        fts, sanitize_column_terms("email_from", "gianluca@example.com")
+    ) == [(1,)]
+
+
+def test_terms_or_keyword_utente_non_operano_in_match_reale(fts):
+    # '"preventivo" OR "AND" OR "prevent"': matcha per 'preventivo', mentre
+    # 'AND' resta una parola cercata e non un operatore.
+    assert _match(fts, sanitize_terms_or("preventivo AND prevent")) == [(1,)]
+    assert _match(fts, sanitize_terms_or("AND NEAR NOT")) == []

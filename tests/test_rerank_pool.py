@@ -345,20 +345,38 @@ def test_intent_parse_column_prefix_is_case_insensitive():
     assert _lexical_match_expr("EMAIL_FROM:gianluca") == 'email_from:("gianluca")'
 
 
-def test_intent_parse_natural_query_goes_to_unscoped_terms():
-    # Nessuna forma `col:valore` → terms unscoped su tutte le colonne indicizzate.
-    assert _lexical_match_expr("mail di gianluca") == '"mail" "di" "gianluca"'
+def test_intent_parse_natural_query_goes_to_unscoped_or():
+    # Nessuna forma `col:valore` → terms unscoped in OR, stopword scartate
+    # ('di' cade). Con l'AND implicito servivano tutti i token nello stesso
+    # chunk e il ramo tornava vuoto.
+    assert _lexical_match_expr("mail di gianluca") == '"mail" OR "gianluca"'
 
 
-def test_intent_parse_unknown_prefix_falls_back_to_terms():
-    # "foo" non è in INDEXED_COLUMNS → nessuno scope. Il ':' non è alfanumerico:
-    # il tokenizer lo tratta da separatore e non finisce nei token.
-    assert _lexical_match_expr("foo:bar") == '"foo" "bar"'
+def test_intent_parse_natural_query_keeps_only_informative_tokens():
+    # Query del corpus: restano valori/analisi/sangue/2025, il quoting è
+    # preservato su ognuno (mai barewords).
+    assert _lexical_match_expr("Mi dai i valori delle analisi del sangue del 2025?") == \
+        '"valori" OR "analisi" OR "sangue" OR "2025"'
+
+
+def test_intent_parse_unknown_prefix_falls_back_to_unscoped_or():
+    # "foo" non è in INDEXED_COLUMNS → nessuno scope, MAI un ramo FTS5 scopato.
+    # Il ':' non è alfanumerico: il tokenizer lo tratta da separatore e non
+    # finisce nei token.
+    assert _lexical_match_expr("foo:bar") == '"foo" OR "bar"'
 
 
 def test_intent_parse_all_indexed_columns_are_routable():
+    # Ramo col:valore invariato: scope + AND, nessun OR ereditato.
     for col in INDEXED_COLUMNS:
         assert _lexical_match_expr(f"{col}:valore") == f'{col}:("valore")'
+
+
+def test_intent_parse_known_column_stays_and_not_or():
+    # Un OR qui renderebbe l'email un match su qualunque indirizzo con "com".
+    out = _lexical_match_expr("email_from:gianluca@x.com")
+    assert out == 'email_from:("gianluca" "x" "com")'
+    assert " OR " not in out
 
 
 def test_intent_parse_empty_when_no_alphanumeric_tokens():
@@ -368,14 +386,36 @@ def test_intent_parse_empty_when_no_alphanumeric_tokens():
     assert _lexical_match_expr("!!! ---") == ""
 
 
+def test_intent_parse_all_stopwords_is_empty():
+    # Nessun fallback ai token originali: un OR di sole stopword tocca ~124k
+    # righe con top-3 di puro rumore. Meglio saltare il ramo.
+    assert _lexical_match_expr("che cosa è per me") == ""
+    assert _lexical_match_expr("Perché non lo fa?") == ""
+
+
+def test_intent_parse_stopword_match_ignora_accenti_e_maiuscole():
+    # Confronto sulla forma normalizzata (lowercase + NFD senza combining
+    # marks), come l'indice unicode61 remove_diacritics 1.
+    assert _lexical_match_expr("Perché più mutuo") == '"mutuo"'
+
+
+def test_intent_parse_dedup_su_forma_normalizzata():
+    # 'più' e 'piu' collassano: nessun OR ridondante. Qui cadono entrambi
+    # perché 'piu' è stopword; il dedup si vede sui token informativi.
+    assert _lexical_match_expr("più piu valore") == '"valore"'
+    assert _lexical_match_expr("Mutuo mutuo mùtuo ninfa") == '"Mutuo" OR "ninfa"'
+
+
 def test_intent_parse_column_with_empty_value_is_empty():
     # Mai emettere un 'col:' nudo, che sarebbe sintassi FTS5 rotta.
     assert _lexical_match_expr("email_from:!!!") == ""
 
 
 def test_intent_parse_fts5_operators_are_neutralized():
-    # Le keyword FTS5 escono quotate = stringhe, non sintassi.
-    assert _lexical_match_expr("usufrutto AND ninfa") == '"usufrutto" "AND" "ninfa"'
+    # Le keyword FTS5 digitate dall'utente escono quotate = stringhe, non
+    # sintassi. Gli unici OR nudi sono quelli che emettiamo noi come separatori.
+    assert _lexical_match_expr("usufrutto AND ninfa") == \
+        '"usufrutto" OR "AND" OR "ninfa"'
 
 
 # ── intent-parse: il ':' interno al VALORE non rompe il parse ──
@@ -403,5 +443,5 @@ def test_intent_parse_leading_colon_is_not_a_column_prefix():
 
 
 def test_intent_parse_url_scheme_is_not_a_column():
-    # 'http' non è in INDEXED_COLUMNS → nessuno scope, terms unscoped.
-    assert _lexical_match_expr("http://x") == '"http" "x"'
+    # 'http' non è in INDEXED_COLUMNS → nessuno scope, terms unscoped in OR.
+    assert _lexical_match_expr("http://x") == '"http" OR "x"'

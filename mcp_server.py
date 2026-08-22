@@ -171,7 +171,11 @@ ENTITY_CANDIDATE_STOPWORDS = frozenset({
 # Embedding: loaded from lib.embedding (config-driven)
 from embedding import get_embedding, get_embeddings, info as embedding_info
 from embedding_contract import embedding_text, MAX_EMBED_CHARS
-from fts5_sanitize import sanitize_terms, sanitize_column_terms, INDEXED_COLUMNS
+from fts5_sanitize import (
+    sanitize_terms_or,
+    sanitize_column_terms,
+    INDEXED_COLUMNS,
+)
 # Collection name from config
 try:
     from scripts.lib.config import get as _cfg_get_top
@@ -1994,21 +1998,31 @@ def _lexical_match_expr(query: str) -> str:
     Intent-parse DETERMINISTICO (B1): nessun NL, nessun LLM, nessuna euristica —
     solo una forma letterale riconosciuta.
 
-      - `col:valore` con `col` in INDEXED_COLUMNS → terms SCOPATI sulla colonna
-        (es. 'email_from:gianluca@x.com' → 'email_from:("gianluca" "x" "com")').
+      - `col:valore` con `col` in INDEXED_COLUMNS → terms SCOPATI sulla colonna,
+        in AND (es. 'email_from:gianluca@x.com' →
+        'email_from:("gianluca" "x" "com")'): tutti i token devono stare nella
+        stessa colonna, altrimenti l'intent "email DI gianluca" evapora.
       - tutto il resto (inclusi i prefissi ignoti tipo 'foo:bar') → terms
-        UNSCOPED su tutte le colonne indicizzate: il ':' non e' alfanumerico,
+        UNSCOPED in OR sui soli token informativi: il ':' non e' alfanumerico,
         quindi il tokenizer lo tratta come separatore e non finisce nei token.
+
+    L'OR sull'unscoped e' il fix di un ramo che rendeva 0 candidati su 11 query
+    su 13 del corpus: il join con spazio di `sanitize_terms` e' AND implicito in
+    FTS5, quindi ogni parola della domanda (articoli e preposizioni inclusi)
+    diventava vincolo obbligatorio sullo STESSO chunk. Nessun termine mancava
+    dall'indice — era l'intersezione a essere vuota. Con l'OR + stoplist:
+    recall@n 0/13 → 5/13, mediana 38 ms (max 71).
 
     Il quoting lo fa sempre il sanitizer (mai barewords) — vedi fts5_sanitize.
 
-    Returns: expr FTS5, oppure '' se la query non ha token alfanumerici (un
-    MATCH '' e' invalido in FTS5 → il chiamante salta il ramo).
+    Returns: expr FTS5, oppure '' se la query non ha token alfanumerici o e'
+    fatta di sole stopword (un MATCH '' e' invalido in FTS5 → il chiamante
+    salta il ramo).
     """
     m = re.match(r"^(\w+):(.+)$", query.strip()) if query else None
     if m and m.group(1).lower() in INDEXED_COLUMNS:
         return sanitize_column_terms(m.group(1), m.group(2))
-    return sanitize_terms(query)
+    return sanitize_terms_or(query)
 
 
 def _cosine_relevance(q_vec, c_vec) -> float:

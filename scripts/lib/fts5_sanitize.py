@@ -1,5 +1,9 @@
 """Sanitizzazione query FTS5 — funzioni pure, zero DB.
 
+`sanitize_terms` (AND implicito) e `sanitize_terms_or` (OR esplicito,
+unscoped, con stoplist) sono due funzioni distinte di proposito: vedi il
+docstring di `sanitize_terms_or`.
+
 Invariante: mai emettere bareword. Ogni token/valore esce tra doppie virgolette,
 con `"` interni raddoppiati. Il quoting neutralizza `@ . : - / ( ) *` e le
 keyword `AND OR NOT NEAR` come sintassi: FTS5 le tratta come stringhe.
@@ -15,6 +19,7 @@ droppato. Accettabile per email/path/doc, non per codepoint esotici.
 """
 
 import re
+import unicodedata
 
 INDEXED_COLUMNS = frozenset(
     {"document", "title", "folder", "doc_type", "email_from", "file_path"}
@@ -28,6 +33,34 @@ _TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 _ALNUM_RE = re.compile(r"[^\W_]", re.UNICODE)
+
+# Stopword italiane per il ramo unscoped-OR. Forma NORMALIZZATA (lowercase,
+# senza diacritici): il confronto passa sempre da `_normalize`, quindi
+# `Perché`/`perche`/`PERCHE` collassano tutti su `perche`.
+#
+# LETTERALE e CONGELATA: e' la lista con cui il ramo lexical e' stato misurato
+# (recall@n 5/13, mediana 38 ms). Cambiarla invalida il confronto pre/post —
+# si tocca solo insieme a una nuova misura offline.
+_STOPWORDS = frozenset("""
+a ad agli ai al all alla alle allo anche c che chi ci come con cosa cui da dai
+dal dall dalla dalle dallo degli dei del dell della delle dello di do e ed era
+essere fa fare fra gli ha hai hanno ho i il in io la le lei li lo loro ma me mi
+ne negli nei nel nell nella nelle nello noi non o per perche piu quale quali
+quando quanta quante quanti quanto qual si sia siamo sono su sui sul sull sulla
+sulle sullo ti tra tu tuo un una uno vi
+""".split())
+
+
+def _normalize(token):
+    """Forma di confronto per la stoplist: lowercase + NFD senza combining marks.
+
+    Specchia il tokenizer dell'indice (`unicode61 remove_diacritics 1`): la' i
+    diacritici cadono in fase di indicizzazione, qui devono cadere in fase di
+    filtro, altrimenti `perche'` e `piu'` scritti con accento passerebbero il
+    controllo e resterebbero nell'OR come termini "informativi".
+    """
+    decomposed = unicodedata.normalize("NFD", token.lower())
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
 
 
 def _quote(value):
@@ -52,6 +85,41 @@ def sanitize_terms(text):
         return ""
     tokens = _TOKEN_RE.findall(text)
     return " ".join(_quote(t) for t in tokens)
+
+
+def sanitize_terms_or(text):
+    """Tokenizza, scarta le stopword, dedup e joina con OR esplicito. UNSCOPED.
+
+    'valori delle analisi' -> '"valori" OR "analisi"'.
+
+    Esiste separata da `sanitize_terms` (AND implicito) e non come suo flag:
+    il ramo `col:valore` DEVE restare in AND. Un OR ereditato da
+    `sanitize_column_terms` renderebbe `email_from:gianluca@x.com` un match su
+    qualunque indirizzo che contenga "com".
+
+    - Stoplist confrontata sulla forma normalizzata (`_normalize`), non sul
+      token grezzo: cadono anche `Perche'`, `Piu`, `NON`.
+    - Dedup sulla stessa forma normalizzata: `piu' piu valore` non produce OR
+      ridondanti (vince la prima occorrenza, il quoting e' della forma
+      originale — l'indice normalizza comunque).
+    - Il quoting resta quello di `_quote`: mai barewords, quindi le keyword
+      FTS5 digitate dall'utente (AND, OR, NEAR) escono come stringhe.
+
+    Query interamente stopword -> '' (nessun fallback ai token originali: un
+    OR di sole stopword tocca ~124k righe con top-3 di puro rumore, il
+    chiamante deve saltare il ramo). Nessun token alfanumerico -> ''.
+    """
+    if not text:
+        return ""
+    seen = set()
+    quoted = []
+    for token in _TOKEN_RE.findall(text):
+        norm = _normalize(token)
+        if norm in _STOPWORDS or norm in seen:
+            continue
+        seen.add(norm)
+        quoted.append(_quote(token))
+    return " OR ".join(quoted)
 
 
 def sanitize_phrase(value):
