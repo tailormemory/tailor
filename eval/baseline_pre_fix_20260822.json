@@ -1,0 +1,1190 @@
+{
+  "schema_version": 1,
+  "metadata": {
+    "base_url": "http://127.0.0.1:8787",
+    "corpus": "/Users/jarvis/tailor/eval/retrieval_corpus.jsonl",
+    "timestamp": "2026-08-22T20:57:19+00:00",
+    "timeout_s": 30.0,
+    "rank_base": 1,
+    "rows_total": 13,
+    "rows_ready": 13,
+    "rows_skipped_not_ready": 0,
+    "rows_evaluated": 13,
+    "rows_failed": 0,
+    "duplicate_ids": []
+  },
+  "aggregate": {
+    "rows_scored": 13,
+    "mean_exact_recall_at_row_n": 0.1859,
+    "mean_doc_recall_at_row_n": 0.2628,
+    "micro_exact_recall_at_row_n": 0.1842,
+    "micro_exact_gold_found": 7,
+    "micro_exact_gold_total": 38,
+    "primary_exact_hit_rate": 0.2308,
+    "primary_doc_hit_rate": 0.3077,
+    "timings_median_ms": {
+      "lexical_ms": 9.8,
+      "entity_extract_ms": 222.8,
+      "rerank_ms": 619.65,
+      "total_ms": 897.27
+    }
+  },
+  "rows": [
+    {
+      "id": "miss_usufrutto_ninfa",
+      "line": 1,
+      "occurrence": 1,
+      "query": "chi ha l'usufrutto sulla casa di Ninfa",
+      "url": "http://127.0.0.1:8787/api/diag/hybrid-search?q=chi%20ha%20l%27usufrutto%20sulla%20casa%20di%20Ninfa&n=5",
+      "status": "ok",
+      "error": null,
+      "n": 5,
+      "gold": [
+        "doc_611765bb6025_chunk_0003",
+        "doc_611765bb6025_chunk_0014"
+      ],
+      "primary_gold": "doc_611765bb6025_chunk_0003",
+      "final_ranked_ids": [
+        "email_16ad60ed364e8871_chunk_0003",
+        "email_16ad60ed364e8871_chunk_0002",
+        "email_15f527a70ef4a55a_chunk_0000",
+        "doc_bc4ea337dd23_chunk_0003",
+        "email_175d7354f5702b84_chunk_0000"
+      ],
+      "exact_hits": 0,
+      "doc_hits": 0,
+      "gold_total": 2,
+      "primary_exact_rank": null,
+      "primary_doc_rank": null,
+      "gold_provenance": [
+        {
+          "chunk_id": "doc_611765bb6025_chunk_0003",
+          "provenance": [
+            "entity"
+          ],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": false,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": false
+        },
+        {
+          "chunk_id": "doc_611765bb6025_chunk_0014",
+          "provenance": [],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": false,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": false
+        }
+      ],
+      "counts": {
+        "raw_candidates": 150,
+        "after_supersede": 150,
+        "final_semantic": 3,
+        "final_entity": 2,
+        "final_lexical": 0,
+        "semantic_candidates": 15,
+        "entity_pre_cap": 135,
+        "entity_post_cap": 135,
+        "lexical_candidates": 0,
+        "rerank_pool": 20,
+        "final_ranked": 5
+      },
+      "lexical_derived_dropped": null,
+      "lexical_error": null,
+      "rerank_backend": "onnx",
+      "warnings": [
+        "lexical_derived_dropped_missing"
+      ],
+      "timings_ms": {
+        "lexical_ms": 25.06,
+        "entity_extract_ms": 350.96,
+        "rerank_ms": 431.68,
+        "total_ms": 1232.05
+      }
+    },
+    {
+      "id": "miss_analisi_sangue_2025",
+      "line": 2,
+      "occurrence": 1,
+      "query": "Mi dai i valori delle analisi del sangue del 2025?",
+      "url": "http://127.0.0.1:8787/api/diag/hybrid-search?q=Mi%20dai%20i%20valori%20delle%20analisi%20del%20sangue%20del%202025%3F&n=10",
+      "status": "ok",
+      "error": null,
+      "n": 10,
+      "gold": [
+        "doc_4dcbb9e2ab75_chunk_0000",
+        "doc_4dcbb9e2ab75_chunk_0001",
+        "doc_4dcbb9e2ab75_chunk_0002",
+        "doc_4dcbb9e2ab75_chunk_0003",
+        "doc_4dcbb9e2ab75_chunk_0004",
+        "doc_4dcbb9e2ab75_chunk_0005"
+      ],
+      "primary_gold": "doc_4dcbb9e2ab75_chunk_0000",
+      "final_ranked_ids": [
+        "687925e5-0f64-8011-af22-16a99b6e73c0_chunk_0000",
+        "683d83f7-0310-8011-b19d-df36f55e01d9_chunk_0091",
+        "b027ae2b-e06f-4b2b-b627-a654f31fd221_chunk_0040",
+        "e5136f0e-446c-4cbb-9042-66575f9c4ae1_chunk_0005",
+        "f60503d9-0a23-4280-bf11-9af284f2c6fc_chunk_0055",
+        "3a8affa7-7112-494e-ad8c-16f725820f9d_chunk_0014",
+        "67dbe938-00cc-8011-9192-165281126020_chunk_0003",
+        "683d83f7-0310-8011-b19d-df36f55e01d9_chunk_0085",
+        "682b3850-20bc-8011-8532-9d8b50daf2ba_chunk_0102",
+        "683d83f7-0310-8011-b19d-df36f55e01d9_chunk_0094"
+      ],
+      "exact_hits": 0,
+      "doc_hits": 0,
+      "gold_total": 6,
+      "primary_exact_rank": null,
+      "primary_doc_rank": null,
+      "gold_provenance": [
+        {
+          "chunk_id": "doc_4dcbb9e2ab75_chunk_0000",
+          "provenance": [],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": false,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": false
+        },
+        {
+          "chunk_id": "doc_4dcbb9e2ab75_chunk_0001",
+          "provenance": [],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": false,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": false
+        },
+        {
+          "chunk_id": "doc_4dcbb9e2ab75_chunk_0002",
+          "provenance": [],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": false,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": false
+        },
+        {
+          "chunk_id": "doc_4dcbb9e2ab75_chunk_0003",
+          "provenance": [],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": false,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": false
+        },
+        {
+          "chunk_id": "doc_4dcbb9e2ab75_chunk_0004",
+          "provenance": [],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": false,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": false
+        },
+        {
+          "chunk_id": "doc_4dcbb9e2ab75_chunk_0005",
+          "provenance": [],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": false,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": false
+        }
+      ],
+      "counts": {
+        "raw_candidates": 30,
+        "after_supersede": 30,
+        "final_semantic": 10,
+        "final_entity": 0,
+        "final_lexical": 0,
+        "semantic_candidates": 30,
+        "entity_pre_cap": 0,
+        "entity_post_cap": 0,
+        "lexical_candidates": 0,
+        "rerank_pool": 30,
+        "final_ranked": 10
+      },
+      "lexical_derived_dropped": null,
+      "lexical_error": null,
+      "rerank_backend": "onnx",
+      "warnings": [
+        "lexical_derived_dropped_missing"
+      ],
+      "timings_ms": {
+        "lexical_ms": 17.94,
+        "entity_extract_ms": 0.15,
+        "rerank_ms": 646.77,
+        "total_ms": 720.63
+      }
+    },
+    {
+      "id": "miss_acquisto_marche",
+      "line": 3,
+      "occurrence": 1,
+      "query": "dettagli dell'acquisto di via Marche 72 int. 425",
+      "url": "http://127.0.0.1:8787/api/diag/hybrid-search?q=dettagli%20dell%27acquisto%20di%20via%20Marche%2072%20int.%20425&n=10",
+      "status": "ok",
+      "error": null,
+      "n": 10,
+      "gold": [
+        "doc_1df1d49bdb63_chunk_0000",
+        "doc_1df1d49bdb63_chunk_0002",
+        "doc_1df1d49bdb63_chunk_0005"
+      ],
+      "primary_gold": "doc_1df1d49bdb63_chunk_0005",
+      "final_ranked_ids": [
+        "claude_20260706_163002_1878",
+        "doc_a2ae50702db0_chunk_0002",
+        "doc_summary_3446074968",
+        "doc_summary_9541071553",
+        "doc_b0c6be263bcb_chunk_0000",
+        "682e066a-5550-8011-bcb0-f2d5935874b1_chunk_0000",
+        "doc_419383a04907_chunk_0021",
+        "conv_summary_email_thread_1938d10560f93e38_1775229878822",
+        "doc_summary_1657356463",
+        "doc_7cec5d5bf7a2_chunk_0001"
+      ],
+      "exact_hits": 0,
+      "doc_hits": 0,
+      "gold_total": 3,
+      "primary_exact_rank": null,
+      "primary_doc_rank": null,
+      "gold_provenance": [
+        {
+          "chunk_id": "doc_1df1d49bdb63_chunk_0000",
+          "provenance": [],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": false,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": false
+        },
+        {
+          "chunk_id": "doc_1df1d49bdb63_chunk_0002",
+          "provenance": [
+            "entity"
+          ],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": false,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": false
+        },
+        {
+          "chunk_id": "doc_1df1d49bdb63_chunk_0005",
+          "provenance": [],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": false,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": false
+        }
+      ],
+      "counts": {
+        "raw_candidates": 684,
+        "after_supersede": 671,
+        "final_semantic": 7,
+        "final_entity": 3,
+        "final_lexical": 0,
+        "semantic_candidates": 30,
+        "entity_pre_cap": 654,
+        "entity_post_cap": 654,
+        "lexical_candidates": 0,
+        "rerank_pool": 37,
+        "final_ranked": 10
+      },
+      "lexical_derived_dropped": null,
+      "lexical_error": null,
+      "rerank_backend": "onnx",
+      "warnings": [
+        "lexical_derived_dropped_missing"
+      ],
+      "timings_ms": {
+        "lexical_ms": 18.22,
+        "entity_extract_ms": 222.8,
+        "rerank_ms": 587.08,
+        "total_ms": 949.19
+      }
+    },
+    {
+      "id": "cross_amg_saltato",
+      "line": 4,
+      "occurrence": 1,
+      "query": "perché è saltato l accordo con AMG",
+      "url": "http://127.0.0.1:8787/api/diag/hybrid-search?q=perch%C3%A9%20%C3%A8%20saltato%20l%20accordo%20con%20AMG&n=10",
+      "status": "ok",
+      "error": null,
+      "n": 10,
+      "gold": [
+        "email_19d21316cb6697cd_chunk_0000",
+        "email_19d21316cb6697cd_chunk_0001"
+      ],
+      "primary_gold": "email_19d21316cb6697cd_chunk_0000",
+      "final_ranked_ids": [
+        "live_claude_5d76ecc0cc12f90a",
+        "doc_f6924ca18c62_chunk_0003",
+        "email_13153062a2e525fe_chunk_0002",
+        "email_1317645ec04ba3ea_chunk_0001",
+        "email_12fba7fa89c0ca58_chunk_0001",
+        "email_16dd6ac2a31e87e3_chunk_0001",
+        "email_1307a56624182a60_chunk_0003",
+        "email_1307a55efeab6686_chunk_0003",
+        "email_13caf3adc3cd7ed1_chunk_0002",
+        "email_13caf3a66a8b8109_chunk_0002"
+      ],
+      "exact_hits": 0,
+      "doc_hits": 0,
+      "gold_total": 2,
+      "primary_exact_rank": null,
+      "primary_doc_rank": null,
+      "gold_provenance": [
+        {
+          "chunk_id": "email_19d21316cb6697cd_chunk_0000",
+          "provenance": [
+            "entity"
+          ],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": false,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": false
+        },
+        {
+          "chunk_id": "email_19d21316cb6697cd_chunk_0001",
+          "provenance": [
+            "entity"
+          ],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": true,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": false
+        }
+      ],
+      "counts": {
+        "raw_candidates": 45,
+        "after_supersede": 45,
+        "final_semantic": 9,
+        "final_entity": 0,
+        "final_lexical": 1,
+        "semantic_candidates": 30,
+        "entity_pre_cap": 14,
+        "entity_post_cap": 14,
+        "lexical_candidates": 1,
+        "rerank_pool": 41,
+        "final_ranked": 10
+      },
+      "lexical_derived_dropped": null,
+      "lexical_error": null,
+      "rerank_backend": "onnx",
+      "warnings": [
+        "lexical_derived_dropped_missing"
+      ],
+      "timings_ms": {
+        "lexical_ms": 27.38,
+        "entity_extract_ms": 117.65,
+        "rerank_ms": 595.08,
+        "total_ms": 793.29
+      }
+    },
+    {
+      "id": "cross_amg_risolto",
+      "line": 5,
+      "occurrence": 1,
+      "query": "per quale motivo AMG ha risolto il contratto",
+      "url": "http://127.0.0.1:8787/api/diag/hybrid-search?q=per%20quale%20motivo%20AMG%20ha%20risolto%20il%20contratto&n=10",
+      "status": "ok",
+      "error": null,
+      "n": 10,
+      "gold": [
+        "email_19d21316cb6697cd_chunk_0000",
+        "email_19d21316cb6697cd_chunk_0001"
+      ],
+      "primary_gold": "email_19d21316cb6697cd_chunk_0000",
+      "final_ranked_ids": [
+        "doc_236ebe07b56c_chunk_0015",
+        "live_claude_5d76ecc0cc12f90a",
+        "email_14a4a25ebdc7ddfd_chunk_0000",
+        "email_13d0187441d99040_chunk_0001",
+        "doc_236ebe07b56c_chunk_0014",
+        "doc_8c770988ca38_chunk_0004",
+        "email_16bd10f0b4fb9bfe_chunk_0000",
+        "doc_f23f137e1900_chunk_0020",
+        "doc_9828c60170ff_chunk_0020",
+        "email_13d0186c9f55f1b5_chunk_0001"
+      ],
+      "exact_hits": 0,
+      "doc_hits": 0,
+      "gold_total": 2,
+      "primary_exact_rank": null,
+      "primary_doc_rank": null,
+      "gold_provenance": [
+        {
+          "chunk_id": "email_19d21316cb6697cd_chunk_0000",
+          "provenance": [
+            "entity"
+          ],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": true,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": false
+        },
+        {
+          "chunk_id": "email_19d21316cb6697cd_chunk_0001",
+          "provenance": [
+            "entity"
+          ],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": true,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": false
+        }
+      ],
+      "counts": {
+        "raw_candidates": 45,
+        "after_supersede": 45,
+        "final_semantic": 9,
+        "final_entity": 0,
+        "final_lexical": 1,
+        "semantic_candidates": 30,
+        "entity_pre_cap": 14,
+        "entity_post_cap": 14,
+        "lexical_candidates": 1,
+        "rerank_pool": 41,
+        "final_ranked": 10
+      },
+      "lexical_derived_dropped": null,
+      "lexical_error": null,
+      "rerank_backend": "onnx",
+      "warnings": [
+        "lexical_derived_dropped_missing"
+      ],
+      "timings_ms": {
+        "lexical_ms": 30.85,
+        "entity_extract_ms": 232.48,
+        "rerank_ms": 577.8,
+        "total_ms": 897.27
+      }
+    },
+    {
+      "id": "work_blazemedia_accordo",
+      "line": 6,
+      "occurrence": 1,
+      "query": "Su cosa verte il potenziale accordo fra YOUniversal e Blazemedia",
+      "url": "http://127.0.0.1:8787/api/diag/hybrid-search?q=Su%20cosa%20verte%20il%20potenziale%20accordo%20fra%20YOUniversal%20e%20Blazemedia&n=10",
+      "status": "ok",
+      "error": null,
+      "n": 10,
+      "gold": [
+        "email_19f2885a190d46e8_chunk_0007",
+        "email_19ecb6dbf1e3928c_chunk_0000",
+        "email_19f2885a190d46e8_chunk_0006",
+        "email_19ef97fb63000440_chunk_0000"
+      ],
+      "primary_gold": "email_19f2885a190d46e8_chunk_0007",
+      "final_ranked_ids": [
+        "email_1535b3a90b537d62_chunk_0001",
+        "email_19f2885a190d46e8_chunk_0007",
+        "email_19ecb6dbf1e3928c_chunk_0000",
+        "email_19ecb6dbf1e3928c_chunk_0002",
+        "email_14980b0bbd815f63_chunk_0000",
+        "email_1513dee1e2325b0f_chunk_0001",
+        "email_14e8702fb795fca9_chunk_0001",
+        "email_12d706f32e6222c6_chunk_0001",
+        "email_19f2885a190d46e8_chunk_0006",
+        "email_15da90b64aedf3b5_chunk_0000"
+      ],
+      "exact_hits": 3,
+      "doc_hits": 3,
+      "gold_total": 4,
+      "primary_exact_rank": 2,
+      "primary_doc_rank": 2,
+      "gold_provenance": [
+        {
+          "chunk_id": "email_19f2885a190d46e8_chunk_0007",
+          "provenance": [
+            "entity"
+          ],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": true,
+          "in_final_topn": true,
+          "final_rank": 2,
+          "doc_in_final_topn": true
+        },
+        {
+          "chunk_id": "email_19ecb6dbf1e3928c_chunk_0000",
+          "provenance": [
+            "entity"
+          ],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": true,
+          "in_final_topn": true,
+          "final_rank": 3,
+          "doc_in_final_topn": true
+        },
+        {
+          "chunk_id": "email_19f2885a190d46e8_chunk_0006",
+          "provenance": [
+            "entity"
+          ],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": true,
+          "in_final_topn": true,
+          "final_rank": 9,
+          "doc_in_final_topn": true
+        },
+        {
+          "chunk_id": "email_19ef97fb63000440_chunk_0000",
+          "provenance": [
+            "entity"
+          ],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": true,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": false
+        }
+      ],
+      "counts": {
+        "raw_candidates": 730,
+        "after_supersede": 729,
+        "final_semantic": 6,
+        "final_entity": 4,
+        "final_lexical": 0,
+        "semantic_candidates": 30,
+        "entity_pre_cap": 713,
+        "entity_post_cap": 700,
+        "lexical_candidates": 0,
+        "rerank_pool": 40,
+        "final_ranked": 10
+      },
+      "lexical_derived_dropped": null,
+      "lexical_error": null,
+      "rerank_backend": "onnx",
+      "warnings": [
+        "lexical_derived_dropped_missing"
+      ],
+      "timings_ms": {
+        "lexical_ms": 8.66,
+        "entity_extract_ms": 271.69,
+        "rerank_ms": 648.72,
+        "total_ms": 1034.6
+      }
+    },
+    {
+      "id": "work_novation_yahoo",
+      "line": 7,
+      "occurrence": 1,
+      "query": "Riassumi il processo do novation del contratto di Yahoo da Nexify a YOUniversal",
+      "url": "http://127.0.0.1:8787/api/diag/hybrid-search?q=Riassumi%20il%20processo%20do%20novation%20del%20contratto%20di%20Yahoo%20da%20Nexify%20a%20YOUniversal&n=10",
+      "status": "ok",
+      "error": null,
+      "n": 10,
+      "gold": [
+        "email_19f1a7aa7dad1442_chunk_0000",
+        "email_19f3809615d2d8d9_chunk_0000",
+        "email_19eff1e43e7ec015_chunk_0000",
+        "email_19f038642d39f262_chunk_0000"
+      ],
+      "primary_gold": "email_19f1a7aa7dad1442_chunk_0000",
+      "final_ranked_ids": [
+        "email_150b2e323840b1fc_chunk_0006",
+        "doc_0c37c1f6179d_chunk_0002",
+        "email_150b3045571ebbc6_chunk_0000",
+        "email_16f50dce396f4542_chunk_0000",
+        "email_15143535e5478859_chunk_0000",
+        "01980ed6-a038-730d-8c5b-e448dde109ce_doc_f9c5df87-2d1d-47db-b731-dcf4c58ae379_chunk_0002",
+        "email_156196c71cd4e175_chunk_0004",
+        "email_19f190a1ccd10671_chunk_0000",
+        "email_158eff5f945c81da_chunk_0001",
+        "email_14c7f01e2a32a01f_chunk_0000"
+      ],
+      "exact_hits": 0,
+      "doc_hits": 0,
+      "gold_total": 4,
+      "primary_exact_rank": null,
+      "primary_doc_rank": null,
+      "gold_provenance": [
+        {
+          "chunk_id": "email_19f1a7aa7dad1442_chunk_0000",
+          "provenance": [],
+          "entity_pre_cap_only": true,
+          "in_rerank_pool": false,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": false
+        },
+        {
+          "chunk_id": "email_19f3809615d2d8d9_chunk_0000",
+          "provenance": [],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": false,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": false
+        },
+        {
+          "chunk_id": "email_19eff1e43e7ec015_chunk_0000",
+          "provenance": [
+            "entity"
+          ],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": false,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": false
+        },
+        {
+          "chunk_id": "email_19f038642d39f262_chunk_0000",
+          "provenance": [
+            "entity"
+          ],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": false,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": false
+        }
+      ],
+      "counts": {
+        "raw_candidates": 730,
+        "after_supersede": 730,
+        "final_semantic": 8,
+        "final_entity": 2,
+        "final_lexical": 0,
+        "semantic_candidates": 30,
+        "entity_pre_cap": 1774,
+        "entity_post_cap": 700,
+        "lexical_candidates": 0,
+        "rerank_pool": 40,
+        "final_ranked": 10
+      },
+      "lexical_derived_dropped": null,
+      "lexical_error": null,
+      "rerank_backend": "onnx",
+      "warnings": [
+        "lexical_derived_dropped_missing"
+      ],
+      "timings_ms": {
+        "lexical_ms": 9.88,
+        "entity_extract_ms": 447.18,
+        "rerank_ms": 657.01,
+        "total_ms": 1224.26
+      }
+    },
+    {
+      "id": "cross_visymo_contesto",
+      "line": 8,
+      "occurrence": 1,
+      "query": "che contesto avevamo con Visymo",
+      "url": "http://127.0.0.1:8787/api/diag/hybrid-search?q=che%20contesto%20avevamo%20con%20Visymo&n=10",
+      "status": "ok",
+      "error": null,
+      "n": 10,
+      "gold": [
+        "email_15e28d56fae45c3b_chunk_0000"
+      ],
+      "primary_gold": "email_15e28d56fae45c3b_chunk_0000",
+      "final_ranked_ids": [
+        "671f7b1b-ac64-8011-948a-fcfd3b080459_chunk_0135",
+        "671f7b1b-ac64-8011-948a-fcfd3b080459_chunk_0126",
+        "email_19eb0acd857aea43_chunk_0001",
+        "email_1346ad6fc87ce874_chunk_0003",
+        "email_18877407d619a017_chunk_0001",
+        "email_1888aeed9c39a358_chunk_0001",
+        "email_163ee7cf6f2a3866_chunk_0000",
+        "doc_24e2c04efc56_chunk_0109",
+        "email_188729bcfddfe0fe_chunk_0001",
+        "email_15e28d56fae45c3b_chunk_0000"
+      ],
+      "exact_hits": 1,
+      "doc_hits": 1,
+      "gold_total": 1,
+      "primary_exact_rank": 10,
+      "primary_doc_rank": 9,
+      "gold_provenance": [
+        {
+          "chunk_id": "email_15e28d56fae45c3b_chunk_0000",
+          "provenance": [
+            "entity"
+          ],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": true,
+          "in_final_topn": true,
+          "final_rank": 10,
+          "doc_in_final_topn": true
+        }
+      ],
+      "counts": {
+        "raw_candidates": 44,
+        "after_supersede": 44,
+        "final_semantic": 3,
+        "final_entity": 7,
+        "final_lexical": 0,
+        "semantic_candidates": 30,
+        "entity_pre_cap": 14,
+        "entity_post_cap": 14,
+        "lexical_candidates": 0,
+        "rerank_pool": 40,
+        "final_ranked": 10
+      },
+      "lexical_derived_dropped": null,
+      "lexical_error": null,
+      "rerank_backend": "onnx",
+      "warnings": [
+        "lexical_derived_dropped_missing"
+      ],
+      "timings_ms": {
+        "lexical_ms": 5.22,
+        "entity_extract_ms": 112.59,
+        "rerank_ms": 595.61,
+        "total_ms": 767.39
+      }
+    },
+    {
+      "id": "cross_kingsroad_intro",
+      "line": 9,
+      "occurrence": 1,
+      "query": "di cosa si trattava l intro con Kingsroad",
+      "url": "http://127.0.0.1:8787/api/diag/hybrid-search?q=di%20cosa%20si%20trattava%20l%20intro%20con%20Kingsroad&n=10",
+      "status": "ok",
+      "error": null,
+      "n": 10,
+      "gold": [
+        "email_19ab6a385f4a78aa_chunk_0001",
+        "email_19ab6a385f4a78aa_chunk_0002",
+        "email_19ac51a1e33d096a_chunk_0000"
+      ],
+      "primary_gold": "email_19ab6a385f4a78aa_chunk_0002",
+      "final_ranked_ids": [
+        "email_15f056c24d8ad4ad_chunk_0000",
+        "email_19a9313d86dedba1_chunk_0000",
+        "email_19ab6a385f4a78aa_chunk_0001",
+        "email_175844558b3ee994_chunk_0000",
+        "671f7b1b-ac64-8011-948a-fcfd3b080459_chunk_0118",
+        "email_13129860da17edca_chunk_0000",
+        "email_19aba3b97e49a9ce_chunk_0000",
+        "email_16c234d7b857c9c5_chunk_0000",
+        "email_19a973eef63fc703_chunk_0002",
+        "email_135c591b6949c6cb_chunk_0000"
+      ],
+      "exact_hits": 1,
+      "doc_hits": 2,
+      "gold_total": 3,
+      "primary_exact_rank": null,
+      "primary_doc_rank": 3,
+      "gold_provenance": [
+        {
+          "chunk_id": "email_19ab6a385f4a78aa_chunk_0001",
+          "provenance": [
+            "entity"
+          ],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": true,
+          "in_final_topn": true,
+          "final_rank": 3,
+          "doc_in_final_topn": true
+        },
+        {
+          "chunk_id": "email_19ab6a385f4a78aa_chunk_0002",
+          "provenance": [
+            "entity"
+          ],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": true,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": true
+        },
+        {
+          "chunk_id": "email_19ac51a1e33d096a_chunk_0000",
+          "provenance": [],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": false,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": false
+        }
+      ],
+      "counts": {
+        "raw_candidates": 41,
+        "after_supersede": 41,
+        "final_semantic": 5,
+        "final_entity": 5,
+        "final_lexical": 0,
+        "semantic_candidates": 30,
+        "entity_pre_cap": 11,
+        "entity_post_cap": 11,
+        "lexical_candidates": 0,
+        "rerank_pool": 40,
+        "final_ranked": 10
+      },
+      "lexical_derived_dropped": null,
+      "lexical_error": null,
+      "rerank_backend": "onnx",
+      "warnings": [
+        "lexical_derived_dropped_missing"
+      ],
+      "timings_ms": {
+        "lexical_ms": 5.31,
+        "entity_extract_ms": 110.28,
+        "rerank_ms": 574.41,
+        "total_ms": 746.3
+      }
+    },
+    {
+      "id": "marche103_prezzo_vendita",
+      "line": 10,
+      "occurrence": 1,
+      "query": "a quanto ho venduto l'appartamento di via Marche 72 int. 103?",
+      "url": "http://127.0.0.1:8787/api/diag/hybrid-search?q=a%20quanto%20ho%20venduto%20l%27appartamento%20di%20via%20Marche%2072%20int.%20103%3F&n=10",
+      "status": "ok",
+      "error": null,
+      "n": 10,
+      "gold": [
+        "doc_24eb2a5fac98_chunk_0007"
+      ],
+      "primary_gold": "doc_24eb2a5fac98_chunk_0007",
+      "final_ranked_ids": [
+        "doc_419383a04907_chunk_0035",
+        "doc_summary_3446074968",
+        "doc_419383a04907_chunk_0021",
+        "conv_summary_email_thread_18ccac331db5c8ae_1775231565677",
+        "682e066a-5550-8011-bcb0-f2d5935874b1_chunk_0000",
+        "conv_summary_email_thread_1959ada439c5cc94_1775229378257",
+        "682f423a-1c00-8011-8a18-b12f65b7667b_chunk_0000",
+        "doc_05265c63c64c_chunk_0000",
+        "doc_summary_6655768201",
+        "doc_65b6cf71b89a_chunk_0000"
+      ],
+      "exact_hits": 0,
+      "doc_hits": 0,
+      "gold_total": 1,
+      "primary_exact_rank": null,
+      "primary_doc_rank": null,
+      "gold_provenance": [
+        {
+          "chunk_id": "doc_24eb2a5fac98_chunk_0007",
+          "provenance": [],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": false,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": false
+        }
+      ],
+      "counts": {
+        "raw_candidates": 681,
+        "after_supersede": 669,
+        "final_semantic": 9,
+        "final_entity": 1,
+        "final_lexical": 0,
+        "semantic_candidates": 30,
+        "entity_pre_cap": 651,
+        "entity_post_cap": 651,
+        "lexical_candidates": 0,
+        "rerank_pool": 38,
+        "final_ranked": 10
+      },
+      "lexical_derived_dropped": null,
+      "lexical_error": null,
+      "rerank_backend": "onnx",
+      "warnings": [
+        "lexical_derived_dropped_missing"
+      ],
+      "timings_ms": {
+        "lexical_ms": 9.8,
+        "entity_extract_ms": 222.88,
+        "rerank_ms": 637.36,
+        "total_ms": 968.14
+      }
+    },
+    {
+      "id": "hit_persehais_redundancy",
+      "line": 11,
+      "occurrence": 1,
+      "query": "Come ho gestito la redundancy di Alex Persehais?",
+      "url": "http://127.0.0.1:8787/api/diag/hybrid-search?q=Come%20ho%20gestito%20la%20redundancy%20di%20Alex%20Persehais%3F&n=10",
+      "status": "ok",
+      "error": null,
+      "n": 10,
+      "gold": [
+        "email_19fdca8e2cacdc39_chunk_0000",
+        "email_19fdca8e2cacdc39_chunk_0001",
+        "email_19fdca8e2cacdc39_chunk_0003",
+        "email_19fdca8e2cacdc39_chunk_0004",
+        "email_19fb937fbc0eb7bb_chunk_0001",
+        "email_19fd18d07486528c_chunk_0000"
+      ],
+      "primary_gold": "email_19fdca8e2cacdc39_chunk_0000",
+      "final_ranked_ids": [
+        "email_19fd18d07486528c_chunk_0000",
+        "email_19fdca8e2cacdc39_chunk_0000",
+        "email_19fb937fbc0eb7bb_chunk_0000",
+        "email_17d76eb4350f58ee_chunk_0000",
+        "email_19e4b8b5a15a3046_chunk_0000",
+        "email_1864b1c12b1efce1_chunk_0000",
+        "email_1934ebac01231d80_chunk_0000",
+        "email_17a9f27ea78153b1_chunk_0000",
+        "email_17e978b2501d4f7c_chunk_0000",
+        "email_17ebb8cec0f3e1e5_chunk_0000"
+      ],
+      "exact_hits": 2,
+      "doc_hits": 6,
+      "gold_total": 6,
+      "primary_exact_rank": 2,
+      "primary_doc_rank": 2,
+      "gold_provenance": [
+        {
+          "chunk_id": "email_19fdca8e2cacdc39_chunk_0000",
+          "provenance": [
+            "entity"
+          ],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": true,
+          "in_final_topn": true,
+          "final_rank": 2,
+          "doc_in_final_topn": true
+        },
+        {
+          "chunk_id": "email_19fdca8e2cacdc39_chunk_0001",
+          "provenance": [],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": false,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": true
+        },
+        {
+          "chunk_id": "email_19fdca8e2cacdc39_chunk_0003",
+          "provenance": [],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": false,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": true
+        },
+        {
+          "chunk_id": "email_19fdca8e2cacdc39_chunk_0004",
+          "provenance": [
+            "entity"
+          ],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": false,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": true
+        },
+        {
+          "chunk_id": "email_19fb937fbc0eb7bb_chunk_0001",
+          "provenance": [],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": false,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": true
+        },
+        {
+          "chunk_id": "email_19fd18d07486528c_chunk_0000",
+          "provenance": [
+            "entity"
+          ],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": true,
+          "in_final_topn": true,
+          "final_rank": 1,
+          "doc_in_final_topn": true
+        }
+      ],
+      "counts": {
+        "raw_candidates": 730,
+        "after_supersede": 730,
+        "final_semantic": 0,
+        "final_entity": 10,
+        "final_lexical": 0,
+        "semantic_candidates": 30,
+        "entity_pre_cap": 824,
+        "entity_post_cap": 700,
+        "lexical_candidates": 0,
+        "rerank_pool": 40,
+        "final_ranked": 10
+      },
+      "lexical_derived_dropped": null,
+      "lexical_error": null,
+      "rerank_backend": "onnx",
+      "warnings": [
+        "lexical_derived_dropped_missing"
+      ],
+      "timings_ms": {
+        "lexical_ms": 7.72,
+        "entity_extract_ms": 289.19,
+        "rerank_ms": 860.02,
+        "total_ms": 1263.26
+      }
+    },
+    {
+      "id": "marche103_mobili",
+      "line": 12,
+      "occurrence": 1,
+      "query": "a quanto ho venduto i mobili di via Marche 103?",
+      "url": "http://127.0.0.1:8787/api/diag/hybrid-search?q=a%20quanto%20ho%20venduto%20i%20mobili%20di%20via%20Marche%20103%3F&n=10",
+      "status": "ok",
+      "error": null,
+      "n": 10,
+      "gold": [
+        "doc_ed826b967663_chunk_0000"
+      ],
+      "primary_gold": "doc_ed826b967663_chunk_0000",
+      "final_ranked_ids": [
+        "doc_65b6cf71b89a_chunk_0000",
+        "claude_20260706_180736_4763",
+        "doc_419383a04907_chunk_0021",
+        "email_18e46edce1d97bff_chunk_0000",
+        "doc_419383a04907_chunk_0020",
+        "doc_23b35fedba6d_chunk_0002",
+        "doc_ab4bfa82aed6_chunk_0000",
+        "email_19e6e1704380309f_chunk_0000",
+        "email_16a1fbb1b6435e03_chunk_0003",
+        "email_15f77ab33c59833a_chunk_0002"
+      ],
+      "exact_hits": 0,
+      "doc_hits": 0,
+      "gold_total": 1,
+      "primary_exact_rank": null,
+      "primary_doc_rank": null,
+      "gold_provenance": [
+        {
+          "chunk_id": "doc_ed826b967663_chunk_0000",
+          "provenance": [],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": false,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": false
+        }
+      ],
+      "counts": {
+        "raw_candidates": 691,
+        "after_supersede": 681,
+        "final_semantic": 2,
+        "final_entity": 8,
+        "final_lexical": 0,
+        "semantic_candidates": 30,
+        "entity_pre_cap": 661,
+        "entity_post_cap": 661,
+        "lexical_candidates": 0,
+        "rerank_pool": 40,
+        "final_ranked": 10
+      },
+      "lexical_derived_dropped": null,
+      "lexical_error": null,
+      "rerank_backend": "onnx",
+      "warnings": [
+        "lexical_derived_dropped_missing"
+      ],
+      "timings_ms": {
+        "lexical_ms": 4.42,
+        "entity_extract_ms": 116.51,
+        "rerank_ms": 619.65,
+        "total_ms": 845.76
+      }
+    },
+    {
+      "id": "mutuo_ippocrate_scadenza",
+      "line": 13,
+      "occurrence": 1,
+      "query": "quanto manca alla scadenza del mutuo relativo all'immobile di viale Ippocrate?",
+      "url": "http://127.0.0.1:8787/api/diag/hybrid-search?q=quanto%20manca%20alla%20scadenza%20del%20mutuo%20relativo%20all%27immobile%20di%20viale%20Ippocrate%3F&n=10",
+      "status": "ok",
+      "error": null,
+      "n": 10,
+      "gold": [
+        "doc_b87341f0952e_chunk_0000",
+        "doc_b87341f0952e_chunk_0001",
+        "doc_406249d50b22_chunk_0006"
+      ],
+      "primary_gold": "doc_b87341f0952e_chunk_0000",
+      "final_ranked_ids": [
+        "66fd3150-8850-8011-8324-95cacff8162e_chunk_0048",
+        "doc_2c5a4e16a986_chunk_0008",
+        "email_192be37608b44072_chunk_0001",
+        "doc_e5cb2370c372_chunk_0043",
+        "doc_e5cb2370c372_chunk_0051",
+        "doc_6ecc2b6a5b67_chunk_0046",
+        "email_17522c155c53e757_chunk_0000",
+        "66fd3150-8850-8011-8324-95cacff8162e_chunk_0038",
+        "doc_6ecc2b6a5b67_chunk_0006",
+        "email_16ad60ed364e8871_chunk_0002"
+      ],
+      "exact_hits": 0,
+      "doc_hits": 0,
+      "gold_total": 3,
+      "primary_exact_rank": null,
+      "primary_doc_rank": null,
+      "gold_provenance": [
+        {
+          "chunk_id": "doc_b87341f0952e_chunk_0000",
+          "provenance": [],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": false,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": false
+        },
+        {
+          "chunk_id": "doc_b87341f0952e_chunk_0001",
+          "provenance": [
+            "entity"
+          ],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": false,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": false
+        },
+        {
+          "chunk_id": "doc_406249d50b22_chunk_0006",
+          "provenance": [
+            "entity"
+          ],
+          "entity_pre_cap_only": false,
+          "in_rerank_pool": false,
+          "in_final_topn": false,
+          "final_rank": null,
+          "doc_in_final_topn": false
+        }
+      ],
+      "counts": {
+        "raw_candidates": 408,
+        "after_supersede": 405,
+        "final_semantic": 8,
+        "final_entity": 2,
+        "final_lexical": 0,
+        "semantic_candidates": 30,
+        "entity_pre_cap": 378,
+        "entity_post_cap": 378,
+        "lexical_candidates": 0,
+        "rerank_pool": 39,
+        "final_ranked": 10
+      },
+      "lexical_derived_dropped": null,
+      "lexical_error": null,
+      "rerank_backend": "onnx",
+      "warnings": [
+        "lexical_derived_dropped_missing"
+      ],
+      "timings_ms": {
+        "lexical_ms": 9.06,
+        "entity_extract_ms": 118.95,
+        "rerank_ms": 632.71,
+        "total_ms": 860.12
+      }
+    }
+  ]
+}
