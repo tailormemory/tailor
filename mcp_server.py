@@ -168,6 +168,47 @@ ENTITY_CANDIDATE_STOPWORDS = frozenset({
     "do", "does", "did", "my", "me", "i", "a", "an", "and", "or", "but", "if",
 })
 
+# Prefissi dei chunk DERIVATI, esclusi dal solo ramo lessicale. Sono testi
+# generati a partire da altri chunk (riassunti di conversazione, riassunti di
+# documento, log delle sessioni live) e ripetono le parole della domanda molte
+# piu' volte della fonte primaria: bm25 premia la frequenza dei termini, quindi
+# i derivati scavalcano il primario. Misurato su hit_persehais_redundancy: il
+# gold email_19fdca8e2cacdc39_chunk_0000 e' sceso dai primi tre al rank 7, con
+# rank 0 e 1 presi da un live_claude_* e da un conv_summary_*.
+#
+# `live_` e non `live_claude_`: l'indice contiene live_claude (948),
+# live_gemini (104), live_chatgpt (29) — il prefisso corto li copre tutti.
+# Restano PRIMARI e non filtrati: email_*, doc_*, UUID, claude_session_*,
+# claude_*, claude_memories_chunk_*. Perimetro escluso: 21.734 chunk su 197.089.
+#
+# Solo il ramo lessicale: semantic ed entity devono continuare a poter
+# restituire derivati (li ordinano per cosine, non per frequenza dei termini).
+LEXICAL_DERIVED_CHUNK_PREFIXES = ("conv_summary_", "doc_summary_", "live_")
+
+
+def _lexical_not_derived_sql(col):
+    """Predicato SQL "`col` NON e' un chunk derivato" + i suoi bind param.
+
+    GLOB e non LIKE: in LIKE `_` e' la wildcard "un carattere qualsiasi",
+    quindi `NOT LIKE 'conv_summary_%'` scarterebbe anche `convXsummaryYfoo`.
+    In GLOB i metacaratteri sono `* ? [ ]` e nessuno compare nei prefissi → il
+    match e' letterale. GLOB e' anche case-sensitive, coerente con gli id
+    lowercase e piu' stretto di LIKE (che e' NOCASE sull'ASCII).
+    """
+    params = [prefix + "*" for prefix in LEXICAL_DERIVED_CHUNK_PREFIXES]
+    return " AND ".join(f"{col} NOT GLOB ?" for _ in params), params
+
+
+def _is_derived_chunk(chunk_id):
+    """Controparte Python di `_lexical_not_derived_sql`, per contare i derivati
+    in una finestra di risultati gia' materializzata.
+
+    `str.startswith` accetta la tupla e confronta prefissi letterali: nessuna
+    semantica di wildcard, quindi coincide con il GLOB per costruzione.
+    """
+    return str(chunk_id).startswith(LEXICAL_DERIVED_CHUNK_PREFIXES)
+
+
 # Embedding: loaded from lib.embedding (config-driven)
 from embedding import get_embedding, get_embeddings, info as embedding_info
 from embedding_contract import embedding_text, MAX_EMBED_CHARS
@@ -2339,6 +2380,7 @@ def _hybrid_collect(query: str, n_results: int, source_filter: str,
     _t35 = _now()
     lexical_snapshot = [] if diag else None
     lexical_error = None
+    lexical_derived_dropped = 0
     try:
         match_expr = _lexical_match_expr(query)
 
@@ -2359,29 +2401,78 @@ def _hybrid_collect(query: str, n_results: int, source_filter: str,
                 # nella whitelist → falso negativo silenzioso). Il sidecar filtra
                 # qualunque valore: source ignoto → join vuoto → ramo vuoto, che
                 # e' la risposta corretta, non un errore.
+                # Esclusione dei derivati DENTRO la SQL, prima di ORDER BY/LIMIT,
+                # non post-fetch: su Query B 6 candidati lexical su 14 erano
+                # derivati: filtrarli dopo brucerebbe lex_limit proprio dove
+                # dominano, lasciando meno primari di quanti il cap ne consenta.
+                # Per la stessa ragione lex_limit resta min(n_results*3, 30):
+                # col filtro a monte del LIMIT non serve compensazione.
                 if source_filter:
                     # I7: il filtro source si fa sul sidecar NON-FTS (lexical_meta),
                     # pre-query, senza toccare Chroma. `source` non e' una colonna
                     # FTS → non e' cercabile via MATCH, va joinata.
                     # NB: con l'alias `f` il MATCH resta sul NOME TABELLA
                     # (`lexical_fts MATCH ?`): `f MATCH ?` solleva "no such column: f".
+                    not_derived, derived_params = _lexical_not_derived_sql(
+                        "f.chunk_id"
+                    )
                     lex_cursor.execute(
-                        """
+                        f"""
                         SELECT f.chunk_id, f.rank
                         FROM lexical_fts f
                         JOIN lexical_meta m ON m.chunk_id = f.chunk_id
-                        WHERE lexical_fts MATCH ? AND m.source = ?
+                        WHERE lexical_fts MATCH ? AND m.source = ? AND {not_derived}
                         ORDER BY f.rank LIMIT ?
                         """,
-                        (match_expr, source_filter, lex_limit),
+                        (match_expr, source_filter, *derived_params, lex_limit),
                     )
                 else:
+                    not_derived, derived_params = _lexical_not_derived_sql(
+                        "chunk_id"
+                    )
                     lex_cursor.execute(
-                        "SELECT chunk_id, rank FROM lexical_fts WHERE lexical_fts MATCH ? "
+                        "SELECT chunk_id, rank FROM lexical_fts "
+                        f"WHERE lexical_fts MATCH ? AND {not_derived} "
                         "ORDER BY rank LIMIT ?",
-                        (match_expr, lex_limit),
+                        (match_expr, *derived_params, lex_limit),
                     )
                 lexical_rank = {row[0]: row[1] for row in lex_cursor.fetchall()}
+
+                # Contatore della mitigazione: quanti slot della finestra il
+                # filtro ha liberato. Si rifa' la STESSA query SENZA il predicato
+                # sui derivati, stesso LIMIT, e si contano in Python i chunk_id
+                # con prefisso derivato.
+                #
+                # NON una query col predicato invertito: quella darebbe i primi
+                # lex_limit *fra i soli derivati*, cioe' min(lex_limit, totale
+                # derivati che matchano) — un numero che ignora la competizione
+                # coi primari e sovrastima. Con 20 derivati a bm25 peggiore di 15
+                # primari direbbe 15 invece di 0: nessuno di quei derivati sarebbe
+                # mai entrato nella finestra combinata.
+                #
+                # E' una seconda query FTS → subordinata a diag, come
+                # entity_sql_cap_saturated: il path produzione resta a una query.
+                if diag:
+                    if source_filter:
+                        lex_cursor.execute(
+                            """
+                            SELECT f.chunk_id
+                            FROM lexical_fts f
+                            JOIN lexical_meta m ON m.chunk_id = f.chunk_id
+                            WHERE lexical_fts MATCH ? AND m.source = ?
+                            ORDER BY f.rank LIMIT ?
+                            """,
+                            (match_expr, source_filter, lex_limit),
+                        )
+                    else:
+                        lex_cursor.execute(
+                            "SELECT chunk_id FROM lexical_fts WHERE lexical_fts MATCH ? "
+                            "ORDER BY rank LIMIT ?",
+                            (match_expr, lex_limit),
+                        )
+                    lexical_derived_dropped = sum(
+                        1 for row in lex_cursor.fetchall() if _is_derived_chunk(row[0])
+                    )
             finally:
                 lex_conn.close()
 
@@ -2431,8 +2522,12 @@ def _hybrid_collect(query: str, n_results: int, source_filter: str,
         lexical_error = f"{type(_lex_err).__name__}: {_lex_err}"
     if diag:
         timings["lexical_ms"] = (_now() - _t35) * 1000.0
+        # count = SOLO gli ammessi (i derivati non entrano nemmeno nella query);
+        # lexical_derived_dropped = quanti dei primi lex_limit senza filtro erano
+        # derivati, cioe' quanti slot della finestra il filtro ha liberato.
         stages["lexical_candidates"] = {
             "count": len(lexical_snapshot), "items": lexical_snapshot,
+            "lexical_derived_dropped": lexical_derived_dropped,
             "error": lexical_error
         }
 
